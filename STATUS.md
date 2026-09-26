@@ -192,7 +192,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   `tobefnz` перед/после вложенной emergency, затем сделать focused
   differential без предположения о конкретной ветке. Open-count 25→26.
 
-- [ ] **Safety BLOCKER (latent, класс 2 t2-research): unrooted heap-ret
+- [x] **Safety BLOCKER (latent, класс 2 t2-research): unrooted heap-ret
   staging поперёк emergency-способного `bcGrowFrame` в apply-путях**
   (найдено A1.next-t2 research, bt-доказательство t2v_grow crash):
   комментарии-доказательства «growth никогда не триггерит GC»
@@ -200,6 +200,12 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   fallible-роста кадра. Fix-направение: RootScope вокруг staging;
   ортогонален top-publication (класс 1); замер/proof в t2res_report
   §класс-2. Open-count: 26 (после пункта gen major→minor) → 27.
+  CLOSED (t2 implementation, класс 2): heap-`ret` стейджинг закоренён
+  через RootScope на точном fallible окне apply-путей
+  (applyBytecodeResultsDirect/applyBytecodePendingResults; infallible
+  hot path без session); decisive GC-root proof + canonical
+  t2_gc_bound_publication.lua; комментарий-«доказательство» 17903
+  опровергнут и удалён.
 
 - [ ] **C API: `lua_pushvalue(lua_upvalueindex(n))` возвращает не upvalue
   (BLOCKER, ORDINARY-BACKLOG)**. Независимый C-оракул
@@ -1269,7 +1275,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   countdown-sweep 524 индекса × 2 режима — только ok/oom. Мёртвая ветка
   удалена (PUC-паритет load_aux восстановлен).
 
-- [ ] **Safety BLOCKER (pre-existing, найден A1.next research): emergency-GC
+- [x] **Safety BLOCKER (pre-existing, найден A1.next research): emergency-GC
   во время вычисления аргументов вызова глобала теряет callee value**:
   воспроизводимая форма (Debug+RF, /tmp/opencode/anext/t2.lua + бисекция
   t5/t6): под реальной memory pressure вызов `pcall(...)` с табличным
@@ -1300,18 +1306,49 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   классов: КЛАСС 1 (этот пункт, подтверждён) — emergency-GC из fallible
   alloc при неопубликованном th.top; сайты opClosure/opConcat/opCall
   chain+growth (crash!)/opCall fast-spill/opTforcall/opSetlist;
-  debt/gen-minor входы структурно безопасны (проверено). Рекомендованный
-  дизайн: вариант B — единый MayGC-примитив publishFrameWindowForMayGC
-  (halfProtect-форма: th.top = windowTop активного Lua-кадра;
-  обобщение protectSyncMetamethodWindow vm.zig:12726) на 6 emergency-
-  сайтах; debt-сайты сохраняют rolling limit; opCall slow +3-5 instr
-  (cold), fast path нетронут. КЛАСС 2 (НОВЫЙ, отдельный BLOCKER,
+  debt/gen-minor входы структурно безопасны (проверено). Ревью дизайна:
+  вариант B с безусловным windowTop на всех сайтах отклонён.
+  PUC 5.5.0 публикует ci->top для OP_CLOSURE и fixed-count OP_SETLIST,
+  но точный operand-bound для OP_CALL/OP_TAILCALL/OP_CONCAT/OP_TFORCALL;
+  общий windowTop меняет GC-retention и расход памяти, а в opCall
+  th.top также участвует в расчёте ensureBcStackCap. Inventory пропустил
+  fallible __call-chain у opTailcall. Требуется PUC-точный per-boundary
+  контракт с общей механикой публикации утверждён владельцем;
+  differential weak/oom — gate implementation-cut. КЛАСС 2 (НОВЫЙ,
+  отдельный BLOCKER,
   latent): unrooted heap-ret staging поперёк emergency-способного
   bcGrowFrame в apply-путях — доказательство-комментарий vm.zig:17903
   опровергнут bt (t2v_grow crash) → см. отдельный пункт ниже. Опровергнуты:
   newborn Cells/Closure unrooting в opClosure (freereg+boxed-scan
   безопасны); nested-finalizer timing — отдельный закрытый класс.
-  Готов к implementation-cut по варианту B + класс 2 отдельно.
+  Класс 1 подтверждён; PUC-точный implementation-cut задан в prompt.md;
+  класс 2 независим и включён отдельным cut.
+  CLOSED (t2 implementation, PUC-точная публикация): единый механизм
+  plain-SET публикации Thread.top перед MayGC с PUC-точным per-opcode
+  bound: OP_CALL/OP_TAILCALL (вк. пропущенный в research `__call`-chain
+  opTailcall) — конец callee+args до precall/роста (B==0 nargs из
+  прежнего top ДО публикации; ensureBcStackCap-аргументы не тронуты);
+  OP_CONCAT — operand-end до alloc.dupe/metamethod/continuation;
+  OP_TFORCALL — конец call-region после staging; OP_CLOSURE —
+  frame.windowTop до первой fallible аллокации (halfProtect-parity),
+  после публикации closure — прежний checkGC(ra+1); fixed-count
+  OP_SETLIST — окно до resize/MayGC, B==0 — multret-bound из прежнего
+  top; opNewtable реструктурирован под PUC-порядок (allocTableEphemeral,
+  T.totalmem("table")-паритет: счётчик таблиц инкрементируется).
+  КЛАСС 2 закрыт: heap-ret стейджинг закоренён RootScope'ом на точном
+  fallible окне apply-путей (applyBytecodeResultsDirect/PendingResults);
+  no session на infallible hot path. Ложные комментарии (9905/31586/
+  30229/46420/17903) исправлены. Evidence: canonical
+  tests/stress/t2_gc_bound_publication.lua (t2/concat/grow/B==0/
+  __call-chain/iterator/tailcall/closure-sole-root/weak-retention/
+  emergency+debt/inc+gen; GREEN + ltests-oracle; RED на d83d565);
+  research-формы t2v_* подтверждающе зелёные. Гейты: 358/358 D+RF
+  0 leaks; matrix zig_fail=0 (в т.ч. gc.lua — починен интеграционный
+  counting-дефект allocTableEphemeral, найденный координатором:
+  testc_obj_tables); smoke 86/86; c_api 24-29 PASS оба режима; api580
+  GREEN; fmt/diff-check clean. Perf A/B d83d565↔final: geomean 0.996
+  (нейтрально; худший +5.9% table_alloc_setmetatable — цена PUC-exact
+  OP_NEWTABLE; лучший −10.4%).
 
 - [ ] **Parity HIGH (pre-existing, REDESIGN-констрейнт): yieldability
   pcall-recovery close (16118-ветка) расходится с PUC finishpcallk**:

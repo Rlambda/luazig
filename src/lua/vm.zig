@@ -5290,11 +5290,12 @@ pub const Vm = struct {
     /// not re-enter it (adapter checks `emergencyCollectAllowed`).
     testc_emergency_active: bool = false,
 
-    /// PUC `gcemergency` (lgc.c): set during an emergency full GC. Switches
-    /// root marking to the conservative full register window (the heap pc
-    /// is stale mid-instruction), and suppresses finalizer calls (GCScallfin
-    /// guard) and the string-table shrink (checkSizes guard) — both are
-    /// mutator/allocating work that must not run on the failing path.
+    /// PUC `gcemergency` (lgc.c): set during an emergency full GC. Suppresses
+    /// finalizer calls (GCScallfin guard) and the string-table shrink
+    /// (checkSizes guard) — both are mutator/allocating work that must not
+    /// run on the failing path. Root marking is unchanged (th.top-bounded,
+    /// like every cycle — the per-opcode bound publications keep live
+    /// operand regions inside [0..top) across mid-instruction boundaries).
     gc_emergency: bool = false,
     /// True once testC allocator-control state has ever been touched (a
     /// countdown armed / a limit set). Production VMs never set it, and the
@@ -6998,7 +6999,7 @@ pub const Vm = struct {
     }
 
     pub fn apiNewTable(self: *Vm) Error!*Table {
-        return exposeDispatchResult(*Table, self.allocTable(null));
+        return exposeDispatchResult(*Table, self.allocTable());
     }
 
     pub fn apiNewThread(self: *Vm, callee: Value) Error!*Thread {
@@ -9901,9 +9902,14 @@ pub const Vm = struct {
     }
 
     /// PUC `tryagain` → `luaC_fullgc(L, 1)` (lmem.c): the emergency full GC
-    /// run from a failed allocation boundary, best-effort. gc_emergency
-    /// switches root marking to the conservative full register window (the
-    /// heap pc is stale mid-instruction) and suppresses finalizer calls
+    /// run from a failed allocation boundary, best-effort. Root marking
+    /// stays th.top-bounded exactly like an ordinary cycle — there is no
+    /// separate emergency marking mode; the per-opcode bound publications
+    /// (OP_CALL/OP_TAILCALL/OP_CONCAT/OP_TFORCALL/OP_SETLIST/OP_CLOSURE and
+    /// the staging/shift paths) keep every live operand region inside
+    /// [0..top) across mid-instruction allocation boundaries, and heap-held
+    /// result slices are rooted through RootScope. gc_emergency suppresses
+    /// finalizer calls
     /// (GCScallfin / finishgencycle guards) and the string-table shrink
     /// (checkSizes guard) — PUC lgc.c fullinc under gcemergency=1; the
     /// persistent tobefnz keeps every pending finalization alive across the
@@ -11078,13 +11084,16 @@ pub const Vm = struct {
         ctx.regs = ctx.th.stack[ctx.base .. ctx.base + ctx.cap];
     }
 
-    /// `ctx` is the ACTIVE dispatch context when the allocation happens
-    /// inside an opcode handler (only OP_NEWTABLE today); callers running
-    /// in C frames (builtins, stdlib init, C API) pass null — their parent
-    /// Lua frame is parked at the CALL that entered C, which is already
-    /// the pc the GC must see (PUC: builtins run with the caller's
-    /// savedpc already saved by the interpreter's savestate).
-    fn allocTable(self: *Vm, ctx: ?*BytecodeDispatchCtx) DispatchError!*Table {
+    /// Table creation for C-frame callers (builtins, stdlib init, C API):
+    /// create, then the conditional GC step at the API-boundary position —
+    /// PUC's `lua_newtable` runs `luaH_new` followed by `luaC_checkGC`
+    /// (lapi.h API boundary). The parent Lua frame is parked at the CALL
+    /// that entered C, which is already the pc the GC must see (PUC:
+    /// builtins run with the caller's savedpc already saved by the
+    /// interpreter's savestate). OP_NEWTABLE does NOT use this path: its
+    /// step belongs at PUC's checkGC position AFTER the resize (see the
+    /// .newtable arm).
+    fn allocTable(self: *Vm) DispatchError!*Table {
         const t = try self.allocTableNoGc();
 
         // PUC luaC_condGC: if GCdebt <= 0, run a step. gc_step_debt_kb is
@@ -11102,33 +11111,7 @@ pub const Vm = struct {
             var scope = try self.openRootScope(1, 0);
             defer scope.close();
             _ = scope.protectValueAssumeCapacity(.{ .Table = t });
-            // PUC checkGC(L,c): `savepc(ci)` is the `p` argument of
-            // luaC_condGC — evaluated ONLY when a GC step will actually
-            // run (this branch). Publish the dispatch pc to the heap
-            // CallFrame (the savestate analogue) so debug readers see the
-            // correct pc (GC marking is wholesale over the window).
-            if (ctx) |c| {
-                self.parkActiveFrame(c);
-                // PUC checkGC(L,c): the live limit `c` is the CALLER's
-                // discipline: the OP_NEWTABLE site raises
-                // th.top to ra+1 before calling here (PUC lvm.c:1420),
-                // exactly PUC's `L->top = ra + 1` before luaC_condGC. No
-                // window raise here — th.top is the rolling live limit,
-                // and raising it to base+cap would permanently retain the
-                // frame's dead registers above the limit (the GC1
-                // repeat-until hang class).
-            }
             try self.gcAutomaticStep();
-            // P16.42 T1 (PUC savestack/restorestack discipline): the GC
-            // step may execute __gc finalizers — arbitrary nested Lua
-            // that can grow and REALLOC the owning Thread's
-            // stack. The dispatch ctx's regs slice points into
-            // the OLD allocation; without re-derivation from base+cap
-            // INDICES, the next opcode reads freed memory (the
-            // pcall-in-__gc corruption: "switch on corrupt value" in
-            // isTruthy(regs[inst.a]) / ReleaseFast infinite loop reading
-            // a stale slot that never observes the finalizer's write).
-            if (ctx) |c| c.regs = c.th.stack[c.base .. c.base + c.cap];
         }
         return t;
     }
@@ -11142,6 +11125,7 @@ pub const Vm = struct {
         t.* = .{};
         self.gcRegisterCommit(.{ .table = t });
         self.gcNoteAlloc(@sizeOf(Table));
+        self.testc_obj_tables += 1;
         return t;
     }
 
@@ -12160,6 +12144,15 @@ pub const Vm = struct {
                 return .resume_dispatch;
             },
             .return_frame => |values| {
+                // The close state was destroyed above — this arm is the
+                // slice's sole owner, and the hook machinery below runs
+                // fallible operations (the transfer dupe) and Lua hook
+                // bodies that can collect: root the values until they land
+                // in the caller's registers (same contract as the opCall
+                // .owned arm).
+                var scope = try self.openRootScope(values.len, 0);
+                defer scope.close();
+                for (values) |v| _ = scope.protectValueAssumeCapacity(v);
                 // hooks_active_cached hoisted: tryPushBytecodeDebugHook's own
                 // first early-out, checked here to skip the call args setup.
                 if (self.hooks_active_cached and try self.tryPushBytecodeDebugHook(
@@ -12716,13 +12709,21 @@ pub const Vm = struct {
     /// BELOW live caller registers (e.g. a 0-result CALL's moveresults SET
     /// leaves it at the func slot) — staging there clobbers them (observed:
     /// OP_UNM's __unm sync call overwrote the caller's print closure
-    /// register, which then got invoked as the next CALL's callee). Raise
-    /// th.top to the parent Lua frame's window top — strictly above every
-    /// live caller register — before the call; the C-frame pop restores
-    /// th.top to the same bound. Push-path staging
-    /// (pushResolvedBytecodeClosure) raises identically; this helper covers
-    /// the sync arms. C parents keep the C discipline (staging at the C
-    /// call region), mirroring PUC host-origin luaT_callTMres.
+    /// register, which then got invoked as the next CALL's callee).
+    /// savestate is a PLAIN SET to ci->top = base + maxstacksize
+    /// (luaD_precall LUA_VLCL) — NOT the grown windowTop(), whose
+    /// EXTRA_MARGIN slots PUC never marks (over-marking them changes the
+    /// observable dead-set: tracegc's per-cycle collection dots). The SET
+    /// can also LOWER top (e.g. a SETLIST B==0 multret end above the frame
+    /// file) — PUC-exact; the multret region is dead by then (consumed by
+    /// its B==0 reader). The bound is strictly above every live caller
+    /// register, so the staging below never clobbers them; the C-frame pop
+    /// restores th.top to the same bound (PUC luaT_callTMres: func staged
+    /// at top, top = func+3 for the call, poscall + result move return top
+    /// to func). Push-path staging (pushResolvedBytecodeClosure) publishes
+    /// identically; this helper covers the sync arms. C parents keep the C
+    /// discipline (staging at the C call region), mirroring PUC
+    /// host-origin luaT_callTMres.
     fn protectSyncMetamethodWindow(
         self: *Vm,
         exec_frames: *FrameStack,
@@ -12730,9 +12731,9 @@ pub const Vm = struct {
     ) void {
         const parent = exec_frames.getPtr(parent_index);
         if (parent.isC()) return;
+        const proto = parent.proto() orelse return;
         const th = self.activeBytecodeThread();
-        const parent_window = parent.windowTop();
-        if (th.top < parent_window) th.top = parent_window;
+        th.top = parent.frameBase() + proto.maxstacksize;
     }
 
     fn tryPushSimpleResultMetamethod(
@@ -13355,16 +13356,30 @@ pub const Vm = struct {
         // limit field is always up-to-date (frames are not moved by stack
         // realloc — only the stack/boxed arrays grow).
         if (dst + nstore > cap) {
+            // The heap return slice is invisible to the collector until
+            // its values land in the parent's registers below: root it
+            // across the fallible frame growth. bcGrowFrame's stack
+            // realloc runs through the counted adapter, so a failed
+            // allocation can enter an emergency GC that sweeps the young
+            // result objects before the copy (PUC moveresults has no
+            // fallible window — the results land in pre-reserved slots).
+            var scope = try self.openRootScope(ret.len, 0);
+            defer scope.close();
+            for (ret) |v| _ = scope.protectValueAssumeCapacity(v);
             try self.bcGrowFrame(th, parent.frameBase(), dst + nstore, &cap, &regs);
             // Publish-after-try: on OOM nothing grew, the old cap is still
             // accurate (see applyBytecodePendingResults).
             parent.limit = cap + 1;
         }
         for (0..nstore) |i| regs[dst + i] = if (i < ret.len) ret[i] else .Nil;
-        // Multret producer publication (PUC moveresults: L->top = res + nres):
-        // the occupied bound OVERWRITES the window so the following B==0
-        // consumer reads the exact count.
-        if (nresults < 0) th.top = parent.frameBase() + @as(usize, dst) + ret.len;
+        // PUC luaD_poscall moveresults (ldo.c:550): L->top = res + wanted
+        // — for EVERY contract, not just multret (0 -> res, 1 -> res+1,
+        // fixed -> res+wanted, multret -> res+got). The occupied bound is
+        // the rolling live limit: stale slots above it (dead call args,
+        // consumed temps) are unmarked and die — PUC traversethread parity.
+        // Leaving th.top higher (e.g. at a previous SETLIST publication's
+        // frame-file bound) would retain every dead register up to it.
+        th.top = parent.frameBase() + @as(usize, dst + nstore);
         parent.u.lua.pc += 1;
         if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
     }
@@ -13386,6 +13401,16 @@ pub const Vm = struct {
         var cap = parent.frameCap();
         var regs = th.stack[parent.frameBase() .. parent.frameBase() + cap];
         const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
+        // Same rooting contract as applyBytecodeResultsDirect: the heap
+        // return slice must survive bcGrowFrame's emergency-capable stack
+        // realloc. The scope opens ONLY on the growth path — the
+        // no-growth store below is infallible and pays no root session.
+        var growth_scope: ?RootScope = if (dst + nstore > cap) blk: {
+            var scope = try self.openRootScope(ret.len, 0);
+            for (ret) |v| _ = scope.protectValueAssumeCapacity(v);
+            break :blk scope;
+        } else null;
+        defer if (growth_scope != null) growth_scope.?.close();
         try self.bcGrowFrame(th, parent.frameBase(), dst + nstore, &cap, &regs);
         // Publish-after-try: on OOM bcGrowFrame did not grow anything, so the
         // old cap is still accurate and re-publishing limit is a no-op — the
@@ -13435,6 +13460,16 @@ pub const Vm = struct {
             .results => |result| result,
             else => unreachable,
         };
+        // Root the return values across every fallible step of this
+        // completion (the append_nil extension alloc, the hook machinery's
+        // transfer dupe and Lua hook body, the result application's frame
+        // growth): the heap slice is invisible to the collector until the
+        // values land in the parent's registers — the same contract as the
+        // opCall .owned arm. The append_nil extension copies the same
+        // objects, so the initial pass covers the extended slice too.
+        var scope = try self.openRootScope(ret.len, 0);
+        defer scope.close();
+        for (ret) |v| _ = scope.protectValueAssumeCapacity(v);
         if (cont.append_nil) {
             const extended = try self.alloc.alloc(Value, ret.len + 1);
             @memcpy(extended[0..ret.len], ret);
@@ -13518,6 +13553,15 @@ pub const Vm = struct {
         const parent = exec_frames.getPtr(parent_index);
         var cap = parent.frameCap();
         var regs = th.stack[parent.frameBase() .. parent.frameBase() + cap];
+        // Same rooting contract as applyBytecodePendingResults: the heap
+        // return slice must survive bcGrowFrame's emergency-capable stack
+        // realloc; the scope opens only on the growth path.
+        var growth_scope: ?RootScope = if (@as(usize, cont.dst) + 1 > cap) blk: {
+            var scope = try self.openRootScope(ret.len, 0);
+            for (ret) |v| _ = scope.protectValueAssumeCapacity(v);
+            break :blk scope;
+        } else null;
+        defer if (growth_scope != null) growth_scope.?.close();
         try self.bcGrowFrame(th, parent.frameBase(), @as(usize, cont.dst) + 1, &cap, &regs);
         // Publish-after-try: on OOM nothing grew, the old cap is still
         // accurate (see applyBytecodePendingResults).
@@ -17317,6 +17361,16 @@ pub const Vm = struct {
         for (args_restored, 0..) |v, i| {
             th.stack[func_slot + 1 + i] = v;
         }
+        // PUC luaT_callTMres (ltm.c): after staging func+args, the staged
+        // region's end is published (`L->top.p = func + 3`) BEFORE the call,
+        // so every window between this staging and the activation (the
+        // caller's fallible steps, the activation's own growth) runs with
+        // the staged values inside the marked region. @max keeps a higher
+        // bound already published by the caller.
+        {
+            const bound = func_slot + 1 + args_restored.len;
+            if (th.top < bound) th.top = bound;
+        }
         return .{ .func_slot = func_slot, .nargs = args_restored.len };
     }
 
@@ -17352,6 +17406,13 @@ pub const Vm = struct {
         th.stack[func_slot] = .{ .Closure = callee_cl };
         inline for (0..n) |i| {
             th.stack[func_slot + 1 + i] = args[i];
+        }
+        // PUC luaT_callTMres (ltm.c): the staged region's end is published
+        // before the call — same rule as stageBytecodeCall above (the fixed
+        // window's bound is func + 1 + n, PUC's `func + 3` for n == 2).
+        {
+            const bound = func_slot + 1 + n;
+            if (th.top < bound) th.top = bound;
         }
         return .{ .func_slot = func_slot, .nargs = n };
     }
@@ -17430,6 +17491,16 @@ pub const Vm = struct {
                 (th.stack.len < 200 or needed_top + 200 <= th.stack.len) and
                 (self.dispatch_gate & DISPATCH_GATE_HOOKS) == 0)
             {
+                // PUC luaT_callTMres (ltm.c): the staged region's end is
+                // published before the call (`L->top.p = func + 3`). The
+                // heap-spill branch below can run an emergency collection
+                // (addOne is a counted alloc), so the operand region
+                // [func_slot, func_slot + 1 + nargs) must be inside the
+                // marked window first. For the zero-copy OP_CALL path this
+                // is the caller's already-published bound (no-op); the
+                // activation below then raises top to the child window.
+                const bound = func_slot_in + 1 + nargs;
+                if (th.top < bound) th.top = bound;
                 if (self.stats.enabled) self.stats.calls_lua_frames += 1; // P16.0b: ALL Lua activations
                 // P16.29: FrameStack.addOne inlined for the inline-slot case
                 // (the overwhelmingly common one): compare + increment +
@@ -17758,6 +17829,12 @@ pub const Vm = struct {
         // VAHID requires nextra > 0 (args.len > nparams), so there are never
         // missing params to nil-fill here — the old dead nil-fill loop was
         // `nparams..@max(nparams, nparams)` (an empty range), now removed.
+        // PUC buildhiddenargs (ltm.c:255): every shifted value is written AT
+        // L->top with top++ — the bound covers the shifted func+params
+        // region as it is built, ending at base + nparams. Publish the same
+        // end here so the caller's subsequent fallible steps (the frame
+        // growth to the window) run with the shifted region marked.
+        if (th.top < base + nparams) th.top = base + nparams;
     }
 
     /// Overflow body: realloc stack/boxed to PHYSICAL_LIMIT (MAXSTACK +
@@ -17899,20 +17976,24 @@ pub const Vm = struct {
         // the active thread's frames (a coroutine switch makes the
         // target active before re-driving continuations). Return completions run on the active thread.
         const th = self.activeBytecodeThread();
-        // P15.51j: a RootScope is NOT needed on the common path. After
-        // popBytecodeExecFrame the child's register window is dead, but:
-        //  - closeBytecodeUpvaluesFrom fires write barriers only (gcMarkValue
-        //    queues objects; it does not run a full GC cycle).
-        //  - popBytecodeExecFrame, alloc.dupe/alloc.alloc/alloc.free, and
-        //    bcGrowFrame (ensureBcStackCap → Zig realloc) never trigger GC.
-        //  - applyBytecodeResultsDirect copies ret into the parent's registers
-        //    (a GC root via stack) before any Lua code can run.
-        //  - Paths that DO run Lua code (concat, gsub, protection) have their
-        //    own RootScope. Paths that free ret before running Lua (hook,
-        //    close) don't need protection either.
-        //  - The ONLY path that needs a RootScope is tail_return, where
-        //    beginBytecodeClose runs __close metamethods while ret is still
-        //    alive. A RootScope is opened there.
+        // P15.51j (revised, t2): RootScope placement follows the ACTUAL
+        // MayGC edges of this completion, not a blanket session. After
+        // popBytecodeExecFrame the child's register window is dead, so the
+        // slice's values are reachable only through this Zig local at the
+        // fallible edges below:
+        //  - closeBytecodeUpvaluesFrom fires write barriers only (no cycle).
+        //  - popBytecodeExecFrame and the infraAlloc transports (C-frame
+        //    parent / external boundary) cannot run the collector (infra
+        //    allocations are NoGC).
+        //  - The counted allocs (nil padding, protection wrap) and the frame
+        //    growths (simple-result bcGrowFrame, the apply paths' growth)
+        //    CAN run the emergency collector on allocation failure — each
+        //    opens its own conditional RootScope at the edge (t2v_grow
+        //    proved the bcGrowFrame window; the plain-alloc windows follow
+        //    from the same failed-alloc → emergencyCollect path).
+        //  - Paths that run Lua code (concat, gsub, protection, close) have
+        //    their own RootScopes; the tail_return arm opens one around
+        //    beginBytecodeClose's __close metamethods.
         //
         const child_idx = exec_frames.len() - 1;
         const child_frame = exec_frames.getConstPtr(child_idx);
@@ -18030,10 +18111,22 @@ pub const Vm = struct {
                     if (result != invert) parent_ptr.u.lua.pc += 1;
                 } else {
                     // Value mode: put 1 result into register, advance pc.
-                    // bcGrowFrame is the fallible edge — the errdefer above
-                    // owns the slice across it.
+                    // bcGrowFrame is the fallible edge — its realloc failure
+                    // runs an emergency collection (the t2v_grow window), and
+                    // the popped child's window no longer covers the slice:
+                    // root the values across the growth only when growth is
+                    // actually needed (hot path stays scope-free). The
+                    // errdefer above still owns the slice's storage.
                     const sr_dst = parent_ptr.u.lua.simple_result_dst;
                     var cap = parent_ptr.frameCap();
+                    var growth_scope: ?RootScope = if (@as(usize, sr_dst) + 1 > cap)
+                        try self.openRootScope(ret.len, 0)
+                    else
+                        null;
+                    defer if (growth_scope) |*s| s.close();
+                    if (growth_scope != null) {
+                        for (ret) |v| _ = growth_scope.?.protectValueAssumeCapacity(v);
+                    }
                     var regs = th.stack[parent_ptr.frameBase() .. parent_ptr.frameBase() + cap];
                     try self.bcGrowFrame(th, parent_ptr.frameBase(), @as(usize, sr_dst) + 1, &cap, &regs);
                     // Publish-after-try: on OOM nothing grew, the old cap is
@@ -18061,7 +18154,14 @@ pub const Vm = struct {
         }
         const pending = self.getPendingCallConst(exec_frames.getPtr(parent_index).pending_call_index) orelse unreachable;
         if (pending.completion == .results and pending.completion.results.append_nil) {
-            // Nil-padding edge: the alloc failure is covered by the tag.
+            // Nil-padding edge: the extension alloc is a counted allocation —
+            // its failure runs an emergency collection while the slice is
+            // this completion's only reference (the child's window is dead).
+            // Root the values across the alloc + memcpy; the tag below still
+            // owns the storage on failure.
+            var nil_scope = try self.openRootScope(completed_ret.len, 0);
+            defer nil_scope.close();
+            for (completed_ret) |v| _ = nil_scope.protectValueAssumeCapacity(v);
             const extended = try self.alloc.alloc(Value, completed_ret.len + 1);
             @memcpy(extended[0..completed_ret.len], completed_ret);
             extended[completed_ret.len] = .Nil;
@@ -18077,7 +18177,13 @@ pub const Vm = struct {
         // handler (xpcall) runs inside invokeErrfunc at the throw site, not
         // as a staged child of this protection.
         if (pending.protection != null) {
-            // Protection-wrap edge: the alloc failure is covered by the tag.
+            // Protection-wrap edge: the wrap alloc is a counted allocation —
+            // same emergency window as the nil-padding edge above. Root the
+            // values across the alloc + memcpy; the tag below still owns the
+            // storage on failure.
+            var wrap_scope = try self.openRootScope(completed_ret.len, 0);
+            defer wrap_scope.close();
+            for (completed_ret) |v| _ = wrap_scope.protectValueAssumeCapacity(v);
             const wrapped = try self.alloc.alloc(Value, completed_ret.len + 1);
             wrapped[0] = .{ .Bool = true };
             @memcpy(wrapped[1..], completed_ret);
@@ -19669,15 +19775,6 @@ pub const Vm = struct {
                         // C + EXTRAARG * 256. (PUC uses a k flag instead;
                         // our bytecode has no k bit, so we always emit
                         // EXTRAARG with 0 for the common case.)
-                        // PUC lvm.c:1420: L->top = ra + 1 ("correct top in
-                        // case of emergency GC") BEFORE luaH_new, and
-                        // checkGC(L, ra + 1) after — the rolling live limit
-                        // at this instruction covers every live register
-                        // (ra is freereg; everything above is dead) and
-                        // lets the stale slots above die unmarked.
-                        ctx.th.top = @max(ctx.th.top, ctx.base + @as(usize, inst.a) + 1);
-                        const t = try self.allocTable(&ctx);
-                        ctx.regs[inst.a] = .{ .Table = t };
                         const hsize_log2: u8 = inst.b;
                         // Read the EXTRAARG (always present after NEWTABLE).
                         if (ctx.pc + 1 >= ctx.cur_proto.code.len or
@@ -19698,9 +19795,41 @@ pub const Vm = struct {
                             @as(u32, 1) << @as(u5, @intCast(hsize_log2 - 1))
                         else
                             0;
+                        // PUC lvm.c:1420: `L->top.p = ra + 1` ("correct top
+                        // in case of emergency GC") — a PLAIN SET before
+                        // luaH_new. The rolling live limit at this
+                        // instruction covers every live register (ra is
+                        // freereg; everything above is dead) and lets the
+                        // stale slots above die unmarked. It LOWERS top when
+                        // a previous publication (OP_SETLIST's ci->top, a
+                        // multret producer's bound) left it higher — the
+                        // lowering is what lets the dead slots die (the GC1
+                        // repeat-until-finalizer loop class: PUC's
+                        // `repeat u = {} until finish` terminates precisely
+                        // because this SET drops top below the dead call
+                        // region of the preceding setmetatable).
+                        ctx.th.top = ctx.base + @as(usize, inst.a) + 1;
+                        // PUC luaH_new runs NO conditional GC step — the
+                        // only step is checkGC(L, ra+1) AFTER the resize
+                        // (lvm.c:1425). Stepping inside the creation (the
+                        // old allocTable path) inserts a collection instant
+                        // PUC does not have: with the low ra+1 bound it
+                        // nils dead slots one construction earlier than any
+                        // PUC instant, shifting every later cycle boundary
+                        // (observable: tracegc's per-cycle dots diverge).
+                        // A failed creation still enters the emergency
+                        // collector with top = ra+1 — exactly PUC's
+                        // emergency-GC window at luaH_new.
+                        const t = try self.allocTableEphemeral();
+                        ctx.regs[inst.a] = .{ .Table = t };
                         if (asize > 0 or hsize > 0) {
                             try self.tableResize(t, asize, hsize);
                         }
+                        // PUC checkGC(L, ra + 1): the conditional step after
+                        // the full construction, with the same ra+1 live
+                        // limit (condGcFromDispatch re-checks the debt and
+                        // parks the pc — savestate/savepc parity).
+                        try self.condGcFromDispatch(&ctx);
                     },
                     .self => {
                         // R[A+1] = R[B]; R[A] = R[B][K[C]]
@@ -21441,6 +21570,25 @@ pub const Vm = struct {
             break :blk ctx.cur_proto.code[ctx.pc].extraArg();
         } else c;
 
+        // PUC OP_SETLIST (lvm.c:1901): for a fixed B the window top is
+        // published BEFORE the table resize (`L->top.p = ci->top.p` — a
+        // PLAIN SET, "correct top in case of emergency GC"), so the
+        // a+1..a+B operand region is inside the marked window when
+        // luaH_resizearray (here: tableResizeArray / setIndexValue) can run
+        // a collection. PUC's ci->top = base + maxstacksize (luaD_precall
+        // LUA_VLCL) — NOT this frame's windowTop(), which adds
+        // EXTRA_MARGIN slots PUC does not mark (over-marking them changes
+        // the observable dead-set: tracegc's per-cycle collection dots).
+        // The SET can lower top from a previous publication — PUC-exact;
+        // the next publishing instruction (e.g. OP_NEWTABLE's ra+1) lowers
+        // it back, letting the dead slots above die. B==0 keeps the
+        // producer's already-published occupied bound (PUC reads n from it
+        // and does not raise top).
+        if (b != 0) {
+            const fr = ctx.exec_frames.getPtr(ctx.frame_index);
+            if (!fr.isC()) ctx.th.top = ctx.base + ctx.cur_proto.maxstacksize;
+        }
+
         if (table_val == .Table) {
             const tbl = table_val.Table;
             // Fast path: table without metatable — preallocate array part
@@ -21935,6 +22083,20 @@ pub const Vm = struct {
 
         // Create upvalue cells from child's upvalue descriptions.
         const nups = child_proto.upvalues.len;
+        // PUC OP_CLOSURE (lvm.c:1929): pushclosure runs under halfProtect —
+        // savestate publishes the frame's window top as a PLAIN SET
+        // (`L->top.p = ci->top.p` = base + maxstacksize, luaD_precall
+        // LUA_VLCL — NOT windowTop(), which adds EXTRA_MARGIN slots PUC
+        // does not mark) — so the upvalue source registers are inside the
+        // marked window across every fallible part of the construction
+        // (the cells array, the Cell creates, the Closure commit's
+        // recursive barrier). The trailing checkGC(ra+1) below (also a
+        // plain SET) restores the precise bound, exactly like PUC's
+        // lvm.c:1933.
+        {
+            const fr = ctx.exec_frames.getPtr(ctx.frame_index);
+            if (!fr.isC()) ctx.th.top = ctx.base + ctx.cur_proto.maxstacksize;
+        }
         // P16.50 transactional: bulk registry preparation for ALL objects
         // of this construction (up to nups new Cells + the Closure). After
         // this succeeds, every gcRegisterCommit below is infallible — the
@@ -22146,6 +22308,14 @@ pub const Vm = struct {
         // ── PUC luaD_precall: inline callee type resolution ──
         // Resolve on the copy at R[A+4], not the original at R[A].
         var effective_nargs: usize = 2;
+        // PUC OP_TFORCALL (lvm.c:1875): `L->top.p = ra + 3 + 3;` — the
+        // copied call region's end is published BEFORE the call, so the
+        // __call chain (tryfuncTM) and the stack pre-grow below run with
+        // func+state+control inside the marked window. luazig's layout
+        // puts func at R[A+4] with 2 args, so the bound is A+5+nargs
+        // (A+7 here); tryCallMetamethodInPlace raises it as the chain
+        // shifts (PUC's shift + top++).
+        ctx.th.top = ctx.base + a + 5 + effective_nargs;
         var chain_depth: usize = 0;
         while (true) {
             switch (ctx.regs[a + 4]) {
@@ -22192,11 +22362,11 @@ pub const Vm = struct {
         // replaced by __call resolution).
         const rargs_builtin = ctx.regs[a + 5 .. a + 5 + effective_nargs];
 
-        // PUC OP_TFORCALL (lvm.c): `L->top.p = ra + 3 + 3;` — the iterator
-        // call region end (func + 1 + nargs) is the rolling live limit at
-        // this instruction (see the matching SET in opCall).
-        // The C-iterator arm gets the precallC entry invariant (C-frame
-        // push above the in-stack args source — no memcpy alias).
+        // Final bound after the __call chain (the entry publication above
+        // covered the chain window; the chain's shifts raised top in step —
+        // this re-publishes the exact func + 1 + effective_nargs end, the
+        // precallC entry invariant for the C-iterator arm: the C-frame push
+        // lands above the in-stack args source — no memcpy alias).
         ctx.th.top = ctx.base + a + 5 + effective_nargs;
 
         // Bytecode iterators join the iterative dispatch stack (same as OP_CALL).
@@ -22511,6 +22681,15 @@ pub const Vm = struct {
         // is wholesale — pc-independent).
         self.parkActiveFrame(ctx);
 
+        // PUC OP_CONCAT (lvm.c:1626): `L->top.p = ra + n;` BEFORE luaV_concat
+        // — the operand region end is the rolling live limit across the
+        // whole concat (the dupe below, the __concat metamethod machinery),
+        // so the operands stay inside the marked window. @max(b,1) guards
+        // the degenerate B==0 decode (same as the re-publish in the .value
+        // arm below, which restores the bound after the metamethods moved
+        // top and covers the result at ra).
+        ctx.th.top = ctx.base + a + @max(@as(usize, b), 1);
+
         const concat_vals = try self.alloc.dupe(Value, ctx.regs[a .. a + b]);
         const outcome = try self.advanceBytecodeConcat(
             ctx.exec_frames,
@@ -22604,6 +22783,14 @@ pub const Vm = struct {
         // bound, and a hook interpolation restores it exactly).
         const nargs: usize = if (b == 0) (ctx.th.top - ctx.base) - a - 1 else b - 1;
 
+        // PUC OP_TAILCALL (lvm.c:1737): `if (b != 0) L->top.p = ra + b;` —
+        // published BEFORE precall (the __call chain's tryfuncTM and the
+        // hook machinery below run under it), so the callee+args region is
+        // inside the marked window. B==0 keeps the producer's already-
+        // published occupied bound (no-op). tryCallMetamethodInPlace raises
+        // top in step with the chain's shift (PUC's shift + top++).
+        if (b != 0) ctx.th.top = ctx.base + a + 1 + nargs;
+
         // ── PUC luaD_precall: inline callee type resolution ──
         var effective_nargs = nargs;
         var chain_depth: usize = 0;
@@ -22656,12 +22843,11 @@ pub const Vm = struct {
         const callee_val = ctx.regs[a];
         var call_args = ctx.regs[a + 1 .. a + 1 + effective_nargs];
 
-        // PUC OP_TAILCALL (lvm.c:1749): `if (b != 0) L->top.p = ra + b;` —
-        // the call region end is the rolling live limit at the tail-call
-        // instruction (see the matching SET in opCall). For
-        // B==0 this is the producer's bound (no-op); the C-function arm
-        // gets the precallC entry invariant (C-frame push above the
-        // in-stack args source — no memcpy alias).
+        // Final bound after the __call chain (the entry publication above
+        // covered the chain window; the chain's shifts raised top in step —
+        // this re-publishes the exact func + 1 + effective_nargs end, the
+        // precallC entry invariant for the C-function arm: the C-frame push
+        // lands above the in-stack args source — no memcpy alias).
         ctx.th.top = ctx.base + a + 1 + effective_nargs;
 
         const hook_args = switch (callee_val) {
@@ -22888,6 +23074,15 @@ pub const Vm = struct {
                         ctx.th.stack[new_base + i] = ctx.th.stack[reset_slot + 1 + i];
                         ctx.th.stack[reset_slot + 1 + i] = .Nil;
                     }
+                    // PUC buildhiddenargs (ltm.c:255): the bound follows the
+                    // shifted writes (each value written AT top with top++),
+                    // ending at new_base + nparams. The shifted func+params
+                    // sit ABOVE the caller-side bound (top still reflects
+                    // the pre-shift operand end), so publish the shifted
+                    // region's end BEFORE the frame growth below — its
+                    // allocation failure runs an emergency collection that
+                    // would otherwise sweep the just-shifted values.
+                    if (ctx.th.top < new_base + np) ctx.th.top = new_base + np;
                 }
 
                 // Grow frame to new proto's register needs.
@@ -23246,6 +23441,14 @@ pub const Vm = struct {
             const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th, self.alloc) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
             var vals_owned = true;
             errdefer if (vals_owned) self.alloc.free(vals);
+            // Root the replayed results across the hook machinery (the
+            // transfer dupe, the Lua hook body) and the frame growth below:
+            // the heap slice is invisible to the collector until the values
+            // land in the caller's registers (same contract as the .owned
+            // arm below).
+            var scope = try self.openRootScope(vals.len, 0);
+            defer scope.close();
+            for (vals) |v| _ = scope.protectValueAssumeCapacity(v);
             fr_call.clearHookYield();
             // Clear the in-flight pending call installed by the original
             // OP_CALL before the callee yielded. The replayed results are in
@@ -23282,15 +23485,13 @@ pub const Vm = struct {
             const nstore: usize = if (nresults >= 0) @intCast(nresults) else vals.len;
             try self.growCtxFrame(ctx, a + nstore);
             for (0..nstore) |i| ctx.regs[a + i] = if (i < vals.len) vals[i] else .Nil;
-            // Publication split by nresults (PUC moveresets/moveresults):
-            // multret (< 0) OVERWRITES top with the occupied bound so the
-            // following B==0 consumer reads the exact count; fixed nresults
-            // only raises top (@max) so the stored results survive the
-            // window-derived GC scans.
-            if (nresults < 0)
-                ctx.th.top = ctx.base + a + vals.len
-            else
-                ctx.th.top = @max(ctx.th.top, ctx.base + a + nstore);
+            // PUC luaD_poscall moveresults (ldo.c:550): L->top = res +
+            // wanted for EVERY contract (multret (< 0) OVERWRITES top with
+            // the occupied bound so the following B==0 consumer reads the
+            // exact count; fixed nresults SETs res+wanted — a plain SET,
+            // never @max: stale slots above the results end are dead and
+            // must die, exactly like PUC's traversethread).
+            ctx.th.top = ctx.base + a + nstore;
             self.alloc.free(vals);
             vals_owned = false;
             // Original code did `ctx.pc += 1; continue;` — skip dispatcher +1.
@@ -23303,6 +23504,16 @@ pub const Vm = struct {
         // bound, and a hook interpolation restores it exactly — see
         // popBytecodeExecFrame).
         const nargs: usize = if (b == 0) (ctx.th.top - ctx.base) - a - 1 else b - 1;
+
+        // PUC OP_CALL (lvm.c:1720): `if (b != 0) L->top.p = ra + b;` —
+        // published BEFORE precall (the __call chain's tryfuncTM, the stack
+        // pre-grow, and the hook machinery below run under it), so the
+        // callee+args region is inside the marked window. B==0 keeps the
+        // producer's already-published occupied bound (no-op).
+        // tryCallMetamethodInPlace raises top in step with the chain's
+        // shift (PUC's shift + top++).
+        if (b != 0) ctx.th.top = ctx.base + a + 1 + nargs;
+
         if (self.stats.enabled) self.stats.calls_slow += 1; // P16.0b (after hook-yield replay: a real call)
 
         // ── PUC luaD_precall: inline callee type resolution ──
@@ -23370,16 +23581,12 @@ pub const Vm = struct {
 
         const rargs = ctx.regs[a + 1 .. a + 1 + effective_nargs];
 
-        // PUC OP_CALL (lvm.c:1726): `if (b != 0) L->top.p = ra + b;` — the
-        // call region end (func + 1 + nargs) is the rolling live limit at
-        // the call instruction. For B==0 this is the
-        // producer's already-published bound (no-op); for fixed B it may
-        // lower th.top from a previous instruction's raise, which is
-        // sound by the freereg discipline (every SET target is at or
-        // above freereg, above all live registers). This also gives
-        // callCFunction its PUC precallC entry invariant — L->top =
-        // func + 1 + nargs — so the C-frame push lands at the args end,
-        // strictly above the in-stack args source (no memcpy alias).
+        // Final bound after the __call chain (the entry publication above
+        // covered the chain window; the chain's shifts raised top in step —
+        // this re-publishes the exact func + 1 + effective_nargs end, the
+        // precallC entry invariant for the C-function arm: the C-frame push
+        // lands at the args end, strictly above the in-stack args source
+        // (no memcpy alias).
         ctx.th.top = ctx.base + a + 1 + effective_nargs;
 
         const resolved_callee = ctx.regs[a];
@@ -23520,6 +23727,13 @@ pub const Vm = struct {
                         .returned => |values| {
                             var values_owned = true;
                             errdefer if (values_owned) self.alloc.free(values);
+                            // Root the gsub results across the hook machinery
+                            // (the transfer dupe, the Lua hook body) and the
+                            // frame growth below — same contract as the
+                            // hook-yield replay arm above.
+                            var scope = try self.openRootScope(values.len, 0);
+                            defer scope.close();
+                            for (values) |v| _ = scope.protectValueAssumeCapacity(v);
                             // P16.50-review-7 BLOCKER 3.2: the hook path
                             // adopts the post payload on every error —
                             // disarm our mirror owner when it errors.
@@ -23548,10 +23762,13 @@ pub const Vm = struct {
                             const nstore: usize = if (nresults >= 0) @intCast(nresults) else values.len;
                             try self.growCtxFrame(ctx, a + nstore);
                             for (0..nstore) |i| ctx.regs[a + i] = if (i < values.len) values[i] else .Nil;
-                            // Multret producer publication (PUC moveresults):
-                            // the occupied bound OVERWRITES the window so the
-                            // following B==0 consumer reads the exact count.
-                            if (nresults < 0) ctx.th.top = ctx.base + a + values.len;
+                            // PUC luaD_poscall moveresults (ldo.c:550):
+                            // L->top = res + wanted for EVERY contract —
+                            // multret publishes the occupied bound for the
+                            // B==0 consumer; fixed nresults SETs res+wanted
+                            // (a plain SET — stale slots above the results
+                            // end are dead and must die).
+                            ctx.th.top = ctx.base + a + nstore;
                             self.alloc.free(values);
                             _ = &values_owned;
                             return .continue_dispatch;
@@ -24033,6 +24250,12 @@ pub const Vm = struct {
                 self.clearPendingCall(ctx.exec_frames.getPtr(ctx.frame_index));
                 var ret_owned = true;
                 errdefer if (ret_owned) self.alloc.free(ret);
+                // Root the IR-closure results across the hook machinery (the
+                // transfer dupe, the Lua hook body) and the frame growth
+                // below — same contract as the .owned arm above.
+                var scope = try self.openRootScope(ret.len, 0);
+                defer scope.close();
+                for (ret) |v| _ = scope.protectValueAssumeCapacity(v);
                 // P16.50-review-7 BLOCKER 3.2: the hook path adopts the
                 // post payload on every error — disarm our mirror owner
                 // when it errors.
@@ -25418,7 +25641,7 @@ pub const Vm = struct {
     }
 
     fn setArgTablePucInternal(self: *Vm, puc_argv: []const []const u8, script: i32) DispatchError!void {
-        const tbl = try self.allocTable(null);
+        const tbl = try self.allocTable();
         const argc: i32 = @intCast(puc_argv.len);
         // PUC: narg = argc - (script + 1)  (positive indices = script args)
         const narg: i32 = if (script >= 0) argc - (script + 1) else argc;
@@ -26022,7 +26245,7 @@ pub const Vm = struct {
     }
 
     fn createDebugTable(self: *Vm) DispatchError!*Table {
-        const mod = try self.allocTable(null);
+        const mod = try self.allocTable();
         try self.fillDebugTable(mod);
         return mod;
     }
@@ -30225,10 +30448,14 @@ pub const Vm = struct {
         // o < th->top.p; o++) markvalue(g, s2v(o));`), replacing the S7
         // per-frame [frameBase..@min(windowTop, top)) loops, the per-C-frame
         // window walk and the top-gap walk below. th.top is the dynamic
-        // occupied bound: windowTop of the current frame during plain
-        // execution (restoreTopAtFrame), the staged C-call region during
-        // builtins/C API (staging publications set th.top = F+1+n /
-        // needed_top), and the precise live limit at checkGC points.
+        // occupied bound: the per-opcode published rolling live limit during
+        // plain execution (OP_CALL/OP_TAILCALL/OP_CONCAT/OP_TFORCALL/
+        // OP_SETLIST/OP_CLOSURE entry publications and the staging/
+        // shift paths publish the operand-region end before their fallible
+        // steps — see publishBcFrameWindowTop and the matching opcode
+        // sites), the staged C-call region during builtins/C API (staging
+        // publications set th.top = F+1+n / needed_top), and the frame
+        // window at frame boundaries (restoreTopAtFrame).
         // Frame func_slots are non-decreasing along the chain (frameBase ==
         // func_slot + 1 and every callee register lives inside its parent's
         // window), and the S5 window checker pins the topmost frame's
@@ -31576,19 +31803,19 @@ pub const Vm = struct {
         //
         // Extent per thread: th.top — exactly the marking bound (PUC clears
         // above L->top, the same L->top traversethread marked below). th.top
-        // is the dynamic occupied bound at the cycle's atomic: windowTop
-        // during plain execution, the staged C-call region at builtin
-        // boundaries, the published yield staging for parked coroutines.
-        // Everything above it was NOT marked this cycle, so any pointer
-        // there would dangle into the sweep — nil it, exactly like PUC.
-        // The clear never touches anything a running opcode needs:
-        // in-flight register values live inside the top frame's window
-        // below th.top (th.top = windowTop during execution; staging
-        // publications raise it — the allocTable/condGcFromDispatch
-        // checkGC analogue raises it to the frame window top before every
-        // dispatch-originated step), continuation state is heap-held, and
-        // parked threads sit at safepoints where the published th.top is
-        // exactly the live extent.
+        // is the dynamic occupied bound at the cycle's atomic: the
+        // per-opcode published rolling live limit during plain execution
+        // (the operand-region end publications at the opcode sites), the
+        // staged C-call region at builtin boundaries, the published yield
+        // staging for parked coroutines. Everything above it was NOT marked
+        // this cycle, so any pointer there would dangle into the sweep —
+        // nil it, exactly like PUC. The clear never touches anything a
+        // running opcode needs: in-flight register values live inside the
+        // published bound (the entry publications at the opcode sites cover
+        // every operand region across the instruction's fallible steps;
+        // staging publications raise it to the staged region), continuation
+        // state is heap-held, and parked threads sit at safepoints where
+        // the published th.top is exactly the live extent.
         //
         // FIRST shrink (luaD_shrinkstack — skipped only in emergency
         // cycles, "do not change stack in emergency cycle"), THEN nil the
@@ -35992,7 +36219,7 @@ pub const Vm = struct {
                     }
                     if (debugInfoHasOpt(what, 'L')) {
                         // Build activelines from Proto's line info.
-                        const act = try self.allocTable(null);
+                        const act = try self.allocTable();
                         for (p.lineinfo) |line| {
                             if (line > 0) {
                                 try self.rawSet(act, .{ .Int = @intCast(line) }, .{ .Bool = true });
@@ -36029,7 +36256,7 @@ pub const Vm = struct {
         var scope = try self.openRootScope(1, 0);
         defer scope.close();
 
-        const t = try self.allocTable(null);
+        const t = try self.allocTable();
         _ = scope.protectValueAssumeCapacity(.{ .Table = t });
 
         try self.setField(t, "currentline", .{ .Int = 0 });
@@ -37428,13 +37655,13 @@ pub const Vm = struct {
         // invisible to the emergency scan. The scope reserves all three
         // slots before any object exists (review-7 discipline).
 
-        const reg = try self.allocTable(null);
+        const reg = try self.allocTable();
         _ = scope.protectValueAssumeCapacity(.{ .Table = reg });
 
-        const hookkey = try self.allocTable(null);
+        const hookkey = try self.allocTable();
         _ = scope.protectValueAssumeCapacity(.{ .Table = hookkey });
 
-        const mt = try self.allocTable(null);
+        const mt = try self.allocTable();
         _ = scope.protectValueAssumeCapacity(.{ .Table = mt });
         try self.setField(mt, "__mode", .{ .String = try self.internStr("k") });
         try self.gcStoreMetatable(hookkey, mt);
@@ -37517,7 +37744,7 @@ pub const Vm = struct {
         // interned key is our equivalent reachability guarantee.
         _ = scope.protectValueAssumeCapacity(.{ .String = key });
         // Edge 3: normal table constructor (register + account).
-        const mt = try self.allocTable(null);
+        const mt = try self.allocTable();
         _ = scope.protectValueAssumeCapacity(.{ .Table = mt });
         // Edge 4: root — the caller's window (PUC's L-stack root; the push
         // IS the root: th.stack below th.top is GC-marked) plus the root
@@ -40831,7 +41058,7 @@ pub const Vm = struct {
         }
 
         if (std.mem.eql(u8, fmt, "*t")) {
-            const tbl = try self.allocTable(null);
+            const tbl = try self.allocTable();
             try self.setField(tbl, "sec", .{ .Int = p.sec });
             try self.setField(tbl, "min", .{ .Int = p.min });
             try self.setField(tbl, "hour", .{ .Int = p.hour });
@@ -44285,7 +44512,7 @@ pub const Vm = struct {
         if (narray > 1_000_000_000 or nhash > 1_000_000_000) return self.fail("table overflow", .{});
         if (narray > std.math.maxInt(usize) - nhash) return self.fail("table overflow", .{});
 
-        const t = try self.allocTable(null);
+        const t = try self.allocTable();
         if (narray != 0 or nhash != 0) {
             try self.tableResize(t, @intCast(narray), @intCast(nhash));
         }
@@ -44487,7 +44714,7 @@ pub const Vm = struct {
 
     fn builtinTablePack(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
-        const tbl = try self.allocTable(null);
+        const tbl = try self.allocTable();
         for (args, 0..) |v, i| {
             const k: i64 = @intCast(i + 1);
             try self.tableSetValue(tbl, .{ .Int = k }, v);
@@ -46424,11 +46651,6 @@ pub const Vm = struct {
             return self.fail("attempt to call a {s} value", .{current_callee.typeName()});
         }
 
-        // getTmByObj may have triggered GC (via allocTable inside table
-        // lookup), which can realloc stack and invalidate regs.*.
-        // Always refresh regs.* here, even if bcGrowFrame is not needed.
-        regs.* = self.activeBytecodeThread().stack[base .. base + frame_cap.*];
-
         // Ensure the frame has space for one extra slot (the shift target).
         // PUC does this via checkstackp(L, 1, func) before the shift.
         const needed = a + 1 + nargs.* + 1;
@@ -46452,6 +46674,17 @@ pub const Vm = struct {
 
         nargs.* += 1;
         chain_depth.* += 1;
+        // PUC tryfuncTM (ldo.c:523): after the shift `L->top.p++` — the
+        // published bound grows with the chain (the caller's entry
+        // publication covers func+1+nargs; each link adds the shifted
+        // callee as one more arg). @max keeps a higher bound another
+        // instruction published (bcGrowFrame's window form); the caller's
+        // final publication sets the exact func + 1 + effective_nargs end.
+        {
+            const th = self.activeBytecodeThread();
+            const bound = base + a + 1 + nargs.*;
+            if (th.top < bound) th.top = bound;
+        }
     }
 
     /// Dispatch to the correct execution engine for a closure.
@@ -48188,19 +48421,19 @@ pub const Vm = struct {
         var scope = try self.openRootScope(3, 0);
         defer scope.close();
 
-        const upvals = try self.allocTable(null);
+        const upvals = try self.allocTable();
         _ = scope.protectValueAssumeCapacity(.{ .Table = upvals });
 
         for (args, 0..) |v, i| {
             try self.tableSetValue(upvals, .{ .Int = @intCast(i + 1) }, v);
         }
-        const ccl = try self.allocTable(null);
+        const ccl = try self.allocTable();
         _ = scope.protectValueAssumeCapacity(.{ .Table = ccl });
 
         try self.setField(ccl, "__testc_upvalues", .{ .Table = upvals });
         try self.setField(ccl, "__testc_upenv", self.currentCallableEnvValue());
         try self.setField(ccl, "__testc_script_upvalue", .{ .Bool = true });
-        const mt = try self.allocTable(null);
+        const mt = try self.allocTable();
         _ = scope.protectValueAssumeCapacity(.{ .Table = mt });
         try self.setField(mt, "__call", .{ .Builtin = .testc_testC });
         try self.gcStoreMetatable(ccl, mt);
@@ -48351,18 +48584,18 @@ pub const Vm = struct {
         var scope = try self.openRootScope(7, 0);
         defer scope.close();
 
-        const root = try self.allocTable(null);
+        const root = try self.allocTable();
         _ = scope.protectValueAssumeCapacity(.{ .Table = root });
         try self.setField(root, "instructions", statVal(s.instructions_total));
 
-        const ops = try self.allocTable(null);
+        const ops = try self.allocTable();
         _ = scope.protectValueAssumeCapacity(.{ .Table = ops });
         inline for (@typeInfo(bc.Op).@"enum".fields) |f| {
             try self.setField(ops, f.name, statVal(s.instructions_by_op[f.value]));
         }
         try self.setField(root, "op_histogram", .{ .Table = ops });
 
-        const calls = try self.allocTable(null);
+        const calls = try self.allocTable();
         _ = scope.protectValueAssumeCapacity(.{ .Table = calls });
         try self.setField(calls, "fast", statVal(s.calls_fast));
         try self.setField(calls, "slow", statVal(s.calls_slow));
@@ -48372,7 +48605,7 @@ pub const Vm = struct {
         try self.setField(calls, "c", statVal(s.calls_c));
         try self.setField(root, "calls", .{ .Table = calls });
 
-        const tables = try self.allocTable(null);
+        const tables = try self.allocTable();
         _ = scope.protectValueAssumeCapacity(.{ .Table = tables });
         try self.setField(tables, "get_fast_int", statVal(s.tbl_get_fast_int));
         try self.setField(tables, "get_fast_str", statVal(s.tbl_get_fast_str));
@@ -48385,7 +48618,7 @@ pub const Vm = struct {
         try self.setField(tables, "rehash", statVal(s.tbl_rehash));
         try self.setField(root, "tables", .{ .Table = tables });
 
-        const allocs = try self.allocTable(null);
+        const allocs = try self.allocTable();
         _ = scope.protectValueAssumeCapacity(.{ .Table = allocs });
         inline for (@typeInfo(GcObject).@"union".fields, 0..) |f, i| {
             try self.setField(allocs, f.name, statVal(s.alloc_by_type[i]));
@@ -48393,13 +48626,13 @@ pub const Vm = struct {
         try self.setField(allocs, "bytes_total", statVal(s.alloc_bytes_total));
         try self.setField(root, "allocs", .{ .Table = allocs });
 
-        const gc = try self.allocTable(null);
+        const gc = try self.allocTable();
         _ = scope.protectValueAssumeCapacity(.{ .Table = gc });
         try self.setField(gc, "steps_auto", statVal(s.gc_steps_auto));
         try self.setField(gc, "steps_manual", statVal(s.gc_steps_manual));
         try self.setField(root, "gc", .{ .Table = gc });
 
-        const yr = try self.allocTable(null);
+        const yr = try self.allocTable();
         _ = scope.protectValueAssumeCapacity(.{ .Table = yr });
         try self.setField(yr, "yields", statVal(s.yields));
         try self.setField(yr, "resumes", statVal(s.resumes));
@@ -49607,14 +49840,14 @@ pub const Vm = struct {
                 // commit below is the ONLY window mutation.
                 try win.ensure(1);
 
-                const upvals = try self.allocTable(null);
+                const upvals = try self.allocTable();
                 _ = scope.protectValueAssumeCapacity(.{ .Table = upvals });
 
                 const base = win.count() - n;
                 for (0..n) |i| {
                     try self.tableSetValue(upvals, .{ .Int = @intCast(i + 1) }, win.slot(base + i));
                 }
-                const ccl = try self.allocTable(null);
+                const ccl = try self.allocTable();
                 _ = scope.protectValueAssumeCapacity(.{ .Table = ccl });
 
                 try self.setField(ccl, "__testc_upvalues", .{ .Table = upvals });
@@ -49628,7 +49861,7 @@ pub const Vm = struct {
                 const envv = ctx.upenv orelse self.currentCallableEnvValue();
                 try self.setField(ccl, "__testc_upenv", envv);
                 try self.setField(ccl, "__testc_script_upvalue", .{ .Bool = false });
-                const mt = try self.allocTable(null);
+                const mt = try self.allocTable();
                 _ = scope.protectValueAssumeCapacity(.{ .Table = mt });
                 try self.setField(mt, "__call", .{ .Builtin = .testc_testC });
                 try self.gcStoreMetatable(ccl, mt);
@@ -54163,9 +54396,12 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
             @as(u32, INVALID_PENDING),
             exec_frames.getPtr(parent_index).pending_call_index,
         );
-        // 4. top restored (staging never bumps it; the activation
-        //    failed before its own top update).
-        try testing.expectEqual(saved_top, th.top);
+        // 4. top at the staged end (PUC luaT_callTMres: staging func+args
+        //    publishes `L->top = func + 3`; the activation failed after
+        //    staging, and PUC's own error unwind leaves top at the staged
+        //    end too — the dead staged region is reclaimed by the next
+        //    publication).
+        try testing.expectEqual(saved_top + 1 + args.len, th.top);
     }
 
     // ── Failure point 2: FrameStack.addOne fails AFTER staging AND after
@@ -54205,9 +54441,10 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
             @as(u32, INVALID_PENDING),
             exec_frames.getPtr(parent_index).pending_call_index,
         );
-        // top was set to needed_top before addOne failed — the
-        // errdefer must have restored it.
-        try testing.expectEqual(saved_top, th.top);
+        // top at the staged end (see failure point 1: staging publishes
+        // `func + 1 + nargs`; the activation's errdefer restores to its
+        // entry bound, which is the staged end after the staging bump).
+        try testing.expectEqual(saved_top + 1 + args.len, th.top);
     }
 
     // ── Success iteration: staging + activation both succeed. ──
@@ -55265,7 +55502,7 @@ test "P16.49-review-2: OLD0 promotion charges added-old exactly once (PUC sweepg
 
     // Old owner: created BEFORE entering generational mode, then made old
     // by the mode-transition full collection (temp-rooted so it survives).
-    const owner = try vm.allocTable(null);
+    const owner = try vm.allocTable();
     {
         var scope = try vm.openRootScope(1, 0);
         defer scope.close();
@@ -55274,7 +55511,7 @@ test "P16.49-review-2: OLD0 promotion charges added-old exactly once (PUC sweepg
         try testing.expect(owner.gc.age.isOld());
     }
     // Young child (registered in gen-minor → age .new, in young list).
-    const child = try vm.allocTable(null);
+    const child = try vm.allocTable();
     try testing.expect(child.gc.age == .new);
 
     var scope = try vm.openRootScope(3, 0);
@@ -55312,7 +55549,7 @@ test "P16.49-review-2: OLD0 promotion charges added-old exactly once (PUC sweepg
     // (gc_gen_added_old_kb >= base * minormajor%). A build without the
     // OLD0 charge stays minor here — the negative validation. Uses a
     // FRESH young child: the first one is already OLD by now (markold).
-    const child2 = try vm.allocTable(null);
+    const child2 = try vm.allocTable();
     _ = scope.protectValueAssumeCapacity(.{ .Table = child2 });
     try vm.gcForwardBarrierValue(.{ .Table = owner }, .{ .Table = child2 });
     try testing.expect(child2.gc.age == .old0);
@@ -56149,7 +56386,7 @@ test "P16.50: allocTable/allocUserdata OOM transactionality + testc memory edges
 
         if (result) |t| {
             first_success_idx = fail_idx;
-            p50TeardownTable(&vm, t, false); // Ephemeral never touches the counter
+            p50TeardownTable(&vm, t, true); // Ephemeral counts like any table (T.totalmem parity)
             try snap.assertRestored(&vm);
             break;
         } else |err| {
@@ -58374,6 +58611,7 @@ test "P16.50-review-2 B1: opClosure heap worklist (nups=20) mixed OOM matrix" {
 
     var parent_builder = bc.ProtoBuilder.init(vm.alloc);
     errdefer parent_builder.deinit();
+    parent_builder.checkStack(12); // R11 needs 12 registers (emitABC does not track usage)
     _ = try parent_builder.emitABC(.closure, 11, 0, 0, 1); // R11 := closure(P[0])
     _ = try parent_builder.emitSimple(.return0, 1);
     for (0..10) |i| {
@@ -68004,7 +68242,7 @@ test "P16.50-review-14 D: rawSet rehash window roots tbl/key/val across the emer
     // tbl with an EMPTY hash part (PUC dummy node): the first new-key
     // insert deterministically takes the rehash branch (nodeInsert has no
     // free slot to offer).
-    tbl = try vm.allocTable(null);
+    tbl = try vm.allocTable();
     _ = setup_scope.protectValueAssumeCapacity(.{ .Table = tbl });
 
     // key/val are FRESH tables — after setup_scope.close() below they live
@@ -68012,9 +68250,9 @@ test "P16.50-review-14 D: rawSet rehash window roots tbl/key/val across the emer
     // roots them across the rehash window. Pre-fix shape: the emergency
     // GC at the rehash allocation swept them and the post-rehash insert
     // published dangling pointers.
-    key_tbl = try vm.allocTable(null);
+    key_tbl = try vm.allocTable();
     _ = setup_scope.protectValueAssumeCapacity(.{ .Table = key_tbl });
-    val_tbl = try vm.allocTable(null);
+    val_tbl = try vm.allocTable();
     _ = setup_scope.protectValueAssumeCapacity(.{ .Table = val_tbl });
 
     // Pre-reserve the root-vector capacity the production RootScope's
@@ -68084,15 +68322,15 @@ test "P16.50-review-14 D: rawSet no-rehash insert opens ZERO temp-root sessions"
     // Pre-sized constructor shape (OP_NEWTABLE pre-allocates the hinted
     // hash part — the `{v = i}` workload): 8 hash slots, no array part.
     // Every insert below fits → nodeInsert succeeds → no rehash.
-    const tbl = try vm.allocTable(null);
+    const tbl = try vm.allocTable();
     _ = scope.protectValueAssumeCapacity(.{ .Table = tbl });
     try vm.tableResize(tbl, 0, 8);
 
     // GC-object key/val — the exact case the temp-root session exists to
     // protect. Sessions are counted across ONLY the rawSet call (the
     // setup allocations may legitimately open their own sessions).
-    const key_a = try vm.allocTable(null);
-    const val_a = try vm.allocTable(null);
+    const key_a = try vm.allocTable();
+    const val_a = try vm.allocTable();
     _ = scope.protectValueAssumeCapacity(.{ .Table = key_a });
     _ = scope.protectValueAssumeCapacity(.{ .Table = val_a });
 
@@ -68103,8 +68341,8 @@ test "P16.50-review-14 D: rawSet no-rehash insert opens ZERO temp-root sessions"
     try testing.expectEqual(sessions_before, vm.stats.gc_root_scope_sessions); // ZERO session work
 
     // A second fitting insert (distinct fresh key/val) — same proof.
-    const key_b = try vm.allocTable(null);
-    const val_b = try vm.allocTable(null);
+    const key_b = try vm.allocTable();
+    const val_b = try vm.allocTable();
     _ = scope.protectValueAssumeCapacity(.{ .Table = key_b });
     _ = scope.protectValueAssumeCapacity(.{ .Table = val_b });
     try vm.rawSet(tbl, .{ .Table = key_b }, .{ .Table = val_b });
@@ -68117,10 +68355,10 @@ test "P16.50-review-14 D: rawSet no-rehash insert opens ZERO temp-root sessions"
 
     // Control: the rehash branch (empty hash part — PUC dummy) opens
     // exactly ONE session around the resize + re-insert window.
-    const tbl2 = try vm.allocTable(null);
+    const tbl2 = try vm.allocTable();
     _ = scope.protectValueAssumeCapacity(.{ .Table = tbl2 });
-    const key_c = try vm.allocTable(null);
-    const val_c = try vm.allocTable(null);
+    const key_c = try vm.allocTable();
+    const val_c = try vm.allocTable();
     _ = scope.protectValueAssumeCapacity(.{ .Table = key_c });
     _ = scope.protectValueAssumeCapacity(.{ .Table = val_c });
     const sessions_control = vm.stats.gc_root_scope_sessions;

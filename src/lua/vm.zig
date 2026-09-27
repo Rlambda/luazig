@@ -11845,6 +11845,7 @@ pub const Vm = struct {
             };
             var obj: Value = undefined;
             var from_chain = false;
+            var tbc_reg: u8 = undefined;
             if (chain_gate and state.owner_thread.c_tbc_chain.items.len > parent.tbc_chain_base) {
                 const chain = &state.owner_thread.c_tbc_chain;
                 const entry = chain.items[chain.items.len - 1];
@@ -11877,7 +11878,7 @@ pub const Vm = struct {
                 }
 
                 const close_index = found_index orelse break;
-                const tbc_reg = state.owner_thread.bytecode_tbc_regs.items[close_index];
+                tbc_reg = state.owner_thread.bytecode_tbc_regs.items[close_index];
                 _ = state.owner_thread.bytecode_tbc_regs.orderedRemove(close_index);
                 state.scan_index = close_index;
 
@@ -11942,20 +11943,61 @@ pub const Vm = struct {
                 else => return resolve_err,
             };
             defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-            // PUC luaF_close → luaT_callTM stages func+obj(+err) at L->top,
-            // then luaD_call/luaD_callnoyield activates. Both activation
-            // arms below stage the callee at th.top (the Lua-closure arm
-            // via stageBytecodeCall; the direct builtin/sync arm via
-            // callMetamethod → callBuiltin's C-frame push), so th.top must
-            // sit at the parent frame's window top, above every live
-            // register of the closing frame (PUC Protect parity,
-            // lvm.c:1151) — otherwise the staging overwrites a live TBC
-            // register that a later entry in this region still has to
-            // read.
+            // PUC luaF_close → prepcallclosemth (lfunc.c) → callclosemethod
+            // stages func+obj(+err) at L->top, then luaD_call activates.
+            // Both activation arms below stage the callee at th.top, so the
+            // published top decides which stale slots the staging clobbers
+            // (weak-table observable) and must match PUC's bound per path:
+            //   .return_frame (OP_RETURN k, CLOSEKTOP): lvm.c:1772 raises
+            //     L->top to ci->top = base + maxstacksize before luaF_close
+            //     (raise-only; a higher producer top stays) and CLOSEKTOP
+            //     keeps it — errobj is NULL, staging is 2 slots.
+            //   .advance_instruction (OP_CLOSE, LUA_OK): prepcallclosemth
+            //     SETS L->top = level + 1 ("call will be at this level"),
+            //     overriding OP_CLOSE's Protect (top = ci->top) — staging is
+            //     2 slots at level+1, no error object.
+            //   .unwind_frame (error): luaD_seterrorobj writes the in-flight
+            //     error at level+1 and sets top = level + 2 — staging is 3
+            //     slots (func, obj, err).
+            // level = the entry's register (frameBase + tbc_reg). Entries
+            // close in decreasing register order (the scan walks
+            // bytecode_tbc_regs downward), so the staging at level+1/level+2
+            // sits above every pending entry's slot and above the live
+            // registers below the close boundary (PUC Protect parity,
+            // lvm.c:1151) — it only clobbers dead slots of the dying
+            // region, exactly like PUC. C-chain marks keep the window-top
+            // raise: their PUC levels live above the frame's register file
+            // (hook/view C windows), so the window top is the closest
+            // native bound (documented approximation, no observable
+            // differential).
             if (!parent.isC()) {
-                const close_window = parent.windowTop();
-                if (state.owner_thread.top < close_window)
-                    state.owner_thread.top = close_window;
+                if (from_chain) {
+                    const close_window = parent.windowTop();
+                    if (state.owner_thread.top < close_window)
+                        state.owner_thread.top = close_window;
+                } else switch (state.post) {
+                    .return_frame => {
+                        const puc_top = parent.frameBase() + parent.proto().?.maxstacksize;
+                        if (state.owner_thread.top < puc_top)
+                            state.owner_thread.top = puc_top;
+                    },
+                    .advance_instruction => {
+                        state.owner_thread.top = parent.frameBase() + @as(usize, tbc_reg) + 1;
+                    },
+                    .unwind_frame => {
+                        const level = parent.frameBase() + @as(usize, tbc_reg);
+                        state.owner_thread.stack[level + 1] = state.current_err orelse .Nil;
+                        state.owner_thread.top = level + 2;
+                    },
+                    .retry_tailcall => {
+                        // Unreachable with regs entries: the compiler never
+                        // emits a tailcall from a function with TBC
+                        // obligations, so the bc region is empty here.
+                        const close_window = parent.windowTop();
+                        if (state.owner_thread.top < close_window)
+                            state.owner_thread.top = close_window;
+                    },
+                }
             }
             if (resolved.callee == .Closure and resolved.callee.Closure.proto != null) {
                 // P16.52: PUC callclosemethod (lfunc.c:107) → luaD_call(yy=1)
@@ -12397,8 +12439,16 @@ pub const Vm = struct {
         // assert-closure register, which then got called with the
         // comparison result as its argument).
         if (!parent.isC()) {
-            const parent_window = parent.windowTop();
-            if (th.top < parent_window) th.top = parent_window;
+            // PUC Protect/savestate bound: luaT_callTMres stages above
+            // every live caller register, but the published extent is
+            // exactly ci->top = frameBase + proto.maxstacksize — the
+            // register file as the compiler sees it. windowTop() here
+            // (maxstacksize + EXTRA_MARGIN) would over-mark stale slots
+            // above the register file and change weak-table visibility
+            // relative to PUC.
+            const proto_max = parent.proto().?.maxstacksize;
+            const puc_top = parent.frameBase() + proto_max;
+            if (th.top < puc_top) th.top = puc_top;
         }
 
         if (mode == .pending) {
@@ -13041,8 +13091,17 @@ pub const Vm = struct {
             // so raising to its "window top" is both semantically wrong
             // (PUC skips it) and an integer underflow.
             if (!parent_fr.isC()) {
-                const parent_window = parent_fr.frameBase() + parent_fr.frameCap();
-                if (th.top < parent_window) th.top = parent_window;
+                // PUC luaD_hook (ldo.c): the raise target is ci->top =
+                // base + maxstacksize — the register file end, NOT the
+                // grown window (maxstacksize + EXTRA_MARGIN). The hook
+                // frame is staged at the raised top, so the bound decides
+                // whether a stale slot at the file end is clobbered by the
+                // staged hook closure (PUC: yes — hookf stages the Lua hook
+                // at L->top = ci->top) or survives inside the marked
+                // region (weak-table observable).
+                const proto_max = parent_fr.proto().?.maxstacksize;
+                const puc_top = parent_fr.frameBase() + proto_max;
+                if (th.top < puc_top) th.top = puc_top;
             }
         }
         // PUC luaD_hook: the hook function + event/line args are staged on
@@ -17285,10 +17344,12 @@ pub const Vm = struct {
     /// like PUC's OP_CALL which skips the staging because the operands are
     /// already in the caller's registers).
     ///
-    /// `top` is NOT bumped by staging: the activation owns the
-    /// top update (top = windowTop()) and its errdefer
-    /// restores the old top on failure — identical transactionality to the
-    /// previous prepareHostArgs-based flow. Staged values above
+    /// `top` is NOT bumped by staging itself: the activation owns the
+    /// top update — it first publishes the PUC Protect/savestate bound
+    /// (raise-only to ci->top = frameBase + maxstacksize; see
+    /// pushResolvedBytecodeClosure) and its errdefer restores the old
+    /// top on failure — identical transactionality to the previous
+    /// prepareHostArgs-based flow. Staged values above the published
     /// top are not GC-marked through stack, exactly as before;
     /// their sources (caller registers / host slices / metatables) remain
     /// reachable across the stage→activate window, and the activation
@@ -21428,6 +21489,24 @@ pub const Vm = struct {
                             // parameter slot only at the very end).
                             ctx.regs = ctx.th.stack[ctx.base .. ctx.base + ctx.cap];
                             ctx.regs[va_reg] = .{ .Table = t };
+                        } else {
+                            // VAHID (no vararg table): PUC adjustvarargs
+                            // (ltm.c:277-278) explicitly nils the vararg
+                            // parameter slot after buildhiddenargs —
+                            // `setnilvalue(s2v(ci->func.p + nfixparams + 1))`.
+                            // The slot is never written by the activation:
+                            // the staged args end at the last fixed param (or
+                            // at the first extra arg, which the shift leaves
+                            // BELOW the new func), so without this write the
+                            // slot keeps stale stack content. OP_GETVARG
+                            // distinguishes VATAB from VAHID by testing this
+                            // register for a Table — a stale Table there
+                            // redirects every `t[k]` access to the garbage
+                            // table (observed: __close metamethod staged
+                            // inside the parent's register file, locals.lua
+                            // "presence of second argument"). Nil it here,
+                            // exactly at PUC's VARARGPREP-time write.
+                            ctx.regs[ctx.cur_proto.numparams] = .Nil;
                         }
                     },
 
@@ -37324,9 +37403,15 @@ pub const Vm = struct {
         // divert-bound builtin call hooks) stages hook traffic at th.top,
         // which a multret producer may have lowered into the current
         // activation's live registers. Raise to the current Lua frame's
-        // window top for the duration of the hook and restore the pre-hook
-        // top EXACTLY afterwards (PUC restoretop), preserving a producer's
-        // occupied bound for the following B==0 consumer. C frames get no
+        // ci->top = base + maxstacksize — the register file end, above
+        // every live register, NOT the grown window (maxstacksize +
+        // EXTRA_MARGIN) — for the duration of the hook and restore the
+        // pre-hook top EXACTLY afterwards (PUC restoretop), preserving a
+        // producer's occupied bound for the following B==0 consumer. The
+        // bound decides whether a stale slot at the file end is clobbered
+        // by the staged hook traffic (PUC: yes) or survives inside the
+        // marked region (weak-table observable via a GC inside the hook —
+        // the async analog is proven by probe_hook2). C frames get no
         // raise (PUC's isLua(ci) guard — a C activation's top is already
         // L->top-derived); with no Lua frame current there is nothing to
         // protect.
@@ -37335,10 +37420,10 @@ pub const Vm = struct {
             if (sync_th.call_frames.len() > 0) {
                 const cur = sync_th.call_frames.getConstPtr(sync_th.call_frames.len() - 1);
                 if (!cur.isC()) {
-                    const window_top = cur.frameBase() + cur.frameCap();
-                    if (sync_th.top < window_top) {
+                    const puc_top = cur.frameBase() + cur.proto().?.maxstacksize;
+                    if (sync_th.top < puc_top) {
                         const saved_sync_top = sync_th.top;
-                        sync_th.top = window_top;
+                        sync_th.top = puc_top;
                         defer sync_th.top = saved_sync_top;
                     }
                 }

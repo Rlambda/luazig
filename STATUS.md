@@ -206,6 +206,57 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   hot path без session); decisive GC-root proof + canonical
   t2_gc_bound_publication.lua; комментарий-«доказательство» 17903
   опровергнут и удалён.
+  REVIEW `fc42243`: RootScope на fallible apply-путях присутствует, но
+  заявленный decisive GC-root proof не представлен: canonical suite не
+  изолирует heap-`ret` с единственным GC-visible объектом на `bcGrowFrame`
+  emergency после pop child frame; RED класса 1 не доказывает класс 2.
+  Закрытие отложено до focused negative-before/mutation и PUC-differential,
+  без вывода о том, что сам RootScope неверен. Open-count 25→26.
+  CLOSED (t2 correction, decisive runtime proof): negative-mutation —
+  отключение .return_frame completion-scope + protection-wrap scope
+  (apply-пути) → emergency GC сметает объект, живущий ТОЛЬКО в heap-ret
+  (RED weak[1]==nil); восстановление → GREEN. Дискриминатор:
+  tests/stress/t2c_apply_path_root_scope.lua; RootScope покрывает ровно
+  fallible окно от потери stack-root до публикации в parent; infallible
+  hot path без session.
+
+- [x] **Parity BLOCKER, FIX-NOW: PUC-точная публикация перед Lua-метаметодом
+  не завершена в t2 implementation** (review `fc42243`).
+  `pushResolvedBytecodeClosure` поднимает `th.top` до
+  `parent.windowTop()` с `EXTRA_MARGIN`, тогда как PUC `Protect/savestate`
+  публикует ровно `ci->top = frameBase + maxstacksize`; соседний
+  `protectSyncMetamethodWindow` уже использует точную границу. Это
+  сохраняет мёртвый объект в margin на GC внутри `__add`.
+  Независимый weak-value differential
+  `/tmp/opencode/review_t2_margin.lua`: PUC 5.5 `true true`, luazig
+  Debug/RF `false false` (immutable pre-stage binary тоже `false false`:
+  происхождение pre-existing, но заявленный инвариант этапа не выполнен).
+  Требуется аудит остальных `windowTop` публикаций на MayGC и исправление
+  только реально отличающихся от PUC границ. Open-count 26→27.
+  CLOSED (t2 correction): публикация метаметод-стейджинга — ровно PUC
+  ci->top = frameBase()+proto.maxstacksize. pushResolvedBytecodeClosure
+  (обоих modes .pending/.simple_result): прежний windowTop() включал
+  EXTRA_MARGIN=5 → over-marking stale-слотов (weak-retention: PUC true
+  true, luazig false false). Hook-пути: luaD_hook-parity raise до
+  frameBase()+maxstacksize (~13051, ~37379). continueBytecodeClose —
+  per-path staging bounds PUC prepcallclosemth (.return_frame raise-only
+  ci->top; .advance_instruction SET level+1; .unwind_frame err
+  level+1/top=level+2); попутно закрыт latent VAHID-else vararg-param
+  nil (PUC ltm.c:277-278; locals.lua:315 RED→GREEN). Evidence: canonical
+  tests/smoke/88_metamethod_window_gc_boundary.lua (10 секций, byte-exact
+  PUC Debug+RF; baseline fc42243 fails 9/11); t2-сценарий/stress — GREEN.
+  Perf A/B fc42243(ac8515f2)↔final(4bfdc08d) paired instructions:
+  только metamethod_add +0.117% (раскрыто), остальные 6 workload ±0.000%.
+
+- [ ] **Evidence BLOCKER, FIX-NOW: perf A/B этапа t2 не относится к
+  финальному product-бинарю** (review `fc42243`). Скрипт
+  `/tmp/opencode/t2_ab.sh` измерял `/tmp/opencode/luazig_final_rf`
+  (mtime 03:52, SHA-256 `315b7064…`); последняя product-правка
+  `testc_obj_tables` сделана позже, commit 05:52. Поэтому заявленные
+  geomean 0.996 и worst +5.9% не являются финальным замером. Нужен
+  повторный A/B на immutable бинарях точного финального source с hashes,
+  toolchain и сырыми paired результатами; скорость не является gate.
+  Open-count 27→28.
 
 - [ ] **C API: `lua_pushvalue(lua_upvalueindex(n))` возвращает не upvalue
   (BLOCKER, ORDINARY-BACKLOG)**. Независимый C-оракул
@@ -1349,6 +1400,10 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   GREEN; fmt/diff-check clean. Perf A/B d83d565↔final: geomean 0.996
   (нейтрально; худший +5.9% table_alloc_setmetatable — цена PUC-exact
   OP_NEWTABLE; лучший −10.4%).
+  REVIEW `fc42243`: конкретная потеря callee исправлена и независимо
+  подтверждена; более широкий PUC-точный invariant не закрыт из-за
+  отдельного `pushResolvedBytecodeClosure` Parity BLOCKER выше.
+  Заявление о perf финального дерева также отозвано до повторного A/B.
 
 - [ ] **Parity HIGH (pre-existing, REDESIGN-констрейнт): yieldability
   pcall-recovery close (16118-ветка) расходится с PUC finishpcallk**:

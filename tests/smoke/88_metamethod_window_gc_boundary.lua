@@ -7,7 +7,10 @@
 -- retained through a collectgarbage() inside the metamethod (weak-table
 -- observable). The dead object is planted by make() at exactly the caller's
 -- ci->top (make's first local past the pad lands there when the call
--- register is the caller's last live register).
+-- register is the caller's last live register); section [11] plants it in
+-- a dead multret slot ABOVE the register file instead (a B==0 producer's
+-- leftover that the metamethod savestate plain-set drops back to the file
+-- end — PUC lvm.c:1151).
 -- Also covers the __close staging bounds (PUC prepcallclosemth per path:
 -- OP_RETURN k = max(top, ci->top); OP_CLOSE = level+1; error unwind =
 -- level+2 with the error object written at level+1) and the debug-hook
@@ -199,4 +202,33 @@ do
   caller()
   debug.sethook()
   print("hook-ret-builtin", weak[1] == nil)
+end
+
+-- [11] high rolling top after a B==0 multret consumer: many() returns 25
+-- values, {many()} (SETLIST B==0) consumes them but leaves the rolling top
+-- ABOVE the caller's register file, with the weak-registered object parked
+-- in a dead multret slot beyond the file end. The next metamethod's
+-- savestate is a PLAIN SET to ci->top (PUC lvm.c:1151 savestate — raised
+-- or lowered): the dead multret slots above the file end become
+-- GC-invisible, so the object dies in the metamethod's collectgarbage;
+-- after the metamethod the VM continues on the lowered top and the next
+-- GC cycle keeps the object dead.
+do
+  local trigger = setmetatable({}, {__add = function()
+    collectgarbage(); collectgarbage()
+    return weak[1] == nil
+  end})
+  local function many()
+    local o = {}
+    weak[1] = o
+    return 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,o
+  end
+  local function caller()
+    local t = {many()}
+    t = nil
+    return trigger + 1
+  end
+  local r = caller()
+  collectgarbage()
+  print("add-high-top", r, weak[1] == nil)
 end

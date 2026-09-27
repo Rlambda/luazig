@@ -12429,26 +12429,28 @@ pub const Vm = struct {
         }
 
         // PUC Protect (lvm.c:1151-1158): savestate sets L->top = ci->top —
-        // the CURRENT frame's window top — before every metamethod call, so
-        // luaT_callTMres stages func+args ABOVE every live register of the
-        // caller. Stage at the parent's window top too: the
-        // rolling th.top can sit below live caller registers (e.g. a call
-        // results end below a callee temp loaded by a later instruction),
-        // and staging there would clobber them (observed: the __lt yield
-        // test in coroutine.lua — the staging overwrote the caller's
-        // assert-closure register, which then got called with the
-        // comparison result as its argument).
+        // the CURRENT frame's register-file end — before every metamethod
+        // call, so luaT_callTMres stages func+args ABOVE every live
+        // register of the caller. Stage at the parent's register-file end
+        // too: the rolling th.top can sit below live caller registers
+        // (e.g. a call results end below a callee temp loaded by a later
+        // instruction), and staging there would clobber them (observed:
+        // the __lt yield test in coroutine.lua — the staging overwrote
+        // the caller's assert-closure register, which then got called
+        // with the comparison result as its argument).
         if (!parent.isC()) {
-            // PUC Protect/savestate bound: luaT_callTMres stages above
-            // every live caller register, but the published extent is
-            // exactly ci->top = frameBase + proto.maxstacksize — the
-            // register file as the compiler sees it. windowTop() here
-            // (maxstacksize + EXTRA_MARGIN) would over-mark stale slots
-            // above the register file and change weak-table visibility
-            // relative to PUC.
+            // PUC savestate(L,ci) — a PLAIN SET before Protect
+            // (lvm.c: L->top.p = ci->top.p): the published extent is
+            // exactly ci->top = frameBase + proto.maxstacksize, raised
+            // OR lowered. After a B==0/many() producer the rolling top
+            // can sit ABOVE the caller's register file (multret results
+            // staged beyond maxstacksize); PUC drops it back to the file
+            // end so the dead multret slots are not GC-visible (weak
+            // tables observe the difference). Staging then proceeds
+            // ABOVE the file end exactly like PUC luaT_callTMres at
+            // L->top = ci->top.
             const proto_max = parent.proto().?.maxstacksize;
-            const puc_top = parent.frameBase() + proto_max;
-            if (th.top < puc_top) th.top = puc_top;
+            th.top = parent.frameBase() + proto_max;
         }
 
         if (mode == .pending) {
@@ -13070,17 +13072,22 @@ pub const Vm = struct {
         post_owned = false;
         struct_owned = false;
         identity_armed = false;
-        // PUC luaD_hook (ldo.c): `if (isLua(ci) && L->top < ci->top)
-        // L->top = ci->top;` — raise the staging position to the parent
-        // activation's window top. A multret producer (OP_VARARG/OP_CALL
-        // with B==0) may have lowered th.top to its occupied bound inside
-        // the parent's live registers; staging the hook frame there would
-        // clobber them (the staged hook closure overwrites the parent's
-        // callee register, and the .retry_call completion then re-calls
-        // the hook itself — the db.lua "crl" corruption). Save the pre-hook
-        // top first: the hook frame's pop restores it EXACTLY (PUC
-        // restoretop), so the following B==0 consumer still reads the
-        // producer's occupied bound.
+        // PUC luaD_hook (ldo.c:449-451): `if (isLua(ci) && L->top < ci->top)
+        // L->top = ci->top;` — RAISE-ONLY, unlike savestate's plain set
+        // (lvm.c:1151, see pushResolvedBytecodeClosure): the pre-hook top
+        // may be a LIVE multret occupied bound — a B==0 producer's results
+        // that the instruction after the hook still consumes — and the
+        // hook must not lower it (the B==0 consumer derives its count from
+        // top; PUC restores the saved top EXACTLY afterwards so the
+        // consumer reads the producer's bound). A top above ci->top (e.g.
+        // the stale multret end after a B==0 SETLIST) likewise stays:
+        // luaD_hook only ever raises a below-file staging position into
+        // the register file, because staging the hook frame there would
+        // clobber live registers (the staged hook closure overwrites the
+        // parent's callee register, and the .retry_call completion then
+        // re-calls the hook itself — the db.lua "crl" corruption). Save
+        // the pre-hook top first: the hook frame's pop restores it
+        // EXACTLY (PUC restoretop).
         {
             const parent_fr = exec_frames.getPtr(parent_index);
             th.debug_hook_saved_top = th.top;
@@ -17344,16 +17351,26 @@ pub const Vm = struct {
     /// like PUC's OP_CALL which skips the staging because the operands are
     /// already in the caller's registers).
     ///
-    /// `top` is NOT bumped by staging itself: the activation owns the
-    /// top update — it first publishes the PUC Protect/savestate bound
-    /// (raise-only to ci->top = frameBase + maxstacksize; see
-    /// pushResolvedBytecodeClosure) and its errdefer restores the old
-    /// top on failure — identical transactionality to the previous
-    /// prepareHostArgs-based flow. Staged values above the published
-    /// top are not GC-marked through stack, exactly as before;
-    /// their sources (caller registers / host slices / metatables) remain
-    /// reachable across the stage→activate window, and the activation
-    /// makes them live as frame registers.
+    /// `top` around the stage→activate window, mirroring PUC exactly:
+    ///
+    ///   - The CALLER publishes the savestate bound before staging when
+    ///     the callee runs as a metamethod/continuation of a Lua frame
+    ///     (pushResolvedBytecodeClosure: plain set to ci->top =
+    ///     frameBase + maxstacksize — PUC lvm.c:1151 savestate; raised
+    ///     OR lowered, so a stale multret top above the register file is
+    ///     dropped and its dead slots stop being GC-visible).
+    ///   - The STAGE step publishes the staged region's end (raise-only
+    ///     to func + 1 + nargs — PUC luaT_callTMres `L->top.p += 3`), so
+    ///     the staged values are inside the marked window across every
+    ///     fallible step between staging and activation.
+    ///   - The ACTIVATE step raises top to the child's window top with an
+    ///     errdefer restoring the pre-raise bound on failure — identical
+    ///     transactionality to the previous prepareHostArgs-based flow.
+    ///     Staged values above the last publication are not GC-marked
+    ///     through stack, exactly as before; their sources (caller
+    ///     registers / host slices / metatables) remain reachable across
+    ///     the stage→activate window, and the activation makes them live
+    ///     as frame registers.
     const StagedCall = struct {
         func_slot: usize,
         nargs: usize,
@@ -54368,16 +54385,19 @@ test "vm: P16.8a transactional simple_result setup — errdefer rollback on push
 //
 // The staged ABI (stageBytecodeCall → pushStagedBytecodeExecFrame) opens a
 // new failure window relative to the old fused flow: staging can succeed
-// (func+args written at top) while the activation fails afterwards
-// (frame-space growth OOM, or FrameStack.addOne OOM). This test forces each
-// failure point and verifies the PUC luaT_callTMres → luaD_precall sequence
-// rolls back exactly:
+// (func+args written at the savestate position) while the activation fails
+// afterwards (frame-space growth OOM, or the heap-spill FrameStack.addOne
+// OOM). This test forces each failure point and verifies the PUC
+// luaT_callTMres → luaD_precall sequence rolls back exactly:
 //   1. parent simple_result state restored (NONE),
 //   2. no child frame left (frame count unchanged),
 //   3. no pending-call slot leak (pending_call_index == INVALID_PENDING),
-//   4. top restored to its pre-call value (staged temporaries
-//      above top are dead by definition — not part of any live
-//      frame region and not GC-marked through stack),
+//   4. top at the last pre-failure publication (the staged end, or the
+//      buildhiddenargs shift end when the failure is later) — the
+//      savestate may have DROPPED a higher rolling multret top to the
+//      caller's register-file end first (PUC savestate is a plain set),
+//      and the dead staged region above the publication is reclaimed by
+//      the next publication,
 //   5. success iteration: errdefers do NOT fire spuriously.
 // =========================================================================
 test "vm: P16.15 T6 transactional staged activation — failure between staging and activation" {
@@ -54387,9 +54407,11 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
     defer arena.deinit();
     const aalloc = arena.allocator();
 
-    // Parent: minimal frame. Child: 60 locals → large frame_cap, so the
-    // activation's needed_top (base + frame_cap) exceeds the remaining
-    // stack headroom while the staged func+2 args still fit.
+    // Parent: minimal frame (2 registers). Child: 60 locals → a 61-register
+    // frame. Both protos are vararg main chunks (compileTestProto compiles
+    // whole chunks), so the child's 2 metamethod args become hidden varargs:
+    // buildhiddenargs shifts func up by nargs+1 before the window check, and
+    // the activation's needed_top is ci->top + nargs + 2 + frame_cap.
     const parent_proto = try compileTestProto(aalloc, "return 1\n");
     var many_locals_buf: [820]u8 = undefined;
     var many_locals_len: usize = 0;
@@ -54427,29 +54449,54 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
     const exec_frames = &th.call_frames;
     const staged_parent = try vm.stageBytecodeCall(th, 0, parent_cl, &.{});
     try vm.pushStagedBytecodeExecFrame(th, exec_frames, parent_proto, staged_parent.func_slot, staged_parent.nargs, -1);
-    // The parent lands at the TOP of the frame stack — the
-    // main thread's base frame (Vm.init's initThreadBaseFrame) sits at
-    // index 0, so a literal 0 (the pre-base-frame convention this test
-    // was written against) silently retargets every parent_index use to
-    // the base frame: the child's simple_result completion, the
-    // clear/has checks, and the final top restore (which read the base
-    // frame's empty window, top=0, leaving the parent's window rolled
-    // off at deinit — surfaced by the window checker at the
-    // closing-finalizer C pop).
+
+    // The activation's addOne allocates only after the inline frame array
+    // (INLINE_FRAME_CAP) is full — frames below the cap come from the
+    // inline array with no allocation. Push Lua frames (the same closure)
+    // until the array is full, staging each one window apart and HIGH in
+    // the stack, so the final frame — the metamethod's parent — has its
+    // register-file end (ci->top = frameBase + maxstacksize) just below
+    // the stack top: the metamethod staging at the savestate position
+    // fits the initial stack, while the child's VAHID-shifted window
+    // (failure point 1) and, after a pre-grow, the heap-spill addOne
+    // (failure point 2) are the remaining fallible steps.
+    const parent_window: usize = parent_proto.maxstacksize + 1 + EXTRA_MARGIN;
+    while (exec_frames.len() < INLINE_FRAME_CAP) {
+        const slot = th.stack.len - parent_window * (INLINE_FRAME_CAP - exec_frames.len());
+        const staged = try vm.stageBytecodeCall(th, slot, parent_cl, &.{});
+        try vm.pushStagedBytecodeExecFrame(th, exec_frames, parent_proto, staged.func_slot, staged.nargs, -1);
+    }
+    // The metamethod's parent is the LAST pushed frame — the top of the
+    // frame stack. The main thread's base frame (Vm.init's
+    // initThreadBaseFrame) sits at index 0, so a literal 0 (the
+    // pre-base-frame convention this test was written against) silently
+    // retargets every parent_index use to the base frame: the child's
+    // simple_result completion, the clear/has checks, and the final top
+    // restore (which read the base frame's empty window, top=0, leaving
+    // the parent's window rolled off at deinit — surfaced by the window
+    // checker at the closing-finalizer C pop).
     const parent_index: usize = exec_frames.len() - 1;
     const saved_frame_count = exec_frames.len();
-
     const args = [_]Value{ .Nil, .Nil };
+    const ci_top = exec_frames.getPtr(parent_index).frameBase() + parent_proto.maxstacksize;
+    const child_frame_cap: usize = mm_proto.maxstacksize + EXTRA_MARGIN;
+    // Staging func+2 args at the savestate position must fit the initial
+    // stack; the child's VAHID-shifted window must not.
+    std.debug.assert(ci_top + 1 + args.len <= th.stack.len);
+    std.debug.assert(ci_top + args.len + 2 + child_frame_cap > th.stack.len);
 
-    // ── Failure point 1: activation's frame-space growth (ensureBcStackCap
+    // ── Failure point 1: the activation's frame-space growth (ensureBcStackCap
     // inside pushStagedBytecodeExecFrame) fails AFTER staging succeeded. ──
-    // top = len - 3: staging needs exactly len slots (func + 2
-    // args) → no growth, staging completes. The child's window (~66 slots)
-    // exceeds the 2 remaining slots → growBcStackCapSlow → FailingAllocator
-    // makes the realloc fail → error.OutOfMemory.
+    // The rolling top models a multret leftover ABOVE the parent's register
+    // file (a B==0 producer staged its results beyond the file end). The
+    // savestate publication inside pushResolvedBytecodeClosure DROPS it to
+    // ci->top (PUC lvm.c:1151 savestate — a plain set, not a raise), so the
+    // staging lands at the register-file end: func + 2 args fit the initial
+    // stack, but the child's VAHID-shifted window does not →
+    // growBcStackCapSlow → the FailingAllocator rejects the realloc.
     {
         exec_frames.getPtr(parent_index).clearSimpleResult();
-        th.top = th.stack.len - 3;
+        th.top = th.stack.len - 1;
         const saved_top = th.top;
 
         var failing = std.testing.FailingAllocator.init(aalloc, .{
@@ -54481,23 +54528,31 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
             @as(u32, INVALID_PENDING),
             exec_frames.getPtr(parent_index).pending_call_index,
         );
-        // 4. top at the staged end (PUC luaT_callTMres: staging func+args
-        //    publishes `L->top = func + 3`; the activation failed after
+        // 4. top at the staged end: the savestate dropped the rolling top
+        //    to ci->top and the staging published func+args above it (PUC
+        //    luaT_callTMres: `L->top.p += 3`); the activation failed after
         //    staging, and PUC's own error unwind leaves top at the staged
         //    end too — the dead staged region is reclaimed by the next
-        //    publication).
-        try testing.expectEqual(saved_top + 1 + args.len, th.top);
+        //    publication.
+        try testing.expectEqual(ci_top + 1 + args.len, th.top);
+        // The staged end sits BELOW the pre-call rolling top: the drop is
+        // the savestate publication itself (plain set), not the staging.
+        try testing.expect(th.top < saved_top);
     }
 
-    // ── Failure point 2: FrameStack.addOne fails AFTER staging AND after
-    // the activation's stack growth + top update. ──
-    // Pre-grow stack so the activation needs no growth: the first
-    // allocation on the path is addOne, which the FailingAllocator rejects.
+    // ── Failure point 2: the activation's heap-spill addOne fails AFTER
+    // staging AND after the activation's stack growth + top update. ──
+    // Pre-grow the stack (real allocator) so the child's VAHID-shifted
+    // window fits, and drop the frame stack's pre-ensured heap capacity
+    // (Vm.init's ensureTotalCapacity; the heap holds no live frames — all
+    // 32 are inline): every step up to the frame push is now
+    // allocation-free, and the heap-spill addOne is the first — and only
+    // — heap allocation on the path. The FailingAllocator rejects it.
     {
         exec_frames.getPtr(parent_index).clearSimpleResult();
-        const child_frame_cap: usize = mm_proto.maxstacksize + EXTRA_MARGIN;
-        try vm.ensureBcStackCap(th, th.top + 1 + args.len + child_frame_cap);
-        th.top = th.stack.len - 1 - args.len - child_frame_cap;
+        exec_frames.heap.clearAndFree(vm.alloc);
+        try vm.ensureBcStackCap(th, ci_top + args.len + 2 + child_frame_cap);
+        th.top = th.stack.len - 1;
         const saved_top = th.top;
 
         var failing = std.testing.FailingAllocator.init(aalloc, .{
@@ -54526,17 +54581,20 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
             @as(u32, INVALID_PENDING),
             exec_frames.getPtr(parent_index).pending_call_index,
         );
-        // top at the staged end (see failure point 1: staging publishes
-        // `func + 1 + nargs`; the activation's errdefer restores to its
-        // entry bound, which is the staged end after the staging bump).
-        try testing.expectEqual(saved_top + 1 + args.len, th.top);
+        // top at the buildhiddenargs publication: staging published
+        // func+args (ci->top + 3), then the VAHID shift moved func up past
+        // the extra args and published the shifted end (base + nparams);
+        // the addOne failure restores exactly that bound (the activation's
+        // errdefer), so the shifted region stays GC-visible while the
+        // frame push is retried or unwound.
+        try testing.expectEqual(ci_top + args.len + 2 + mm_proto.numparams, th.top);
+        try testing.expect(th.top < saved_top);
     }
 
     // ── Success iteration: staging + activation both succeed. ──
     {
         exec_frames.getPtr(parent_index).clearSimpleResult();
-        const child_frame_cap: usize = mm_proto.maxstacksize + EXTRA_MARGIN;
-        try vm.ensureBcStackCap(th, th.top + 1 + args.len + child_frame_cap);
+        try vm.ensureBcStackCap(th, ci_top + args.len + 2 + child_frame_cap);
 
         const outcome = try vm.tryPushSimpleResultMetamethod(
             exec_frames,

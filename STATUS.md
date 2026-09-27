@@ -219,6 +219,13 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   tests/stress/t2c_apply_path_root_scope.lua; RootScope покрывает ровно
   fallible окно от потери stack-root до публикации в parent; infallible
   hot path без session.
+  REVIEW `565e55c`: runtime-мутант отключал completion-scope и
+  protection-wrap scope одновременно; этот тест доказывает sole-root
+  emergency на wrap-аллокации, но не отдельно `bcGrowFrame` в apply.
+  Ростовые arms проверены по коду: условный RootScope защищает весь
+  `ret` до `bcGrowFrame`, затем результат копируется в parent перед
+  закрытием scope. Формулировку «runtime-proof каждого growth edge»
+  не считать установленной; scoped follow-up — focused discriminator.
 
 - [x] **Parity BLOCKER, FIX-NOW: PUC-точная публикация перед Lua-метаметодом
   не завершена в t2 implementation** (review `fc42243`).
@@ -247,6 +254,48 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   PUC Debug+RF; baseline fc42243 fails 9/11); t2-сценарий/stress — GREEN.
   Perf A/B fc42243(ac8515f2)↔final(4bfdc08d) paired instructions:
   только metamethod_add +0.117% (раскрыто), остальные 6 workload ±0.000%.
+  REVIEW `565e55c`: частичное исправление подтверждено на исходной
+  weak-форме, но `pushResolvedBytecodeClosure` делает только
+  `if (th.top < puc_top) th.top = puc_top`. PUC `Protect/savestate`
+  **присваивает** `L->top = ci->top`; после `OP_SETLIST B==0` старый
+  multret-bound может быть ВЫШЕ `ci->top`. Тогда luazig не опускает top
+  и ошибочно удерживает мёртвый объект при GC внутри `__add`.
+  Независимая форма `/tmp/opencode/review_t2c_high_top.lua`:
+  `local t={many()}; t=nil; return trigger+1`, где `many()` возвращает
+  25 значений, последнее — объект из weak-value таблицы. PUC 5.5:
+  `true true`; luazig `565e55c`: `false false`; bytecode caller:
+  maxstack=2, `CALL B==0` → `SETLIST B==0` → `ADDI/MMBINI`.
+  Origin pre-existing, но correction не выполнила заявленный exact-bound
+  invariant и её smoke-тест пропустил top>ci->top. Судьба FIX-NOW;
+  open-count 26→27. Вариант исправления — PUC plain SET в Protect-пути
+  после аудита обоих modes и живых continuation; hook/return-close
+  raise-only и прочие границы не менять механически.
+  CLOSED (t2 high-top correction): pushResolvedBytecodeClosure — PUC
+  savestate = PLAIN SET `th.top = frameBase()+maxstacksize` (подъём И
+  опускание). High-top после B==0/many()-producera (top > ci->top —
+  мёртвые multret-слоты) опускается — weak-visibility = PUC. Тест-фикстура
+  P16.15 T6 пересчитана под plain-SET семантику (инварианты
+  errdefer-rollback/no-child/no-pending-leak сохранены; FP1 growth-OOM
+  после savestate-drop, FP2 heap-spill). luaD_hook-путь (~13104) —
+  НАСТОЯЩИЙ raise-only (PUC ldo.c:449-451 luaD_hook: L->top поднимается
+  только если ниже ci->top) — различие от savestate задокументировано;
+  OP_RETURN k / SETLIST — уже точные. StagedCall-документация переписана
+  (caller plain set / stage raise-only / activate raises с errdefer).
+  Evidence: smoke-88 секция [11] add-high-top (semantic class ревью:
+  many() 25 значений → SETLIST B==0 → ADDI): RED на immutable 565e55c
+  (единственное междвижковое отличие), GREEN byte-exact PUC Debug+RF;
+  low-top секции/TBC/hook/stress — GREEN. Отрицательная мутация
+  (raise-only) → T6 + smoke-88[11] RED → восстановлено GREEN.
+  Класс-2 apply-growth edges: structural proof — ростовые arms
+  структурно замаскированы (значения staged/pre-grown на стеке до
+  apply; единственный fallible шаг — stack realloc — не срабатывает
+  внутри окна); решающий rooting — доказанная t2c-цепь
+  .return_frame + protection-wrap; runtime-дискриминатор для этих arms
+  не существует (не заявлен). Perf: полный A/B d83d565↔final
+  (lua_calls +1.549%, coroutine_yield +4.754% — отнесено к принятой
+  t2impl-итерации, подтверждено изолированным A/B 565e55c↔final:
+  metamethod_add −0.050%, остальные ±0.000% — собственная цена
+  correction благоприятная).
 
 - [ ] **Evidence BLOCKER, FIX-NOW: perf A/B этапа t2 не относится к
   финальному product-бинарю** (review `fc42243`). Скрипт
@@ -257,6 +306,14 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   повторный A/B на immutable бинарях точного финального source с hashes,
   toolchain и сырыми paired результатами; скорость не является gate.
   Open-count 27→28.
+  REVIEW `565e55c`: новый paired-instructions A/B (7 workload'ов,
+  `fc42243`→`565e55c`) подтверждает цену только correction, но не
+  заменяет требовавшееся измерение исходного t2-этапа
+  `d83d565`→финальное дерево. Независимый диагностический single-seed
+  `cpu_core/instructions/u` на 18 workload'ах с заново собранным
+  `d83d565` дал geomean final/base≈1.0031 (не канонический
+  multi-seed A/B, не замена gate). Пункт остаётся открытым,
+  open-count не меняется.
 
 - [ ] **C API: `lua_pushvalue(lua_upvalueindex(n))` возвращает не upvalue
   (BLOCKER, ORDINARY-BACKLOG)**. Независимый C-оракул

@@ -14,7 +14,10 @@
 -- Also covers the __close staging bounds (PUC prepcallclosemth per path:
 -- OP_RETURN k = max(top, ci->top); OP_CLOSE = level+1; error unwind =
 -- level+2 with the error object written at level+1) and the debug-hook
--- raise (PUC luaD_hook: raise to ci->top).
+-- raise (PUC luaD_hook: raise to ci->top), plus the luaG_traceexec
+-- correct-top (PUC ldebug.c:955-957: before count/line hooks, a non-IT
+-- upcoming instruction gets top plain-set to ci->top; an IT upcoming
+-- consumer keeps its live multret bound GC-visible through the hook).
 -- Differential: C Lua 5.5.0 vs luazig --engine=zig (pure Lua, no testc).
 
 local weak = setmetatable({}, {__mode = "v"})
@@ -231,4 +234,68 @@ do
   local r = caller()
   collectgarbage()
   print("add-high-top", r, weak[1] == nil)
+end
+
+-- [12] luaG_traceexec correct-top (PUC ldebug.c:955-957): the B==0 SETLIST
+-- consumed the multret but left the rolling top above the register file,
+-- with the weak object parked in a dead multret slot beyond the file end.
+-- Before the next non-IT instruction, traceexec plain-sets top to
+-- ci->top (it may LOWER): the dead slot becomes GC-invisible inside the
+-- count hook's collectgarbage. Without the correct-top the hook stages at
+-- the stale high top and the dead slot stays inside the GC-scanned region.
+do
+  local function many()
+    local o = {}
+    weak[1] = o
+    return 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,o
+  end
+  local armed, seen
+  local function caller()
+    local t = {many()}
+    t = nil
+    armed = true
+    local x = 1
+    return x
+  end
+  debug.sethook(function()
+    if armed and seen == nil then
+      collectgarbage(); collectgarbage()
+      seen = weak[1] == nil
+    end
+  end, "", 1)
+  caller()
+  debug.sethook()
+  print("hook-top", seen, weak[1] == nil)
+end
+
+-- [13] IT control for the correct-top: the count hook fires between the
+-- CALL C==0 producer and the SETLIST B==0 consumer — the upcoming
+-- instruction is IT, so traceexec must NOT correct top: the live multret
+-- bound (the object reachable only through the multret slot above the
+-- file) stays GC-visible through the hook's collectgarbage, and the
+-- consumer reads all 25 values with identity preserved. A blanket
+-- correct-top (no isIT test) would lower top past the live multret: the
+-- object dies inside the hook's collection and the consumer's count
+-- truncates.
+do
+  local armed, died
+  local function many()
+    local o = {}
+    weak[1] = o
+    armed = true
+    return 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,o
+  end
+  local function caller()
+    local t = {many()}
+    return #t, t[25] == weak[1]
+  end
+  debug.sethook(function()
+    if armed then
+      collectgarbage()
+      if weak[1] == nil then died = true end
+    end
+  end, "", 1)
+  local n, same = caller()
+  debug.sethook()
+  print("hook-it-live", died, n, same)
 end

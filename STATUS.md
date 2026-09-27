@@ -297,7 +297,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   metamethod_add −0.050%, остальные ±0.000% — собственная цена
   correction благоприятная).
 
-- [ ] **Evidence BLOCKER, FIX-NOW: perf A/B этапа t2 не относится к
+- [x] **Evidence BLOCKER, FIX-NOW: perf A/B этапа t2 не относится к
   финальному product-бинарю** (review `fc42243`). Скрипт
   `/tmp/opencode/t2_ab.sh` измерял `/tmp/opencode/luazig_final_rf`
   (mtime 03:52, SHA-256 `315b7064…`); последняя product-правка
@@ -314,6 +314,55 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   `d83d565` дал geomean final/base≈1.0031 (не канонический
   multi-seed A/B, не замена gate). Пункт остаётся открытым,
   open-count не меняется.
+  CLOSED (review `c1341a4`): новый paired A/B `d83d565`→финальный
+  product-бинарь, 7 затронутых workload'ов × 3 seed, ReleaseFast Zig
+  0.16.0, `cpu_core/instructions:u`; финальный SHA-256
+  `03042b1e4f2ecaef4cc311d7a29d03d54cbf82782cfe36aeff628f01b842d3db`
+  независимо совпал с текущим `zig-out/bin/luazig`. Сырые paired
+  результаты: `/tmp/opencode/t2h_perf_ab.json`; отдельно
+  `565e55c`→final: `/tmp/opencode/t2h_perf_ab2.json`.
+  `lua_calls` +1.549%, `coroutine_yield` +4.754% за весь t2-этап;
+  isolated high-top correction: `metamethod_add` −0.050%, прочие
+  workload'ы в шуме. Старый geomean 0.996 к финалу не относится и
+  не используется как acceptance evidence. Open-count 26→25.
+
+- [x] **Parity BLOCKER, ORDINARY-BACKLOG: count/line hook не исправляет
+  `Thread.top` перед non-IT инструкцией** (review `c1341a4`). PUC
+  `luaG_traceexec` (`ldebug.c:955-957`) перед hook делает plain SET
+  `L->top = ci->top`, если предстоящая инструкция не `luaP_isIT`
+  (`savedpc-1` указывает на неё, не на уже выполненную);
+  `luaD_hook` затем только поднимает низкий top. В luazig hook-dispatch
+  делает raise-only без предшествующего условного correct-top, поэтому
+  после `CALL B==0` → `SETLIST B==0` мёртвый multret-слот выше
+  register-file end остаётся GC-visible во время count-hook.
+  Независимый weak-value differential
+  `/tmp/opencode/review_t2h_hook_top.lua`: PUC 5.5 `true true`, luazig
+  `565e55c` и `c1341a4` `false false`; origin pre-existing, не
+  регрессия high-top correction. Нужен PUC `luaP_isIT`-эквивалент
+  и top-публикация до обоих Lua/C hook lanes с сохранением живого
+  multret-bound перед IT-потребителем и при yield/re-entry.
+  Open-count 25→26.
+  CLOSED (hook top-publication implementation): PUC luaG_traceexec-parity.
+  (1) Instruction.isIT() (bytecode.zig) — точный эквивалент luaP_isIT:
+  IT-класс {call, tailcall, return_, setlist, varargprep} с тестом b==0;
+  format-расхождение SETLIST vB (PUC 6-бит с перекрытием vC ↔ Zig чистый
+  8-бит count → b==0 ≡ vB==0) задокументировано; varargprep B всегда 0 у
+  обоих codegen'ов (extra args выше file до adjust — IT load-bearing).
+  (2) Публикация plain SET th.top = base+maxstacksize при non-IT
+  предстоящей: line-lane (каждая инструкция при line-mask) и count-lane
+  (при budget-hit) в PUC-порядке (после HOOKYIELD-check, до staged-push
+  MayGC и dispatch); на IT живой multret-bound сохраняется; luaD_hook
+  raise-only нетронут; без hooks — нулевая цена. (3) Evidence: smoke-88
+  секции [12] hook-top (reviewer-форма; наблюдение ВНУТРИ hook +
+  финал + следующий GC cycle) и [13] IT-контроль (hook между producer и
+  потребителем живого B==0: значения/count/identity сохранены) — RED на
+  pristine c1341a4 ([12] false false), GREEN byte-exact PUC Debug+RF;
+  negative mutations ×2: отключение SET → [12] RED; blanket SET на IT →
+  [13] RED (объект умер + count усечён) — обе восстановлены GREEN.
+  Perf A/B c1341a4↔final (SHA-256): paired dynamic instructions
+  идентичны (1,200,033 hook / 400,010 no-hook) — регрессии нет.
+  Гейты: 358/358 D+RF 0 leaks; matrix zig_fail=0; smoke 87/87; c_api
+  24-29 PASS оба режима; api580 GREEN; fmt/diff-check clean.
 
 - [ ] **C API: `lua_pushvalue(lua_upvalueindex(n))` возвращает не upvalue
   (BLOCKER, ORDINARY-BACKLOG)**. Независимый C-оракул

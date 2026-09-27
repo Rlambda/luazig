@@ -103,6 +103,39 @@ pub const Instruction = packed struct(u32) {
             .c = @truncate(off >> 8),
         };
     }
+
+    /// PUC luaP_isIT (lopcodes.c:131-138): does this instruction USE top —
+    /// accept a variable number of results left by the previous OT
+    /// instruction above the register file? PUC's test is
+    /// `testITMode(op) && GETARG_B(i) == 0` (opmodes bit 5, lopcodes.h:430);
+    /// the IT set in luaP_opmodes is exactly {CALL, TAILCALL, RETURN,
+    /// SETLIST, VARARGPREP} — the open consumers of a multret region.
+    /// Zig-format mapping (B semantics identical to PUC unless noted):
+    ///   - call/tailcall/return_: B = nargs/nresults + 1, 0 = use top —
+    ///     same encoding as PUC OP_CALL/OP_TAILCALL/OP_RETURN.
+    ///   - return0/return1 are NOT IT: fixed-count returns (PUC
+    ///     OP_RETURN0/OP_RETURN1 carry it = 0 in luaP_opmodes).
+    ///   - setlist: PUC packs SETLIST as ivABC, where vB is the low 6
+    ///     bits of the B byte (the high 2 bits belong to vC), so PUC
+    ///     tests GETARG_vB(i) == 0. The Zig format stores the full 8-bit
+    ///     `b` as the pure item count (the base index lives in `c`, no
+    ///     bit overlap), so `b == 0` is the exact vB == 0 (multret)
+    ///     equivalent.
+    ///   - varargprep: both codegens emit it with B = 0 (PUC lparser.c
+    ///     setvararg; codegen_bc varargprep emission) — the incoming
+    ///     extra arguments live above the initial register file until
+    ///     the adjustment runs, so it is IT whenever reached. The
+    ///     `b == 0` test keeps PUC's exact formula for hand-crafted
+    ///     binary chunks.
+    ///   - vararg is NOT IT: PUC OP_VARARG is OT-only — it SETS top for
+    ///     a consumer and never reads a previous producer's bound.
+    pub fn isIT(self: Instruction) bool {
+        const op: Op = @enumFromInt(self.op);
+        return switch (op) {
+            .call, .tailcall, .return_, .setlist, .varargprep => self.b == 0,
+            else => false,
+        };
+    }
 };
 
 // ---------------------------------------------------------------------------

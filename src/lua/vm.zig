@@ -13079,8 +13079,11 @@ pub const Vm = struct {
         // that the instruction after the hook still consumes — and the
         // hook must not lower it (the B==0 consumer derives its count from
         // top; PUC restores the saved top EXACTLY afterwards so the
-        // consumer reads the producer's bound). A top above ci->top (e.g.
-        // the stale multret end after a B==0 SETLIST) likewise stays:
+        // consumer reads the producer's bound). A top above ci->top
+        // reaching luaD_hook is therefore a live IT bound: the hook gate's
+        // traceexec correct-top (luaG_traceexec, ldebug.c:955-957) already
+        // plain-set any dead region (e.g. the stale multret end a B==0
+        // SETLIST leaves behind) down to ci->top before the hook staging;
         // luaD_hook only ever raises a below-file staging position into
         // the register file, because staging the hook frame there would
         // clobber live registers (the staged hook closure overwrites the
@@ -19183,6 +19186,29 @@ pub const Vm = struct {
                                     hook_state.skip_bc_line_once = false;
                                 }
 
+                                // PUC luaG_traceexec (ldebug.c:955-957): before
+                                // the count/line hooks, correct top to the
+                                // register file end — `if (!luaP_isIT(next))
+                                // L->top.p = ci->top.p`. The upcoming
+                                // instruction (ctx.pc, already published to
+                                // fr.u.lua.pc) is the consumer of any multret
+                                // the previous OT instruction left above the
+                                // file: an IT consumer (CALL/TAILCALL/RETURN
+                                // with B==0, SETLIST with count 0, VARARGPREP)
+                                // derives its bound from top, so its live
+                                // multret must stay GC-visible through the
+                                // hook; anything else means the region is
+                                // dead (e.g. the stale multret end a B==0
+                                // SETLIST leaves behind), and this plain SET
+                                // — it may LOWER top — makes it GC-invisible
+                                // for the hook's collections. Skipped on a
+                                // hook-yield replay like every other
+                                // traceexec action (PUC's CIST_HOOKYIELD check
+                                // precedes the correct-top).
+                                if (!skip_replayed_hook and !inst.isIT()) {
+                                    th.top = ctx.base + ctx.cur_proto.maxstacksize;
+                                }
+
                                 // PUC starts tracing a vararg function after OP_VARARGPREP:
                                 // the first source-visible line is the instruction that
                                 // follows it. Record OP_VARARGPREP as oldpc, but do not
@@ -19296,6 +19322,20 @@ pub const Vm = struct {
                                 hook_state.budget -= 1;
                                 if (hook_state.budget <= 0) {
                                     hook_state.budget = hook_state.count;
+                                    // PUC luaG_traceexec: the count hook fires
+                                    // here, so the correct-top (see the line
+                                    // lane above for the full invariant) runs
+                                    // at the same point — with count-only
+                                    // hooks this is the ONLY publication
+                                    // (PUC returns early, before the
+                                    // correct-top, while the budget lasts).
+                                    // With a line hook also active the line
+                                    // lane already published this instruction;
+                                    // the re-SET is idempotent (both hook
+                                    // paths restore top exactly).
+                                    if (!inst.isIT()) {
+                                        th.top = ctx.base + ctx.cur_proto.maxstacksize;
+                                    }
                                     if (try self.tryPushBytecodeDebugHook(
                                         exec_frames,
                                         ctx.frame_index,

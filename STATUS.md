@@ -468,6 +468,14 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   (MEDIUM); tolstring/is* read-write асимметрия (MEDIUM);
   acceptable-but-empty pushvalue обязан nil (MEDIUM). Готов к
   implementation-cut (gates C1-C4 в отчёте §7).
+  Reviewer qualification: фактический inventory и negative-before приняты,
+  но предложенный `registry: *Table`/read-only destination не является
+  полным PUC-контрактом: `lapi.c:lua_copy` разрешает запись через
+  `index2value(L, LUA_REGISTRYINDEX)` в `G->l_registry` (Value-слот).
+  Текущий `Vm.debug_registry: ?*Table` не может выразить этот target;
+  исключение R1 из research не утверждено. До implementation нужно
+  согласовать единый writable registry owner и ABI-константу PUC 5.5;
+  `report.md` как завершённый handoff не переписывать.
 
 - [x] **Architecture A1 research (COMPLETED): единая GC lifetime/rooting/constructor
   модель**. Локальная `P16.50-review-16 correction`, ошибочно открытая ревьюером

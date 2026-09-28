@@ -56,7 +56,7 @@ pub fn main(init: std.process.Init) !void {
     defer proto.tree.?.releaseTree(alloc);
 
     const env_cell = try alloc.create(lua.internal.vm.Cell);
-    env_cell.* = .{ .value = .{ .Table = vm.global_env } };
+    env_cell.* = .{ .value = vm.registryGlobalsValue() };
     const upvals = [_]*lua.internal.vm.Cell{env_cell};
     const script_args = [_]lua.internal.vm.Value{.{ .String = try vm.internStr(selector) }};
 
@@ -103,7 +103,7 @@ pub fn main(init: std.process.Init) !void {
     var env_node_depth: i64 = -1; // -1 = key not found
     var env_node_chain_len: usize = 0;
     {
-        const env = vm.global_env;
+        const env = vm.registryGlobalsTable() orelse return error.NoGlobals;
         const nodes = env.hash;
         if (nodes.len != 0) {
             const ls = st.lookup(name, hash) orelse null;

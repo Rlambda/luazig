@@ -148,9 +148,9 @@ fn runZigSourceArgs(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: 
         defer loaded_proto.tree.?.releaseTree(aalloc);
         // Pre-resolve constants (strings already interned via callback).
         vm.preResolveUndumpedConstants(loaded_proto) catch return error.OutOfMemory;
-        // Execute directly with _ENV = global_env.
+        // Execute directly with _ENV = the current registry globals.
         const env_cell = aalloc.create(lua.internal.vm.Cell) catch return error.OutOfMemory;
-        env_cell.* = .{ .value = .{ .Table = vm.global_env } };
+        env_cell.* = .{ .value = vm.registryGlobalsValue() };
         const upvals = [_]*lua.internal.vm.Cell{env_cell};
         const saved_errfunc = vm.getErrfuncValue();
         vm.setErrfuncValue(.{ .Builtin = .cli_msghandler });
@@ -212,13 +212,13 @@ fn runZigSourceArgs(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: 
                 try lua.internal.bytecode.dumpProto(&out, proto, 0);
                 return;
             }
-            // Set up _ENV upvalue (upvalue 0 = global_env table).
+            // Set up _ENV upvalue (upvalue 0 = the current registry globals table).
             // Heap-allocate the cell: closures created during execution
             // capture this cell as an upvalue, and finalizers may run
             // during vm.deinit() — long after this function has returned.
             // A stack-local cell would be a use-after-free at that point.
             const env_cell = aalloc.create(lua.internal.vm.Cell) catch return error.OutOfMemory;
-            env_cell.* = .{ .value = .{ .Table = vm.global_env } };
+            env_cell.* = .{ .value = vm.registryGlobalsValue() };
             const upvals = [_]*lua.internal.vm.Cell{env_cell};
             // PUC docall (lua.c:155-166): push msghandler as errfunc before
             // calling lua_pcall. The handler runs BEFORE call stack unwinding,
@@ -478,7 +478,7 @@ fn dolibrary(vm: *lua.internal.vm.Vm, spec: []const u8) bool {
     }
 
     // Call require(modname)
-    const require_fn = vm.apiGetGlobal("require");
+    const require_fn = vm.apiGetGlobal("require") catch return false;
     const modname_str = vm.internStr(modname) catch return false;
     var call_args = [_]lua.internal.vm.Value{.{ .String = modname_str }};
     // PUC dolibrary → docall (lua.c): the msghandler is armed as errfunc
@@ -561,7 +561,7 @@ fn runargs(
 /// Send a warning control message (@on/@off) to the VM's warn builtin.
 /// This mirrors PUC's `lua_warning(L, msg, 0)` for control messages.
 fn vmWarnControl(vm: *lua.internal.vm.Vm, msg: []const u8) void {
-    const warn_fn = vm.apiGetGlobal("warn");
+    const warn_fn = vm.apiGetGlobal("warn") catch return;
     const str = vm.internStr(msg) catch return;
     var args = [_]lua.internal.vm.Value{.{ .String = str }};
     const ret = vm.apiCall(.nonyieldable, warn_fn, args[0..]) catch return;
@@ -663,7 +663,7 @@ fn checklocal(line: []const u8) void {
 /// Returns the prompt string (owned by the caller, must be freed).
 fn getPrompt(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, firstline: bool) []const u8 {
     const name = if (firstline) "_PROMPT" else "_PROMPT2";
-    const val = vm.apiGetGlobal(name);
+    const val = vm.apiGetGlobal(name) catch return if (firstline) "> " else ">> ";
     switch (val) {
         .Nil => {
             // Use the default prompt (PUC LUA_PROMPT / LUA_PROMPT2).
@@ -718,7 +718,7 @@ fn doREPL(
         out.writeAll("\n") catch {};
         return;
     };
-    env_cell.* = .{ .value = .{ .Table = vm.global_env } };
+    env_cell.* = .{ .value = vm.registryGlobalsValue() };
     defer aalloc.destroy(env_cell);
 
     while (true) {
@@ -857,7 +857,7 @@ fn doREPL(
             // message as `error calling 'print' (error_message)` — NO
             // traceback is appended (PUC uses lua_pcall with msghandler=0).
             if (rets.len > 0) {
-                const print_fn = vm.apiGetGlobal("print");
+                const print_fn = vm.apiGetGlobal("print") catch break;
                 const print_rets = vm.apiCall(.nonyieldable, print_fn, rets) catch |err| switch (err) {
                     error.OutOfMemory => {
                         aalloc.free(rets);
@@ -1076,7 +1076,7 @@ fn extractLuazigOptions(alloc: std.mem.Allocator, args: []const []const u8) !Lua
 /// by -e chunks are visible. If `arg` is not a table, prints the PUC error
 /// message and exits.
 fn pushArgsFromTable(alloc: std.mem.Allocator, vm: *lua.internal.vm.Vm) ![]lua.internal.vm.Value {
-    const arg_val = vm.apiGetGlobal("arg");
+    const arg_val = vm.apiGetGlobal("arg") catch |e| return e;
     if (arg_val != .Table) {
         var errw = stdio.stderr();
         errw.print("luazig: 'arg' is not a table\n", .{}) catch {};

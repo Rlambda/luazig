@@ -3836,7 +3836,7 @@ test "resume yield round-trip returns borrowed span rooted across GC" {
     var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     // Source reads globals (`coroutine.*` — GETTABUP on the _ENV upvalue).
-    var env_cell = Cell{ .value = .{ .Table = vm.global_env } };
+    var env_cell = Cell{ .value = vm.registryGlobalsValue() };
     const upvals = [_]*Cell{&env_cell};
     const ret = try vm.runBytecode(proto, &upvals, &.{}, null);
     try testing.expect(ret.len == 1);
@@ -4931,7 +4931,14 @@ pub const Vm = struct {
     /// storage can be reset immediately after each frontend invocation.
     dynamic_ast_arena: lua_ast.AstArena,
     dynamic_bytecode_compiler: ?DynamicBytecodeCompiler = null,
-    global_env: *Table,
+    // PUC G->l_registry (lstate.h): the single owner of the registry value.
+    // Eager-created in initWithSeed (PUC f_luaopen -> init_registry,
+    // lstate.c:186-204) with the predefined RIDX entries
+    // [1]=false/[2]=globals/[3]=mainthread plus _HOOKKEY/_LOADED/_PRELOAD.
+    // API writes into the slot are plain stores without a barrier (PUC
+    // lapi.c:262-263); the atomic step re-marks the slot before sweep
+    // decides liveness (lgc.c:1553), in both GC modes.
+    l_registry: Value = .Nil,
     // PUC mt[LUA_TSTRING]: the type-level string metatable. Optional like
     // every other type slot (PUC G(L)->mt[] is NULL-able); "disabled" IS
     // null — there is no separate enabled flag in PUC. Set at bootstrap
@@ -5010,7 +5017,6 @@ pub const Vm = struct {
     // So a separate table is needed: a long literal and a long runtime string
     // with the same content must have distinct pointers.
     long_literals: StringIntern = .{},
-    debug_registry: ?*Table = null,
 
     /// PUC `-E` flag (lua.c:720-723): when true, the VM ignores LUA_PATH /
     /// LUA_CPATH / LUA_INIT_5_5 / LUA_INIT environment variables and uses
@@ -5765,7 +5771,6 @@ pub const Vm = struct {
         var vm: Vm = .{
             .alloc = alloc,
             .dynamic_ast_arena = lua_ast.AstArena.init(alloc),
-            .global_env = env,
             .string_metatable = str_mt,
             .noenv = noenv,
             // The seed MUST be live before the first internStr below: the
@@ -5875,6 +5880,16 @@ pub const Vm = struct {
                     vm.internStr(entry.s) catch @panic("oom");
             }
         }
+        // PUC init_registry (lstate.c:186-204): publish the registry into
+        // the l_registry slot, then populate the predefined RIDX entries
+        // ([1]=false, [2]=globals, [3]=mainthread) plus _HOOKKEY/_LOADED/
+        // _PRELOAD. Must run BEFORE bootstrapGlobals — every global read/
+        // write goes through registry[LUA_RIDX_GLOBALS] from here on. No GC
+        // can fire inside (the initial gc_step_debt makes every condGC a
+        // no-op — the analog of PUC's GCSTPSTOP window in f_luaopen), so
+        // the population needs no root scope; the slot publication is the
+        // infallible commit.
+        vm.initRegistry(env) catch @panic("oom");
         vm.bootstrapGlobals() catch @panic("oom");
         // PUC lstate.c:375-380: setgcparam for all 6 GC params with PUC
         // defaults. Each param is coded via gcCodeParam (floating-point byte).
@@ -5889,6 +5904,36 @@ pub const Vm = struct {
             Vm.gcCodeParam(9600), // LUA_GCPSTEPSIZE (200 * sizeof(Table))
         };
         return vm;
+    }
+
+    /// PUC init_registry (lstate.c:186-204), verbatim order:
+    ///   1. create the registry table and publish it into `l_registry`
+    ///      FIRST (the slot is the single owner — PUC sethvalue before any
+    ///      population);
+    ///   2. registry[1] = false (PUC setbfvalue — NOT the main thread);
+    ///   3. registry[LUA_RIDX_MAINTHREAD] = main thread;
+    ///   4. registry[LUA_RIDX_GLOBALS] = the globals table (the `env`
+    ///      created by initWithSeed — PUC creates a fresh table here);
+    ///   5. _HOOKKEY (PUC ldblib.c:382 creates it lazily on first debug
+    ///      hook use; luazig creates it eagerly at state init — a shape
+    ///      deviation with identical observable behavior). _LOADED/_PRELOAD
+    ///      are NOT created here: PUC creates them at package-load time
+    ///      (luaL_getsubtable from luaopen_package), which for luazig is
+    ///      bootstrapGlobals.
+    /// Only reachable from initWithSeed, where no GC step can fire (see
+    /// the call site) — the raw sets need no root scope.
+    fn initRegistry(self: *Vm, globals: *Table) DispatchError!void {
+        const reg = try self.allocTableNoGc();
+        self.l_registry = .{ .Table = reg };
+        try self.rawSet(reg, .{ .Int = 1 }, .{ .Bool = false });
+        try self.rawSet(reg, .{ .Int = LUA_RIDX_MAINTHREAD }, .{ .Thread = self.main_thread.? });
+        try self.rawSet(reg, .{ .Int = LUA_RIDX_GLOBALS }, .{ .Table = globals });
+
+        const hookkey = try self.allocTableNoGc();
+        const mt = try self.allocTableNoGc();
+        try self.setField(mt, "__mode", .{ .String = try self.internStr("k") });
+        try self.gcStoreMetatable(hookkey, mt);
+        try self.setField(reg, "_HOOKKEY", .{ .Table = hookkey });
     }
 
     /// Allocate a `lua_State` handle with its `LUA_EXTRASPACE` extra space in
@@ -6800,7 +6845,7 @@ pub const Vm = struct {
         // very END of this function (see the tail block).
         //
         // Run closing finalizers first — they execute Lua __gc metamethods and
-        // need most objects (global_env, frames, tables) still alive.
+        // need most objects (registry/globals, frames, tables) still alive.
         self.gcFinalizeAtClose();
         // If a finalizer called `os.exit(code, true)` during close, PUC
         // calls `exit(code)` after `lua_close` returns. All finalizers have
@@ -6980,16 +7025,50 @@ pub const Vm = struct {
     }
 
     // Public API helpers for `src/lua/api.zig`.
-    pub fn apiGetGlobal(self: *Vm, name: []const u8) Value {
-        return self.getGlobal(name);
+
+    /// Predefined registry indices (PUC lua.h:84-86). registry[1] holds
+    /// plain `false` (PUC init_registry's setbfvalue) and has no name.
+    pub const LUA_RIDX_GLOBALS: i64 = 2;
+    pub const LUA_RIDX_MAINTHREAD: i64 = 3;
+    pub const LUA_RIDX_LAST: i64 = 3;
+
+    /// The registry table from the `l_registry` slot, if the slot holds
+    /// one. PUC's registry is unconditional (init_registry publishes it
+    /// before anything else and api_check's "registry must be a table" on
+    /// every access); a non-table slot is PUC release UB. Here the null
+    /// return keeps every consumer total — API-level reads surface as the
+    /// standard index error, raw/testC paths fail with their own message.
+    pub fn registryTable(self: *Vm) ?*Table {
+        return switch (self.l_registry) {
+            .Table => |t| t,
+            else => null,
+        };
     }
 
-    /// Lazily create and return the PUC registry table (the table accessible
-    /// via the `LUA_REGISTRYINDEX` pseudo-index). Used by the C API shim
-    /// (`luaL_ref(L, LUA_REGISTRYINDEX)`, etc.). Wraps `ensureDebugRegistry`
-    /// to expose a clean `Error` result to `c_api.zig`.
-    pub fn apiEnsureRegistry(self: *Vm) Error!*Table {
-        return exposeDispatchResult(*Table, self.ensureDebugRegistry());
+    /// PUC getGlobalTable (lapi.c:691-696): the CURRENT globals value =
+    /// registry[LUA_RIDX_GLOBALS], read once per call. Returns the raw
+    /// entry (a non-table registry[2] flows into the caller's index path
+    /// and raises the standard "attempt to index a ... value" error,
+    /// exactly like PUC auxgetstr on a non-table gt); a non-table SLOT
+    /// (PUC release UB) degrades to Nil, which produces the same standard
+    /// error class downstream — a safe superset.
+    pub fn registryGlobalsValue(self: *Vm) Value {
+        const reg = self.registryTable() orelse return .Nil;
+        return self.rawGet(reg, .{ .Int = LUA_RIDX_GLOBALS });
+    }
+
+    /// The current globals table as a `*Table`, when registry[2] holds
+    /// one (PUC getGlobalTable's api_check shape for internal consumers
+    /// that need the table pointer itself).
+    pub fn registryGlobalsTable(self: *Vm) ?*Table {
+        return switch (self.registryGlobalsValue()) {
+            .Table => |t| t,
+            else => null,
+        };
+    }
+
+    pub fn apiGetGlobal(self: *Vm, name: []const u8) Error!Value {
+        return exposeDispatchResult(Value, self.getGlobal(name));
     }
 
     pub fn apiSetGlobal(self: *Vm, name: []const u8, v: Value) Error!void {
@@ -24897,19 +24976,26 @@ pub const Vm = struct {
         };
     }
 
-    fn getGlobal(self: *Vm, name: []const u8) Value {
-        if (std.mem.eql(u8, name, "_G")) return .{ .Table = self.global_env };
-        if (std.mem.eql(u8, name, "_ENV")) return .{ .Table = self.global_env };
-        const v = self.getField(self.global_env, name);
-        if (v != .Nil) return v;
-        if (std.mem.eql(u8, name, "_VERSION")) return .{ .String = self.internStrAssume("Lua 5.5") };
-        return .Nil;
+    /// PUC lua_getglobal = auxgetstr(getGlobalTable(L), name) (lapi.c:691-696,
+    /// 668-687): read the CURRENT registry[LUA_RIDX_GLOBALS] once per call,
+    /// then run the full __index path (luaV_fastget + luaV_finishget). No
+    /// _G/_ENV/_VERSION special cases — PUC has none: _G/_VERSION are real
+    /// bootstrap fields (bootstrapGlobals/luaopen_base), and PUC never
+    /// stores an _ENV field in the globals table.
+    fn getGlobal(self: *Vm, name: []const u8) DispatchError!Value {
+        const gt = self.registryGlobalsValue();
+        const key: Value = .{ .String = try self.internStr(name) };
+        return self.indexValue(gt, key);
     }
 
+    /// PUC lua_setglobal = auxsetstr(getGlobalTable(L), name, v) (lapi.c:702,
+    /// 858-877): the full __newindex path (luaV_fastset + luaV_finishset) on
+    /// the current registry[2]. Writing Nil removes the entry (finishset →
+    /// luaH_finishset deletion).
     fn setGlobal(self: *Vm, name: []const u8, v: Value) DispatchError!void {
-        // Writing Nil removes the entry (rawSet semantics); no separate dup of
-        // the name is needed — the key lives inside the interned LuaString.
-        try self.setField(self.global_env, name, v);
+        const gt = self.registryGlobalsValue();
+        const key: Value = .{ .String = try self.internStr(name) };
+        return self.setIndexValue(gt, key, v);
     }
 
     fn errorLocationFrameIndex(self: *const Vm, level: usize) ?*const CallFrame {
@@ -26150,10 +26236,11 @@ pub const Vm = struct {
         // uses global accesses (e.g. `require`, `setmetatable`) that compile
         // to OP_GETTABUP on upvalue 0 (_ENV). Passing empty upvalues causes
         // an out-of-bounds access in gettabup. createBytecodeChunkClosure
-        // allocates the upvalue cells; applyLoadEnv sets _ENV to global_env.
+        // allocates the upvalue cells; applyLoadEnv sets _ENV to the current
+        // registry globals.
         const cl = try self.createBytecodeChunkClosure(proto);
         proto.tree.?.releaseTree(self.alloc);
-        try self.applyLoadEnv(cl, .{ .Table = self.global_env }, false);
+        try self.applyLoadEnv(cl, self.registryGlobalsValue(), false);
         const ret = try self.runClosure(cl, &.{});
         self.alloc.free(ret);
 
@@ -26179,7 +26266,7 @@ pub const Vm = struct {
 
     fn bootstrapGlobals(self: *Vm) DispatchError!void {
         // Materialize canonical globals inside `_G` itself for `_ENV`-based lookups.
-        try self.setGlobal("_G", .{ .Table = self.global_env });
+        try self.setGlobal("_G", self.registryGlobalsValue());
         try self.setGlobal("_VERSION", .{ .String = try self.internStr("Lua 5.5") });
 
         // Base builtins.
@@ -26231,9 +26318,11 @@ pub const Vm = struct {
         try self.setField(package_tbl, "preload", .{ .Table = preload_tbl });
         // PUC stores loaded/preload in the registry (LUA_REGISTRYINDEX,
         // LUA_LOADED_TABLE / LUA_PRELOAD_TABLE) so that require still works
-        // even if someone replaces the global `package` table. We do the
-        // same: store the canonical tables in the debug registry.
-        const reg = try self.ensureDebugRegistry();
+        // even if someone replaces the global `package` table. PUC creates
+        // them at package-load time (luaL_getsubtable); bootstrapGlobals is
+        // our package-load point, so the same shape: create here, publish
+        // into the registry slot's table.
+        const reg = self.registryTable().?;
         try self.setField(reg, "_LOADED", .{ .Table = loaded_tbl });
         try self.setField(reg, "_PRELOAD", .{ .Table = preload_tbl });
         // PUC registers the globals table in package.loaded under "_G"
@@ -26242,7 +26331,7 @@ pub const Vm = struct {
         // `require("_G")` reads and — importantly for error messages —
         // what pushglobalfuncname's loaded-table search walks to resolve
         // global functions (setmetatable, error, ...) to their names.
-        try self.setField(loaded_tbl, "_G", .{ .Table = self.global_env });
+        try self.setField(loaded_tbl, "_G", self.registryGlobalsValue());
         try self.setGlobal("package", .{ .Table = package_tbl });
 
         // os = core process/filesystem helpers
@@ -26775,7 +26864,7 @@ pub const Vm = struct {
             const k = self.gcControl(3, 0, -1); // LUA_GCCOUNT
             const b = self.gcControl(4, 0, -1); // LUA_GCCOUNTB
             if (want_out) {
-                const live_ud_kb = self.testcLiveUserdataKb();
+                const live_ud_kb = try self.testcLiveUserdataKb();
                 // P16.39 Cut 3 (correctness): testcLiveUserdataKb runs a
                 // nested callBuiltin (C-frame push may grow stack) —
                 // re-derive the outs window before writing.
@@ -30602,7 +30691,6 @@ pub const Vm = struct {
     /// re-walking them for every tiny incremental slice would turn `load()`-
     /// heavy programs into repeated full-root scans.
     fn gcMarkCurrentRoots(self: *Vm) DispatchError!void {
-        try self.gcMarkValue(.{ .Table = self.global_env });
         try self.gcMarkMutableRoots();
         try self.gcMarkVmRoots();
     }
@@ -31882,13 +31970,14 @@ pub const Vm = struct {
     fn gcAtomicCommon(self: *Vm) DispatchError!void {
         // ── Step 1 (lgc.c:1551-1554): mark roots ──
         // PUC: markobject(g, L) + markvalue(g, &g->l_registry) + markmt(g).
-        // luazig: gcMarkMutableRoots covers the first two PUC operations
+        // luazig: gcMarkMutableRoots covers the first PUC operation
         // AND marks the active thread's register windows plus parked
         // threads' stacks. This is the equivalent of PUC's
         // traversethread, which runs during propagateall (Step 2). The
-        // third PUC operation, markmt(g), is NOT here: it is performed by
-        // the separate gcMarkTypeMetatables helper called immediately
-        // below.
+        // second PUC operation, markvalue(&g->l_registry), is the
+        // separate slot re-mark right below. The third, markmt(g), is
+        // performed by the separate gcMarkTypeMetatables helper called
+        // immediately below.
         //
         // [PUC lgc.c:1546-1547 saves+clears grayagain HERE, before
         // markobject. luazig defers the save+clear to gcDrainGrayagain
@@ -31909,6 +31998,16 @@ pub const Vm = struct {
         // because no mutations occur between gcMarkMutableRoots and
         // gcDrainGrayagain.]
         try self.gcMarkMutableRoots();
+
+        // PUC atomic Step 1 (lgc.c:1553): markvalue(g, &g->l_registry) —
+        // re-mark the registry SLOT before sweep decides liveness. The API
+        // stores into the slot with a plain store and NO barrier (PUC
+        // lapi.c:262-263), so a fresh table written into the slot mid-cycle
+        // (lua_copy(x, LUA_REGISTRYINDEX)) is white and unreachable until
+        // this re-mark paints it. Runs in both GC modes: incremental
+        // gcAtomicPhase and generational gcMinorCollection both come
+        // through gcAtomicCommon.
+        try self.gcMarkValue(self.l_registry);
 
         // PUC atomic Step 1 ends with markmt(g) (lgc.c:1554): re-mark the
         // type-level metatable slots. The API can store a fresh table into
@@ -33171,7 +33270,7 @@ pub const Vm = struct {
     }
 
     /// Mark all GC roots that live directly on the Vm struct and are NOT
-    /// reachable through Lua-value traversal from global_env/frames.
+    /// reachable through Lua-value traversal from the registry/frames.
     fn gcMarkVmRoots(self: *Vm) DispatchError!void {
         // Type metatables: every string/number/boolean/etc. value's metamethod
         // lookup routes through these (PUC markmt).
@@ -33208,7 +33307,13 @@ pub const Vm = struct {
                 self.gc_mark_epoch += 1;
             }
         }
-        if (self.debug_registry) |t| try self.gcMarkValue(.{ .Table = t });
+        // The registry slot (PUC G->l_registry): unconditional mark of the
+        // slot VALUE — a no-op for non-GC values (nil/number/boolean), a
+        // full subtree mark for the registry table. This replaces both the
+        // old debug_registry mark and the old direct global_env mark: the
+        // globals table is registry[LUA_RIDX_GLOBALS], reachable through
+        // the slot's traversal.
+        try self.gcMarkValue(self.l_registry);
 
         // Thread handles held by the VM.
         const optional_threads = [_]?*Thread{
@@ -34289,7 +34394,7 @@ pub const Vm = struct {
         // lua_load behavior: the main chunk's first upvalue is _ENV = _G.
         // Without this, global lookups (GETTABUP on upvalue 0) return nil
         // because the _ENV cell is initialized to Nil by createBytecodeChunkClosure.
-        try self.applyLoadEnv(cl, .{ .Table = self.global_env }, false);
+        try self.applyLoadEnv(cl, self.registryGlobalsValue(), false);
         return Value{ .Closure = cl };
     }
 
@@ -34395,7 +34500,7 @@ pub const Vm = struct {
                     return self.fail("{s}", .{diagnostic});
                 },
             };
-            try self.applyLoadEnv(cl, .{ .Table = self.global_env }, false);
+            try self.applyLoadEnv(cl, self.registryGlobalsValue(), false);
             if (self.current_thread) |th| {
                 if (th.callee == .Builtin and th.callee.Builtin == .dofile) {
                     th.dofile_entry_closure = cl;
@@ -35190,7 +35295,7 @@ pub const Vm = struct {
         const reader_val: Value = args[0];
         const chunk_name_val: Value = if (args.len > 1) args[1] else .Nil;
         const mode_val: Value = if (args.len > 2) args[2] else .Nil;
-        const env_val: Value = if (args.len > 3) args[3] else .{ .Table = self.global_env };
+        const env_val: Value = if (args.len > 3) args[3] else self.registryGlobalsValue();
         var scope = try self.openRootScope(5, 0);
         defer scope.close();
         _ = scope.protectValueAssumeCapacity(reader_val);
@@ -35406,16 +35511,25 @@ pub const Vm = struct {
         // PUC ll_require (loadlib.c:650-656): gets loaded/preload from
         // LUA_REGISTRYINDEX, NOT from the global `package` table. This means
         // require keeps working even if someone replaces `package = {}`.
-        // We replicate this: canonical loaded/preload live in the registry.
-        const reg = try self.ensureDebugRegistry();
-        const loaded_v = self.getFieldOpt(reg, "_LOADED") orelse return self.fail("require: registry._LOADED missing", .{});
-        const loaded_tbl = try self.expectTable(loaded_v);
-        const preload_v = self.getFieldOpt(reg, "_PRELOAD") orelse return self.fail("require: registry._PRELOAD missing", .{});
-        const preload_tbl = try self.expectTable(preload_v);
+        // PUC reads them with lua_getfield — a non-table registry slot or a
+        // missing/non-table entry surfaces as the standard index error
+        // ("attempt to index a nil/... value"), not a custom message.
+        const reg = self.registryTable() orelse
+            return self.fail("attempt to index a nil value", .{});
+        const loaded_v = self.getFieldOpt(reg, "_LOADED") orelse .Nil;
+        const loaded_tbl = switch (loaded_v) {
+            .Table => |t| t,
+            else => return self.fail("attempt to index a {s} value", .{loaded_v.typeName()}),
+        };
+        const preload_v = self.getFieldOpt(reg, "_PRELOAD") orelse .Nil;
+        const preload_tbl = switch (preload_v) {
+            .Table => |t| t,
+            else => return self.fail("attempt to index a {s} value", .{preload_v.typeName()}),
+        };
 
         // PUC ll_require checks package.searchers is a table.
         // Our search is hardcoded but we validate the field for compatibility.
-        const package_v = self.getGlobal("package");
+        const package_v = try self.getGlobal("package");
         if (package_v == .Table) {
             if (self.getFieldOpt(package_v.Table, "searchers")) |searchers| {
                 if (searchers != .Table) {
@@ -37887,32 +38001,6 @@ pub const Vm = struct {
         outs[0] = .Nil;
     }
 
-    fn ensureDebugRegistry(self: *Vm) DispatchError!*Table {
-        if (self.debug_registry) |r| return r;
-        var scope = try self.openRootScope(3, 0);
-        defer scope.close();
-        // P16.50-review-14 HIGH 2: every fresh table here (reg, hookkey and
-        // especially mt — the audit's unrooted one) must be rooted with an
-        // INFALLIBLE protect: the next setField/intern/metatable-prepare can
-        // fire an emergency GC, and a table living only in a Zig local is
-        // invisible to the emergency scan. The scope reserves all three
-        // slots before any object exists (review-7 discipline).
-
-        const reg = try self.allocTable();
-        _ = scope.protectValueAssumeCapacity(.{ .Table = reg });
-
-        const hookkey = try self.allocTable();
-        _ = scope.protectValueAssumeCapacity(.{ .Table = hookkey });
-
-        const mt = try self.allocTable();
-        _ = scope.protectValueAssumeCapacity(.{ .Table = mt });
-        try self.setField(mt, "__mode", .{ .String = try self.internStr("k") });
-        try self.gcStoreMetatable(hookkey, mt);
-        try self.setField(reg, "_HOOKKEY", .{ .Table = hookkey });
-        self.debug_registry = reg;
-        return reg;
-    }
-
     /// PUC luaL_newmetatable (lauxlib.c:317-327) as ONE shared semantic
     /// path for both thin wrappers: the C-API `api.State.newmetatable` /
     /// c_api `luaL_newmetatable`, and the testC `newmetatable` command
@@ -37963,7 +38051,8 @@ pub const Vm = struct {
         tname: []const u8,
         th: *Thread,
     ) DispatchError!bool {
-        const reg = try self.ensureDebugRegistry();
+        const reg = self.registryTable() orelse
+            return self.fail("attempt to index a nil value", .{});
         // Edge 1: tname intern (part of the registry lookup).
         const key = try self.internStr(tname);
         const existing = self.apiRawGet(reg, .{ .String = key });
@@ -38021,8 +38110,7 @@ pub const Vm = struct {
     fn builtinDebugGetregistry(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = args;
         if (outs.len == 0) return;
-        const reg = try self.ensureDebugRegistry();
-        outs[0] = .{ .Table = reg };
+        outs[0] = self.l_registry;
     }
 
     /// PUC db_getmetatable (ldblib.c:48-54): a RAW lua_getmetatable —
@@ -38184,7 +38272,7 @@ pub const Vm = struct {
             };
 
             // Apply _ENV = _G so the debug command sees globals.
-            try self.applyLoadEnv(cl, .{ .Table = self.global_env }, false);
+            try self.applyLoadEnv(cl, self.registryGlobalsValue(), false);
 
             // Run the chunk in a protected context (pcall semantics).
             // PUC uses lua_pcall(L, 0, 0, 0); on error, the message is on the
@@ -38269,7 +38357,8 @@ pub const Vm = struct {
     /// the same way; used by writeSyntheticTopCFrame's pushfuncname fallback).
     fn debugFindGlobalFuncName(self: *Vm, callee: Value) ?[]const u8 {
         if (callee != .Closure and callee != .Builtin) return null;
-        for (self.global_env.hash) |*node| {
+        const gt = self.registryGlobalsTable() orelse return null;
+        for (gt.hash) |*node| {
             if (!ltable.Node.isStringTag(node.key_tt)) continue;
             if (node.value == .Nil) continue;
             // Tag-guarded comparison: reading the wrong union payload of
@@ -39064,7 +39153,7 @@ pub const Vm = struct {
         var ret_file: Value = .Nil;
         if (!to_stderr and args.len > 0 and asFileTable(self, args[0]) != null) {
             // Method call syntax: <file>:write(...). Handle stdout/stderr objects.
-            const io_v = self.getGlobal("io");
+            const io_v = try self.getGlobal("io");
             if (io_v == .Table) {
                 const io_tbl = io_v.Table;
                 ret_file = args[0];
@@ -39081,7 +39170,7 @@ pub const Vm = struct {
             i = 1;
         } else if (!to_stderr) {
             // io.write(...) writes to current default output stream.
-            const io_v = self.getGlobal("io");
+            const io_v = try self.getGlobal("io");
             if (io_v == .Table) {
                 const io_tbl = io_v.Table;
                 const out_v = self.getFieldOpt(io_tbl, "stdout") orelse .Nil;
@@ -39117,7 +39206,7 @@ pub const Vm = struct {
             }
         }
         if (to_stderr) {
-            const io_v = self.getGlobal("io");
+            const io_v = try self.getGlobal("io");
             if (io_v == .Table) ret_file = self.getFieldOpt(io_v.Table, "stderr") orelse .Nil;
         }
         if (outs.len > 0 and ret_file != .Nil) outs[0] = ret_file;
@@ -39125,7 +39214,7 @@ pub const Vm = struct {
 
     fn builtinIoInput(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
-        const io_v = self.getGlobal("io");
+        const io_v = try self.getGlobal("io");
         if (io_v != .Table) {
             outs[0] = .Nil;
             return;
@@ -39145,7 +39234,7 @@ pub const Vm = struct {
             };
             try self.setField(io_tbl, "input_stream", file_v);
 
-            self.maybeCloseReplacedDefault(old_in, file_v);
+            try self.maybeCloseReplacedDefault(old_in, file_v);
             outs[0] = file_v;
             return;
         }
@@ -39154,7 +39243,7 @@ pub const Vm = struct {
             return self.fail("bad argument #1 to 'input' (FILE* expected, got {s})", .{name});
         }
         try self.setField(io_tbl, "input_stream", args[0]);
-        self.maybeCloseReplacedDefault(old_in, args[0]);
+        try self.maybeCloseReplacedDefault(old_in, args[0]);
         outs[0] = args[0];
     }
 
@@ -39859,22 +39948,22 @@ pub const Vm = struct {
         return self.fail("bad argument to 'read' (invalid format)", .{});
     }
 
-    fn currentInputFile(self: *Vm) Value {
-        const io_v = self.getGlobal("io");
+    fn currentInputFile(self: *Vm) DispatchError!Value {
+        const io_v = try self.getGlobal("io");
         if (io_v != .Table) return .Nil;
         return self.getFieldOpt(io_v.Table, "input_stream") orelse (self.getFieldOpt(io_v.Table, "stdin") orelse .Nil);
     }
 
-    fn currentOutputFile(self: *Vm) Value {
-        const io_v = self.getGlobal("io");
+    fn currentOutputFile(self: *Vm) DispatchError!Value {
+        const io_v = try self.getGlobal("io");
         if (io_v != .Table) return .Nil;
         const io_tbl = io_v.Table;
         return self.getFieldOpt(io_tbl, "output_stream") orelse (self.getFieldOpt(io_tbl, "stdout") orelse .Nil);
     }
 
     fn builtinIoRead(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
-        const file_v = self.currentInputFile();
-        if (asFileTable(self, file_v) != null and !self.isStdFile(file_v) and self.getManagedFile(file_v) == null) {
+        const file_v = try self.currentInputFile();
+        if (asFileTable(self, file_v) != null and !try self.isStdFile(file_v) and self.getManagedFile(file_v) == null) {
             return self.fail(" input file is closed", .{});
         }
         if (!fileCanRead(self, file_v)) return self.fail(" input file is closed", .{});
@@ -39937,7 +40026,7 @@ pub const Vm = struct {
         var auto_close = false;
         var fmt_start: usize = 0;
         if (args.len == 0 or args[0] == .Nil) {
-            file_v = self.currentInputFile();
+            file_v = try self.currentInputFile();
             fmt_start = if (args.len == 0) 0 else 1;
         } else if (args[0] == .String) {
             var open_out = [_]Value{ .Nil, .Nil, .Nil };
@@ -40001,7 +40090,7 @@ pub const Vm = struct {
     fn builtinIoFlush(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = args;
         if (outs.len == 0) return;
-        const out_v = self.currentOutputFile();
+        const out_v = try self.currentOutputFile();
         _ = self.getManagedFile(out_v) orelse {
             outs[0] = .{ .Bool = true };
             return;
@@ -40020,7 +40109,7 @@ pub const Vm = struct {
 
     fn builtinIoOutput(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
-        const io_v = self.getGlobal("io");
+        const io_v = try self.getGlobal("io");
         if (io_v != .Table) {
             outs[0] = .Nil;
             return;
@@ -40038,7 +40127,7 @@ pub const Vm = struct {
                 return self.fail("cannot open file '{s}' ({s})", .{ args[0].String.bytes(), msg });
             };
             try self.setField(io_tbl, "output_stream", file_v);
-            self.maybeCloseReplacedDefault(old_out, file_v);
+            try self.maybeCloseReplacedDefault(old_out, file_v);
             outs[0] = file_v;
             return;
         }
@@ -40047,12 +40136,12 @@ pub const Vm = struct {
             return self.fail("bad argument #1 to 'output' (FILE* expected, got {s})", .{name});
         }
         try self.setField(io_tbl, "output_stream", args[0]);
-        self.maybeCloseReplacedDefault(old_out, args[0]);
+        try self.maybeCloseReplacedDefault(old_out, args[0]);
         outs[0] = args[0];
     }
 
-    fn isStdFile(self: *Vm, v: Value) bool {
-        const io_v = self.getGlobal("io");
+    fn isStdFile(self: *Vm, v: Value) DispatchError!bool {
+        const io_v = try self.getGlobal("io");
         if (io_v != .Table) return false;
         const io_tbl = io_v.Table;
         const stdin_v = self.getFieldOpt(io_tbl, "stdin") orelse .Nil;
@@ -40061,8 +40150,8 @@ pub const Vm = struct {
         return valuesEqual(v, stdin_v) or valuesEqual(v, stdout_v) or valuesEqual(v, stderr_v);
     }
 
-    fn maybeCloseReplacedDefault(self: *Vm, old_v: Value, new_v: Value) void {
-        if (valuesEqual(old_v, new_v) or self.isStdFile(old_v)) return;
+    fn maybeCloseReplacedDefault(self: *Vm, old_v: Value, new_v: Value) DispatchError!void {
+        if (valuesEqual(old_v, new_v) or try self.isStdFile(old_v)) return;
         if (asFileTable(self, old_v)) |t| {
             _ = self.closeManagedFile(t);
             _ = self.setField(t, "__closed", .{ .Bool = true }) catch {};
@@ -40075,14 +40164,14 @@ pub const Vm = struct {
             if (outs.len > 1) outs[1] = .Nil;
             if (outs.len > 2) outs[2] = .Nil;
         }
-        const io_v = self.getGlobal("io");
+        const io_v = try self.getGlobal("io");
         if (io_v != .Table) return;
         const io_tbl = io_v.Table;
         const file_v = if (args.len == 0) (self.getFieldOpt(io_tbl, "output_stream") orelse (self.getFieldOpt(io_tbl, "stdout") orelse .Nil)) else args[0];
         const file_tbl = asFileTable(self, file_v) orelse {
             return self.fail("bad argument #1 to 'close' (FILE* expected, got {s})", .{self.valueTypeName(file_v)});
         };
-        if (self.isStdFile(file_v)) {
+        if (try self.isStdFile(file_v)) {
             if (outs.len > 1) {
                 const istr = try self.internStr("cannot close standard file");
                 outs[1] = .{ .String = istr };
@@ -40111,7 +40200,7 @@ pub const Vm = struct {
         const file_tbl = asFileTable(self, file_v) orelse {
             return self.fail("bad argument #1 to 'close' (FILE* expected, got {s})", .{self.valueTypeName(file_v)});
         };
-        if (self.isStdFile(file_v)) {
+        if (try self.isStdFile(file_v)) {
             if (outs.len > 1) {
                 const istr = try self.internStr("cannot close standard file");
                 outs[1] = .{ .String = istr };
@@ -40131,7 +40220,7 @@ pub const Vm = struct {
     fn builtinFileMetaClose(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) return;
         const file_tbl = asFileTable(self, args[0]) orelse return;
-        if (self.isStdFile(args[0])) return;
+        if (try self.isStdFile(args[0])) return;
         if (self.getFieldOpt(file_tbl, "__closed")) |v| {
             if (v == .Bool and v.Bool) return;
         }
@@ -40369,7 +40458,7 @@ pub const Vm = struct {
         // Standard streams are long-lived (referenced from `io.stdin`/
         // `io.stdout`/`io.stderr`) and must never be closed by GC, matching
         // PUC Lua where `io.stdin`/`io.stdout`/`io.stderr` are never finalized.
-        if (self.isStdFile(args[0])) return;
+        if (try self.isStdFile(args[0])) return;
         // PUC f_gc (liolib.c:234-238): ignore already-closed files.
         // `isclosed(p)` checks `closef == NULL`; our equivalent is the
         // `__closed` field set by explicit close / __close / auto-close.
@@ -45373,7 +45462,7 @@ pub const Vm = struct {
             const buff = self.testc_warn_buff.items;
 
             // Check for unhandled previous warning in _WARN (ltests.c:140-146).
-            const prev_warn = self.getGlobal("_WARN");
+            const prev_warn = try self.getGlobal("_WARN");
             if (prev_warn != .Nil and prev_warn != .Bool or
                 (prev_warn == .Bool and prev_warn.Bool))
             {
@@ -48475,8 +48564,8 @@ pub const Vm = struct {
 
     fn currentCallableEnvValue(self: *Vm) Value {
         // IR frame env lookup (Vm.call_frames) is gone — that array is always
-        // empty. The active environment is the global env.
-        return .{ .Table = self.global_env };
+        // empty. The active environment is the current registry globals.
+        return self.registryGlobalsValue();
     }
 
     /// P16.50-review-6 BLOCKER 1: T.testC returns its ACTUAL results via the
@@ -50040,7 +50129,8 @@ pub const Vm = struct {
             .pushvalue => {
                 if (cargs.len != 1) return self.fail("testC pushvalue expects 1 arg", .{});
                 if (std.mem.eql(u8, cargs[0], "R")) {
-                    const reg = try self.ensureDebugRegistry();
+                    const reg = self.registryTable() orelse
+                        return self.fail("testC registry slot is not a table", .{});
                     try win.push(.{ .Table = reg });
                 } else if (parseTestcUpvalueToken(cargs[0])) |uix| {
                     const uv = try self.getTestcUpvalue(ctx, uix);
@@ -50863,7 +50953,8 @@ pub const Vm = struct {
                 if (cargs.len != 1) return self.fail("testC settable expects 1 arg", .{});
                 if (win.count() < 2) return self.fail("testC stack underflow", .{});
                 const obj = if (std.mem.eql(u8, cargs[0], "R"))
-                    Value{ .Table = try self.ensureDebugRegistry() }
+                    Value{ .Table = self.registryTable() orelse
+                        return self.fail("testC registry slot is not a table", .{}) }
                 else
                     win.slot(try self.parseTestcIndex(cargs[0], win.count()));
                 const val = win.pop();
@@ -50874,7 +50965,8 @@ pub const Vm = struct {
                 if (cargs.len != 1) return self.fail("testC gettable expects 1 arg", .{});
                 if (win.count() == 0) return self.fail("testC stack underflow", .{});
                 const obj = if (std.mem.eql(u8, cargs[0], "R"))
-                    Value{ .Table = try self.ensureDebugRegistry() }
+                    Value{ .Table = self.registryTable() orelse
+                        return self.fail("testC registry slot is not a table", .{}) }
                 else
                     win.slot(try self.parseTestcIndex(cargs[0], win.count()));
                 const key = win.pop();
@@ -50892,7 +50984,9 @@ pub const Vm = struct {
                                 try win.push(.Nil);
                             }
                         } else {
-                            try win.push(.{ .Table = self.global_env });
+                            // rawgeti(R, LUA_RIDX_GLOBALS): the RAW current
+                            // globals entry, whatever value it holds.
+                            try win.push(self.registryGlobalsValue());
                         }
                     } else if (std.mem.eql(u8, cargs[1], "!M")) {
                         const main_th = if (ctx.state) |state|
@@ -51016,7 +51110,7 @@ pub const Vm = struct {
                         try win.push(.Nil);
                     }
                 } else {
-                    try win.push(self.apiGetGlobal(name));
+                    try win.push(try self.apiGetGlobal(name));
                 }
             },
             .setglobal => {
@@ -51038,7 +51132,8 @@ pub const Vm = struct {
                 if (cargs.len != 1) return self.fail("testC rawget expects 1 arg", .{});
                 if (win.count() == 0) return self.fail("testC stack underflow", .{});
                 const base = if (std.mem.eql(u8, cargs[0], "R"))
-                    Value{ .Table = try self.ensureDebugRegistry() }
+                    Value{ .Table = self.registryTable() orelse
+                        return self.fail("testC registry slot is not a table", .{}) }
                 else
                     win.slot(try self.parseTestcIndex(cargs[0], win.count()));
                 const tbl = switch (base) {
@@ -51053,7 +51148,8 @@ pub const Vm = struct {
                 if (cargs.len != 1) return self.fail("testC rawset expects 1 arg", .{});
                 if (win.count() < 2) return self.fail("testC stack underflow", .{});
                 const base = if (std.mem.eql(u8, cargs[0], "R"))
-                    Value{ .Table = try self.ensureDebugRegistry() }
+                    Value{ .Table = self.registryTable() orelse
+                        return self.fail("testC registry slot is not a table", .{}) }
                 else
                     win.slot(try self.parseTestcIndex(cargs[0], win.count()));
                 const tbl = switch (base) {
@@ -51469,7 +51565,8 @@ pub const Vm = struct {
             .testudata => {
                 if (cargs.len != 2) return self.fail("testC testudata expects 2 args", .{});
                 const idx = try self.parseTestcIndexMaybe(cargs[0], win.count());
-                const reg = try self.ensureDebugRegistry();
+                const reg = self.registryTable() orelse
+                    return self.fail("testC registry slot is not a table", .{});
                 const key = trimTestcQuoted(cargs[1]);
                 const want = self.getFieldOpt(reg, key) orelse .Nil;
                 if (idx == null or want != .Table) {
@@ -51565,7 +51662,7 @@ pub const Vm = struct {
                 const count = std.fmt.parseInt(i64, cargs[1], 10) catch return self.fail("testC invalid hook count", .{});
                 var hook_fn: Value = .Nil;
                 const hook_body = cargs[2];
-                const t_global = self.getGlobal("T");
+                const t_global = try self.getGlobal("T");
                 if (t_global != .Table) return self.fail("testC sethook: T table missing", .{});
                 const mk = self.getFieldOpt(t_global.Table, "makeCfunc") orelse return self.fail("testC sethook: makeCfunc missing", .{});
                 var hook_args = [_]Value{.{ .String = try self.internStr(hook_body) }};
@@ -52030,7 +52127,7 @@ pub const Vm = struct {
     /// The result is written into `buf` (no allocation — error paths must
     /// not be able to fail with OOM while building a message).
     fn pushGlobalFuncName(self: *Vm, buf: []u8, func: Value) ?[]const u8 {
-        const reg = self.debug_registry orelse return null;
+        const reg = self.registryTable() orelse return null;
         const loaded = switch (self.getFieldOpt(reg, "_LOADED") orelse return null) {
             .Table => |t| t,
             else => return null,
@@ -52143,7 +52240,7 @@ pub const Vm = struct {
         return .{ .LightUserdata = @ptrFromInt(ptr_id) };
     }
 
-    fn testcLiveUserdataKb(self: *Vm) f64 {
+    fn testcLiveUserdataKb(self: *Vm) DispatchError!f64 {
         // The `T` global (with `_liveudbytes`) only exists after
         // enableTestcModuleInternal. Guard on the flag so production
         // `collectgarbage("count")` never touches the global table:
@@ -52159,7 +52256,7 @@ pub const Vm = struct {
         // allocUserdata). The live table only tracks payload size for the
         // old table-based emulation. Skip real Userdata entries to avoid
         // double-counting.
-        const t_global = self.getGlobal("T");
+        const t_global = try self.getGlobal("T");
         if (t_global != .Table) return 0.0;
         const fnv = self.getFieldOpt(t_global.Table, "_liveudbytes") orelse return 0.0;
         const retv: Value = switch (fnv) {
@@ -53065,7 +53162,7 @@ test "vm: table constructor and access" {
     var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     // Source uses global `x` (GETTABUP on _ENV upvalue 0); provide _ENV.
-    var env_cell = Cell{ .value = .{ .Table = vm.global_env } };
+    var env_cell = Cell{ .value = vm.registryGlobalsValue() };
     const upvals = [_]*Cell{&env_cell};
     const ret = try vm.runBytecode(proto, &upvals, &.{}, null);
 
@@ -53107,7 +53204,7 @@ test "vm: call tostring (one result)" {
     var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     // Source uses global `tostring` (GETTABUP on _ENV upvalue 0); provide _ENV.
-    var env_cell = Cell{ .value = .{ .Table = vm.global_env } };
+    var env_cell = Cell{ .value = vm.registryGlobalsValue() };
     const upvals = [_]*Cell{&env_cell};
     const ret = try vm.runBytecode(proto, &upvals, &.{}, null);
 
@@ -53153,7 +53250,7 @@ test "vm: if statement (NotEq) with _VERSION" {
     var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     // Source reads global `_VERSION` (GETTABUP on _ENV upvalue 0); provide _ENV.
-    var env_cell = Cell{ .value = .{ .Table = vm.global_env } };
+    var env_cell = Cell{ .value = vm.registryGlobalsValue() };
     const upvals = [_]*Cell{&env_cell};
     const ret = try vm.runBytecode(proto, &upvals, &.{}, null);
 
@@ -53236,7 +53333,7 @@ test "vm: locals swap uses temporaries" {
     var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     // Source uses global `tostring` (GETTABUP on _ENV upvalue 0); provide _ENV.
-    var env_cell = Cell{ .value = .{ .Table = vm.global_env } };
+    var env_cell = Cell{ .value = vm.registryGlobalsValue() };
     const upvals = [_]*Cell{&env_cell};
     const ret = try vm.runBytecode(proto, &upvals, &.{}, null);
 
@@ -53903,7 +54000,7 @@ test "vm: numeric for loop break + scope" {
     defer vm.deinit();
     // `return sum, i` after the for loop reads global `i` (the loop-local `i`
     // is out of scope), which compiles to GETTABUP on _ENV upvalue 0.
-    var env_cell = Cell{ .value = .{ .Table = vm.global_env } };
+    var env_cell = Cell{ .value = vm.registryGlobalsValue() };
     const upvals = [_]*Cell{&env_cell};
     const ret = try vm.runBytecode(proto, &upvals, &.{}, null);
 
@@ -53926,7 +54023,7 @@ test "vm: incremental GC advances real phases and preserves barrier writes" {
     const holder = try vm.allocTableNoGc();
     const target = try vm.allocTableNoGc();
     const holder_key = Value{ .String = try vm.internStr("incremental-holder") };
-    try vm.rawSet(vm.global_env, holder_key, .{ .Table = holder });
+    try vm.rawSet(vm.registryGlobalsTable().?, holder_key, .{ .Table = holder });
 
     // Add enough dead objects that sweep cannot finish in the same work unit.
     var i: usize = 0;
@@ -53984,8 +54081,8 @@ test "vm: generational GC ages barriers and nursery scope match PUC" {
     // A minor collection must not traverse every table in this graph.
     const old_heap = try vm.allocTableNoGc();
     const holder = try vm.allocTableNoGc();
-    try vm.rawSet(vm.global_env, .{ .String = try vm.internStr("gen-old-heap") }, .{ .Table = old_heap });
-    try vm.rawSet(vm.global_env, .{ .String = try vm.internStr("gen-holder") }, .{ .Table = holder });
+    try vm.rawSet(vm.registryGlobalsTable().?, .{ .String = try vm.internStr("gen-old-heap") }, .{ .Table = old_heap });
+    try vm.rawSet(vm.registryGlobalsTable().?, .{ .String = try vm.internStr("gen-holder") }, .{ .Table = holder });
     var i: usize = 0;
     while (i < 512) : (i += 1) {
         const old_entry = try vm.allocTableNoGc();
@@ -54033,7 +54130,7 @@ test "vm: generational GC enters and leaves incremental major mode" {
     defer vm.deinit();
 
     const root = try vm.allocTableNoGc();
-    try vm.rawSet(vm.global_env, .{ .String = try vm.internStr("gen-major-root") }, .{ .Table = root });
+    try vm.rawSet(vm.registryGlobalsTable().?, .{ .String = try vm.internStr("gen-major-root") }, .{ .Table = root });
     try vm.gcEnterGenerational();
     // Set minormajor to 1% to force a quick minor→major transition.
     vm.gcparams[2] = Vm.gcCodeParam(1);
@@ -55188,7 +55285,7 @@ test "vm: Task 7.2 — closure creation failure AFTER borrow established → no 
             borrowed_bytes,
             "test",
             "B",
-            .{ .Table = vm.global_env },
+            vm.registryGlobalsValue(),
             null,
         );
 
@@ -55253,7 +55350,7 @@ test "vm: Task 7.3 — source-backing .owned append in fixed mode (happy path)" 
         owned_copy,
         "test",
         "B",
-        .{ .Table = vm.global_env },
+        vm.registryGlobalsValue(),
         null,
     );
     switch (result) {
@@ -60570,8 +60667,8 @@ test "P16.50-review-5 B2: C-ABI throw matrix" {
                 }
                 const o = gcFromHeader(hdr);
                 if (o == .string and std.mem.eql(u8, o.string.bytes(), name)) {
-                    if (ltable.nodeLookup(vm.global_env.hash, .{ .String = o.string })) |node| {
-                        _ = ltable.nodeDelete(vm.global_env.hash, .{ .String = o.string });
+                    if (ltable.nodeLookup(vm.registryGlobalsTable().?.hash, .{ .String = o.string })) |node| {
+                        _ = ltable.nodeDelete(vm.registryGlobalsTable().?.hash, .{ .String = o.string });
                         ltable.clearKey(node);
                     }
                 }
@@ -62352,7 +62449,7 @@ test "P16.50-review-6 B2: newmetatable shared path + per-edge OOM ownership" {
     // Pre-create the Lua registry and pre-intern the FIXED "__name" key
     // (temp-rooted). The per-iteration names are deliberately NOT
     // pre-interned: the tname-intern edge must be inside the swept window.
-    const reg = try vm.apiEnsureRegistry();
+    const reg = vm.registryTable().?;
     var setup_scope = try vm.openRootScope(2, 0);
     defer setup_scope.close();
     const name_key = try vm.internStr("__name");
@@ -62686,7 +62783,7 @@ test "P16.50-review-7 B2: newmetatable key survives emergency GC in allocTable" 
 
     // Registry + fixed "__name" key pre-created and temp-rooted (the
     // same setup as the review-6 per-edge test).
-    const reg = try vm.apiEnsureRegistry();
+    const reg = vm.registryTable().?;
     var scope = try vm.openRootScope(1, 0);
     defer scope.close();
     const name_key = try vm.internStr("__name");
@@ -62762,7 +62859,7 @@ test "P16.50-review-7 B2: newmetatable roots-reserve OOM owns nothing (pre-table
     defer state.deinit();
     const vm = state.vm;
 
-    const reg = try vm.apiEnsureRegistry();
+    const reg = vm.registryTable().?;
     var scope = try vm.openRootScope(2, 0);
     defer scope.close();
     const name_key = try vm.internStr("__name");
@@ -63587,7 +63684,7 @@ test "P16.50-review-6 B2: testC newmetatable shares the luaL_newmetatable path" 
 
     // Shared-registry proof (Zig side): both testC-created metatables are
     // published in the ONE registry the C API uses, each with __name set.
-    const reg = try vm.apiEnsureRegistry();
+    const reg = vm.registryTable().?;
     const name_key = try vm.internStr("__name");
     for ([_][]const u8{ "p50r6b2mt", "p50r6b2mt2" }) |n| {
         const key = try vm.internStr(n);
@@ -64482,7 +64579,7 @@ test "P16.50-review-7 B3.4b: tail testC through <close> — countdown sweep + ex
                 try testing.expectEqual(@as(usize, 1), results.len);
                 try testing.expect(results[0] == .Table);
                 // The closer ran exactly once on the success path.
-                const g = vm.rawGet(vm.global_env, .{ .String = try vm.internStr("g") });
+                const g = vm.rawGet(vm.registryGlobalsTable().?, .{ .String = try vm.internStr("g") });
                 try testing.expect(g == .Int and g.Int == 1);
                 break :blk false;
             } else |e| {
@@ -64501,7 +64598,7 @@ test "P16.50-review-7 B3.4b: tail testC through <close> — countdown sweep + ex
     defer vm.alloc.free(results);
     try testing.expectEqual(@as(usize, 1), results.len);
     try testing.expect(results[0] == .Table);
-    const g = vm.rawGet(vm.global_env, .{ .String = try vm.internStr("g") });
+    const g = vm.rawGet(vm.registryGlobalsTable().?, .{ .String = try vm.internStr("g") });
     try testing.expect(g == .Int and g.Int == 1);
 }
 
@@ -64634,7 +64731,7 @@ test "P16.50-review-8 §2: continueBytecodeClose reads no field after destroy (p
         _ = scope.protectValueAssumeCapacity(chunk_v);
         const cl = chunk_v.Closure;
         try testing.expectError(error.RuntimeError, vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl));
-        const g = vm.rawGet(vm.global_env, .{ .String = try vm.internStr("g") });
+        const g = vm.rawGet(vm.registryGlobalsTable().?, .{ .String = try vm.internStr("g") });
         try testing.expect(g == .Int and g.Int == 1);
     }
 
@@ -64651,7 +64748,7 @@ test "P16.50-review-8 §2: continueBytecodeClose reads no field after destroy (p
         _ = scope.protectValueAssumeCapacity(chunk_v);
         const cl = chunk_v.Closure;
         try testing.expectError(error.RuntimeError, vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl));
-        const g = vm.rawGet(vm.global_env, .{ .String = try vm.internStr("g") });
+        const g = vm.rawGet(vm.registryGlobalsTable().?, .{ .String = try vm.internStr("g") });
         try testing.expect(g == .Int and g.Int == 1);
     }
 
@@ -64673,7 +64770,7 @@ test "P16.50-review-8 §2: continueBytecodeClose reads no field after destroy (p
         defer vm.alloc.free(results);
         try testing.expectEqual(@as(usize, 1), results.len);
         try testing.expect(results[0] == .String and std.mem.eql(u8, results[0].String.bytes(), "done"));
-        const g = vm.rawGet(vm.global_env, .{ .String = try vm.internStr("g") });
+        const g = vm.rawGet(vm.registryGlobalsTable().?, .{ .String = try vm.internStr("g") });
         try testing.expect(g == .Int and g.Int == 1);
 
         // Health: full GC, then a fresh run of the same closure.
@@ -64682,7 +64779,7 @@ test "P16.50-review-8 §2: continueBytecodeClose reads no field after destroy (p
         defer vm.alloc.free(results2);
         try testing.expectEqual(@as(usize, 1), results2.len);
         try testing.expect(results2[0] == .String and std.mem.eql(u8, results2[0].String.bytes(), "done"));
-        const g2 = vm.rawGet(vm.global_env, .{ .String = try vm.internStr("g") });
+        const g2 = vm.rawGet(vm.registryGlobalsTable().?, .{ .String = try vm.internStr("g") });
         try testing.expect(g2 == .Int and g2.Int == 1);
     }
 }
@@ -68030,74 +68127,94 @@ test "P16.50-review-15 BLOCKER 1: coroutine.wrap C-closure construction survives
     }
 }
 
-test "P16.50-review-14 HIGH 2: ensureDebugRegistry intermediates survive emergency GC and OOM edges" {
+test "cidxcut1: registry slot owner — RIDX population, slot writes, GC re-mark" {
     const testing = std.testing;
 
-    // ── (A) emergency-GC matrix over the three fresh tables (reg,
-    // hookkey, mt) ──
-    for (1..4) |k| {
-        var vm: Vm = .init(testing.allocator, false);
-        defer vm.deinit();
-        // bootstrapGlobals pre-creates the registry; reset the slot so the
-        // construction path under test actually runs (the bootstrap
-        // registry's tables become unreachable garbage — fair game for the
-        // emergency sweep).
-        vm.debug_registry = null;
-        var emerg = R14High2EmergencyAlloc{ .base = testing.allocator, .vm = &vm, .k = k };
-        vm.alloc = emerg.allocator();
-        const r = vm.ensureDebugRegistry();
-        vm.alloc = testing.allocator;
-        const reg = try r;
-        try testing.expect(emerg.fired);
-
-        // Identity: the registry is published fully wired.
-        try testing.expect(vm.debug_registry == reg);
-        const hookkeyv = vm.getFieldOpt(reg, "_HOOKKEY").?;
-        try testing.expect(hookkeyv == .Table);
-        const hookkey = hookkeyv.Table;
-        const mt = hookkey.metatable.?;
-        const modev = vm.getFieldOpt(mt, "__mode").?;
-        try testing.expect(modev == .String and std.mem.eql(u8, "k", modev.String.bytes()));
-
-        // A REAL full cycle: the registry is a GC root — everything
-        // survives through it.
-        try vm.gcCycleFull();
-        try testing.expect(vm.debug_registry == reg);
-        try testing.expect(p50StillRegistered(&vm, .{ .table = reg }));
-        try testing.expect(p50StillRegistered(&vm, .{ .table = hookkey }));
-        try testing.expect(p50StillRegistered(&vm, .{ .table = mt }));
-    }
-
-    // ── (B) OOM edge sweep ──
+    // ── (A) PUC init_registry population (lstate.c:186-204) ──
     {
         var vm: Vm = .init(testing.allocator, false);
         defer vm.deinit();
-        vm.debug_registry = null; // bootstrap pre-creates it — run the construction
-        var boundary: ?usize = null;
-        for (0..32) |fi| {
-            var failing = std.testing.FailingAllocator.init(testing.allocator, .{
-                .fail_index = fi,
-                .resize_fail_index = 0,
-            });
-            vm.alloc = failing.allocator();
-            const r = vm.ensureDebugRegistry();
-            vm.alloc = testing.allocator;
-            if (r) |reg| {
-                boundary = fi;
-                try testing.expect(vm.debug_registry == reg);
-                try vm.gcCycleFull();
-                try testing.expect(vm.debug_registry == reg);
-                break;
-            } else |e| {
-                try testing.expect(e == error.OutOfMemory);
-                // Nothing published: the registry slot stays empty.
-                try testing.expect(vm.debug_registry == null);
-                // REAL full cycle after the failure: partial garbage swept.
-                try vm.gcCycleFull();
-                try testing.expect(vm.debug_registry == null);
-            }
-        }
-        try testing.expect(boundary != null);
+        const reg = vm.registryTable().?;
+        // [1] = false (PUC setbfvalue — NOT the main thread).
+        try testing.expect(vm.rawGet(reg, .{ .Int = 1 }) == .Bool);
+        try testing.expect(vm.rawGet(reg, .{ .Int = 1 }).Bool == false);
+        // [2] = the globals table; getGlobal reads the same table.
+        const gt = vm.rawGet(reg, .{ .Int = Vm.LUA_RIDX_GLOBALS });
+        try testing.expect(gt == .Table);
+        try testing.expect(vm.registryGlobalsTable().? == gt.Table);
+        // _G is a real field of that table (no getGlobal special case).
+        try testing.expect(vm.rawGet(gt.Table, .{ .String = vm.internStrAssume("_G") }) == .Table);
+        // [3] = the main thread.
+        const mt = vm.rawGet(reg, .{ .Int = Vm.LUA_RIDX_MAINTHREAD });
+        try testing.expect(mt == .Thread and mt.Thread == vm.main_thread.?);
+        // _HOOKKEY is eagerly present (documented shape deviation).
+        try testing.expect(vm.getFieldOpt(reg, "_HOOKKEY") != null);
+    }
+
+    // ── (B) incremental atomic re-mark: a plain slot store mid-cycle
+    // survives the cycle (PUC lgc.c:1553 parity) ──
+    {
+        var vm: Vm = .init(testing.allocator, false);
+        defer vm.deinit();
+        try vm.gcStartCycle(true);
+        const t = try vm.allocTable();
+        try vm.setField(t, "marker", .{ .Int = 1234 });
+        // Plain store into the slot — NO barrier (PUC lapi.c:262-263).
+        vm.l_registry = .{ .Table = t };
+        while (vm.gc_state != .pause) _ = try vm.gcAdvance(1, false);
+        try testing.expect(vm.registryTable().? == t);
+        try testing.expect(p50StillRegistered(&vm, .{ .table = t }));
+        const mv = vm.getFieldOpt(t, "marker").?;
+        try testing.expect(mv == .Int and mv.Int == 1234);
+    }
+
+    // ── (C) generational minor-cycle re-mark: same proof under
+    // LUA_GCGEN (gcMinorCollection → gcAtomicCommon) ──
+    {
+        var vm: Vm = .init(testing.allocator, false);
+        defer vm.deinit();
+        _ = vm.gcControl(7, 0, -1);
+        try vm.gcMinorCollection();
+        const t = try vm.allocTable();
+        try vm.setField(t, "marker", .{ .Int = 4321 });
+        vm.l_registry = .{ .Table = t };
+        try vm.gcMinorCollection();
+        try testing.expect(vm.registryTable().? == t);
+        try testing.expect(p50StillRegistered(&vm, .{ .table = t }));
+        const mv = vm.getFieldOpt(t, "marker").?;
+        try testing.expect(mv == .Int and mv.Int == 4321);
+    }
+
+    // ── (D) non-table slot: getGlobal/getfield surface the standard
+    // index error; a table restore returns the API to working order ──
+    {
+        var vm: Vm = .init(testing.allocator, false);
+        defer vm.deinit();
+        const orig = vm.l_registry;
+        vm.l_registry = .Nil;
+        try testing.expectError(error.RuntimeError, vm.getGlobal("x"));
+        try testing.expectError(error.RuntimeError, vm.apiGetGlobal("x"));
+        vm.l_registry = .{ .Int = 42 };
+        try testing.expectError(error.RuntimeError, vm.getGlobal("x"));
+        vm.l_registry = orig;
+        const v = try vm.getGlobal("_G");
+        try testing.expect(v == .Table);
+    }
+
+    // ── (E) non-table registry[2]: getGlobal raises the standard index
+    // error with the PUC type name (auxgetstr on a non-table gt) ──
+    {
+        var vm: Vm = .init(testing.allocator, false);
+        defer vm.deinit();
+        const reg = vm.registryTable().?;
+        const orig = vm.rawGet(reg, .{ .Int = Vm.LUA_RIDX_GLOBALS });
+        try vm.rawSet(reg, .{ .Int = Vm.LUA_RIDX_GLOBALS }, .Nil);
+        try testing.expectError(error.RuntimeError, vm.getGlobal("x"));
+        try vm.rawSet(reg, .{ .Int = Vm.LUA_RIDX_GLOBALS }, .{ .Int = 42 });
+        try testing.expectError(error.RuntimeError, vm.getGlobal("x"));
+        try vm.rawSet(reg, .{ .Int = Vm.LUA_RIDX_GLOBALS }, orig);
+        const v = try vm.getGlobal("_G");
+        try testing.expect(v == .Table);
     }
 }
 
@@ -70308,7 +70425,7 @@ test "A1.1s4 proof a: entry-args sole-ref shape survives full GC (create + wrap)
     var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     // Source reads globals (`coroutine.*` — GETTABUP on the _ENV upvalue).
-    var env_cell = Cell{ .value = .{ .Table = vm.global_env } };
+    var env_cell = Cell{ .value = vm.registryGlobalsValue() };
     const upvals = [_]*Cell{&env_cell};
 
     // Path A — coroutine.create: the entry args (two tables) reach the
@@ -70448,7 +70565,7 @@ test "A1.1s4 proof b: poison oracle — emergency GC during suspension keeps ent
     vm.testcInstallAdapterOverBase(aalloc);
     vm.testcArmPoisonUnmap();
 
-    var env_cell = Cell{ .value = .{ .Table = vm.global_env } };
+    var env_cell = Cell{ .value = vm.registryGlobalsValue() };
     const upvals = [_]*Cell{&env_cell};
 
     const src = Source{
@@ -70810,7 +70927,7 @@ test "builtin yield closer: LIFO suspension, region completion, and re-close of 
     };
     _ = scope.protectValueAssumeCapacity(.{ .Table = obj });
     vm.infraAlloc().free(r1);
-    const g1 = vm.getGlobal("g");
+    const g1 = try vm.getGlobal("g");
     try testing.expect(g1 == .String and std.mem.eql(u8, g1.String.bytes(), ""));
 
     // Resume #2: the yield returns, the close region completes, y's Lua
@@ -70820,7 +70937,7 @@ test "builtin yield closer: LIFO suspension, region completion, and re-close of 
     try testing.expect(r2.len == 2);
     try testing.expect(r2[0] == .Bool and r2[0].Bool);
     try testing.expect(r2[1] == .String and std.mem.eql(u8, r2[1].String.bytes(), "body-done"));
-    const g2 = vm.getGlobal("g");
+    const g2 = try vm.getGlobal("g");
     try testing.expect(g2 == .String and std.mem.eql(u8, g2.String.bytes(), "y"));
 
     // Re-close proof: a second coroutine closing the SAME object must

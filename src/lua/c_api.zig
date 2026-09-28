@@ -951,7 +951,7 @@ pub export fn lua_load(
 
     const name = if (chunkname) |n| std.mem.span(n) else "=?";
     const mode_slice: ?[]const u8 = if (mode) |m| std.mem.span(m) else null;
-    const env: Value = .{ .Table = vm.global_env };
+    const env: Value = vm.registryGlobalsValue();
 
     const result = vm.loadChunk(.{ .owned = owned_bytes }, owned_bytes, name, mode_slice, env, null) catch |err| switch (err) {
         error.OutOfMemory => return statusCode(.memory_error),
@@ -1313,7 +1313,7 @@ pub export fn luaL_loadbufferx(L: ?*lua_State, buff: [*]const u8, sz: usize, nam
         else => return statusCode(.runtime_error),
     };
     const mode_slice: ?[]const u8 = if (mode) |m| std.mem.span(m) else null;
-    const env: Value = .{ .Table = vm.global_env };
+    const env: Value = vm.registryGlobalsValue();
 
     const result = vm.loadChunk(.{ .borrowed = buff[0..sz] }, buff[0..sz], std.mem.span(name), mode_slice, env, null) catch |err| switch (err) {
         error.OutOfMemory => return statusCode(.memory_error),
@@ -1396,7 +1396,7 @@ pub export fn luaL_loadfilex(L: ?*lua_State, filename: [*:0]const u8, mode: ?[*:
     // borrowed from source.name (loadChunk copies it for text, ignores it
     // for binary).
     const mode_slice: ?[]const u8 = if (mode) |m| std.mem.span(m) else null;
-    const env: Value = .{ .Table = vm.global_env };
+    const env: Value = vm.registryGlobalsValue();
 
     const input: vm_mod.Vm.LoadInput = if (prefixed_buf) |buf|
         .{ .owned = buf }
@@ -1501,16 +1501,34 @@ pub export fn lua_rotate(L: ?*lua_State, idx: c_int, n: c_int) void {
     s.rotate(idx, n) catch {}; // (c): in-stack rotate, InvalidIndex-only
 }
 
+/// Resolve a lua_copy source index: registry slot, upvalue pseudo-index,
+/// or a window slot. Returns null for an invalid index.
+fn copySourceValue(h: *lua_State, fromidx: c_int) ?Value {
+    const vm = h.vm;
+    if (fromidx == LUA_REGISTRYINDEX) return vm.l_registry;
+    if (upvalueAt(h, fromidx)) |v| return v;
+    const th = Vm.handleThread(h);
+    const slot = Vm.cWindowSlot(th, fromidx) orelse return null;
+    return th.stack[slot];
+}
+
 pub export fn lua_copy(L: ?*lua_State, fromidx: c_int, toidx: c_int) void {
     const h = L orelse return;
     const vm = h.vm;
     const th = Vm.handleThread(h);
+    // Registry slot as destination (PUC index2value(LUA_REGISTRYINDEX) =
+    // &G->l_registry): a plain setobj with NO barrier — PUC lapi.c:264-265:
+    // "LUA_REGISTRYINDEX does not need gc barrier (collector revisits it
+    // before finishing collection)". The atomic re-mark (gcAtomicCommon,
+    // PUC lgc.c:1553 parity) is what keeps a mid-cycle slot store alive.
+    if (toidx == LUA_REGISTRYINDEX) {
+        const src = copySourceValue(h, fromidx) orelse return;
+        vm.l_registry = src;
+        return;
+    }
     // Handle upvalue pseudo-index as destination (write to upvalue)
     if (toidx < -1001000 and toidx >= -1001255) {
-        const src = upvalueAt(h, fromidx) orelse blk: {
-            const slot = Vm.cWindowSlot(th, fromidx) orelse return;
-            break :blk th.stack[slot];
-        };
+        const src = copySourceValue(h, fromidx) orelse return;
         const upv_n: usize = @intCast(-1001000 - toidx);
         if (Vm.runningCClosureOnThread(th)) |cl| {
             if (upv_n >= 1 and upv_n <= cl.upvalues.len) {
@@ -1527,6 +1545,12 @@ pub export fn lua_copy(L: ?*lua_State, fromidx: c_int, toidx: c_int) void {
                 vm.gcCommitWriteBarrierCell(cell, src, plan);
             }
         }
+        return;
+    }
+    // Registry slot as source: read the slot value into the window.
+    if (fromidx == LUA_REGISTRYINDEX) {
+        const slot = Vm.cWindowSlot(th, toidx) orelse return;
+        th.stack[slot] = vm.l_registry;
         return;
     }
     // Handle upvalue pseudo-index as source (read from upvalue)
@@ -3901,7 +3925,7 @@ pub export fn luaopen_base(L: ?*lua_State) c_int {
     const vm = h.vm;
     // PUC lua_pushglobaltable → api_incr_top: OOM is LUA_ERRMEM
     // (P16.50-review-5 B2 — the old `catch return 0` pushed nothing).
-    vm.cWindowPush(Vm.handleThread(h), .{ .Table = vm.global_env }) catch |e| cThrowOn(vm, h, api.mapVmError(e));
+    vm.cWindowPush(Vm.handleThread(h), vm.registryGlobalsValue()) catch |e| cThrowOn(vm, h, api.mapVmError(e));
     return 1;
 }
 

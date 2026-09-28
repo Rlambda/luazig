@@ -426,7 +426,14 @@ pub const State = struct {
     }
 
     pub fn typeOf(self: *const State, idx: i32) ?Type {
-        const v = self.valueAt(idx) orelse return null;
+        // LUA_REGISTRYINDEX resolves to the registry SLOT value (PUC
+        // index2value → &G->l_registry): lua_type reflects whatever the
+        // slot currently holds — table, nil, number, anything.
+        const registry_idx: c_int = -1001000;
+        const v = if (idx == registry_idx)
+            self.vm.l_registry
+        else
+            self.valueAt(idx) orelse return null;
         return valueType(v);
     }
 
@@ -578,7 +585,7 @@ pub const State = struct {
     }
 
     pub fn getglobal(self: *State, name: []const u8) ApiError!Type {
-        const v = self.vm.apiGetGlobal(name);
+        const v = self.vm.apiGetGlobal(name) catch |e| return mapVmError(e);
         try self.push(v);
         return valueType(v);
     }
@@ -761,12 +768,13 @@ pub const State = struct {
 
     pub fn getfield(self: *State, idx: i32, key: []const u8) ApiError!Type {
         const registry_idx: c_int = -1001000;
-        const object: vm_mod.Value = if (idx == registry_idx) blk: {
-            const reg = self.vm.apiEnsureRegistry() catch |e| return mapVmError(e);
-            break :blk .{ .Table = reg };
-        } else blk: {
-            break :blk self.valueAt(idx) orelse return error.InvalidIndex;
-        };
+        // PUC index2value(LUA_REGISTRYINDEX) = &G->l_registry: the slot
+        // VALUE itself, whatever it holds — a non-table slot flows into
+        // luaV_finishget and raises the standard index error.
+        const object: vm_mod.Value = if (idx == registry_idx)
+            self.vm.l_registry
+        else
+            self.valueAt(idx) orelse return error.InvalidIndex;
         const out = self.vm.apiGetTable(object, .{ .String = try self.vm.internStr(key) }) catch |e| return mapVmError(e);
         try self.push(out);
         return valueType(out);
@@ -776,10 +784,9 @@ pub const State = struct {
         const th = self.curThread();
         if (self.count() == 0) return error.InvalidState;
         const registry_idx: c_int = -1001000;
-        const object: vm_mod.Value = if (idx == registry_idx) blk: {
-            const reg = self.vm.apiEnsureRegistry() catch |e| return mapVmError(e);
-            break :blk .{ .Table = reg };
-        } else blk: {
+        const object: vm_mod.Value = if (idx == registry_idx)
+            self.vm.l_registry
+        else blk: {
             const s = self.slot(idx) orelse return error.InvalidIndex;
             break :blk th.stack[s];
         };
@@ -835,7 +842,11 @@ pub const State = struct {
     }
 
     pub fn rawgeti(self: *State, idx: i32, n: i64) ApiError!Type {
-        const object = self.valueAt(idx) orelse return error.InvalidIndex;
+        const registry_idx: c_int = -1001000;
+        const object = if (idx == registry_idx)
+            self.vm.l_registry
+        else
+            self.valueAt(idx) orelse return error.InvalidIndex;
         const tbl = switch (object) {
             .Table => |t| t,
             else => return error.Type,
@@ -848,10 +859,15 @@ pub const State = struct {
     pub fn rawseti(self: *State, idx: i32, n: i64) ApiError!void {
         const th = self.curThread();
         if (self.count() == 0) return error.InvalidState;
-        const s = self.slot(idx) orelse return error.InvalidIndex;
-        const tbl = switch (th.stack[s]) {
-            .Table => |t| t,
-            else => return error.Type,
+        const registry_idx: c_int = -1001000;
+        const tbl = if (idx == registry_idx) blk: {
+            break :blk self.vm.registryTable() orelse return error.Type;
+        } else blk: {
+            const s = self.slot(idx) orelse return error.InvalidIndex;
+            break :blk switch (th.stack[s]) {
+                .Table => |t| t,
+                else => return error.Type,
+            };
         };
         const value = th.stack[th.top - 1];
         self.vm.apiRawSet(tbl, .{ .Int = n }, value) catch |e| return mapVmError(e);
@@ -1065,11 +1081,10 @@ pub const State = struct {
     }
 
     pub fn getregistry(self: *State) ApiError!void {
-        // Kind-preserving: an OOM creating the registry stays OOM
-        // (P16.50-review-5 B2 — the old `catch return error.Runtime`
-        // surfaced ERRRUN for an allocation failure).
-        const reg = self.vm.apiEnsureRegistry() catch |e| return mapVmError(e);
-        try self.push(.{ .Table = reg });
+        // PUC lua_pushvalue-ish: the registry slot VALUE (debug.getregistry
+        // pushes G->l_registry through index2value). The slot is eager
+        // since initRegistry — no creation edge, no OOM path.
+        try self.push(self.vm.l_registry);
     }
 
     pub fn getupvalue(self: *State, func_idx: i32, n: usize) ApiError!?[]const u8 {
@@ -1338,8 +1353,9 @@ pub const State = struct {
 
         const registry_idx: c_int = -1001000;
         const tbl = if (t == registry_idx) blk: {
-            const reg = self.vm.apiEnsureRegistry() catch return -2;
-            break :blk reg;
+            // The registry table from the slot; a non-table slot cannot
+            // hold refs (PUC would UB on hvalue — here a lenient -2).
+            break :blk self.vm.registryTable() orelse return -2;
         } else blk: {
             const s = self.slot(t) orelse return -2;
             break :blk switch (th.stack[s]) {
@@ -1360,7 +1376,7 @@ pub const State = struct {
     pub fn unref(self: *State, t: i32, ref_id: i32) void {
         const registry_idx: c_int = -1001000;
         const tbl = if (t == registry_idx) blk: {
-            break :blk self.vm.apiEnsureRegistry() catch return;
+            break :blk self.vm.registryTable() orelse return;
         } else blk: {
             const v = self.valueAt(t) orelse return;
             break :blk switch (v) {
@@ -1391,9 +1407,11 @@ pub const State = struct {
     /// (the old swallow pushed nothing at all, corrupting the stack shape;
     /// P16.50-review-5 B2).
     pub fn getRegisteredMetatable(self: *State, tname: []const u8) ApiError!void {
-        const reg = self.vm.apiEnsureRegistry() catch |e| return mapVmError(e);
+        // PUC luaL_getmetatable = lua_getfield(LUA_REGISTRYINDEX, tname):
+        // the FULL field path on the registry slot value — a non-table
+        // slot raises the standard index error, metamethods run.
         const key = try self.vm.internStr(tname);
-        const val = self.vm.apiRawGet(reg, .{ .String = key });
+        const val = self.vm.apiGetTable(self.vm.l_registry, .{ .String = key }) catch |e| return mapVmError(e);
         try self.push(val);
     }
 
@@ -1407,7 +1425,7 @@ pub const State = struct {
     pub fn testudata(self: *State, ud: i32, tname: []const u8) ?*anyopaque {
         const v = self.valueAt(ud) orelse return null;
         if (v != .Userdata) return null;
-        const reg = self.vm.apiEnsureRegistry() catch return null;
+        const reg = self.vm.registryTable() orelse return null;
         const key = self.vm.internStr(tname) catch return null;
         const expected = self.vm.apiRawGet(reg, .{ .String = key });
         if (expected != .Table) return null;
@@ -1532,7 +1550,7 @@ pub const State = struct {
     }
 
     fn callGlobal(self: *State, name: []const u8, args: []const vm_mod.Value) ![]vm_mod.Value {
-        const callee = self.vm.apiGetGlobal(name);
+        const callee = try self.vm.apiGetGlobal(name);
         return self.vm.apiCall(.nonyieldable, callee, args);
     }
 

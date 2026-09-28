@@ -7435,7 +7435,7 @@ test "codegen+vm: inner global declaration shadows outer local" {
 
     var v = vm.Vm.init(testing.allocator, false);
     defer v.deinit();
-    var env_cell = vm.Cell{ .value = .{ .Table = v.global_env } };
+    var env_cell = vm.Cell{ .value = v.registryGlobalsValue() };
     var upvalues = [_]*vm.Cell{&env_cell};
 
     const results = try v.runBytecode(proto, upvalues[0..], &.{}, null);
@@ -7468,7 +7468,7 @@ test "codegen+vm: global declaration expands final call" {
 
     var v = vm.Vm.init(testing.allocator, false);
     defer v.deinit();
-    var env_cell = vm.Cell{ .value = .{ .Table = v.global_env } };
+    var env_cell = vm.Cell{ .value = v.registryGlobalsValue() };
     var upvalues = [_]*vm.Cell{&env_cell};
 
     const results = try v.runBytecode(proto, upvalues[0..], &.{}, null);
@@ -7506,7 +7506,7 @@ test "codegen+vm: direct bytecode yield parks thread-owned continuation" {
 
     var v = vm.Vm.init(testing.allocator, false);
     defer v.deinit();
-    var env_cell = vm.Cell{ .value = .{ .Table = v.global_env } };
+    var env_cell = vm.Cell{ .value = v.registryGlobalsValue() };
     var upvalues = [_]*vm.Cell{&env_cell};
 
     const results = try v.runBytecode(proto, upvalues[0..], &.{}, null);
@@ -7570,7 +7570,7 @@ test "codegen+vm: yielding generic iterator stays on explicit frame stack" {
 
     var v = vm.Vm.init(testing.allocator, false);
     defer v.deinit();
-    var env_cell = vm.Cell{ .value = .{ .Table = v.global_env } };
+    var env_cell = vm.Cell{ .value = v.registryGlobalsValue() };
     var upvalues = [_]*vm.Cell{&env_cell};
 
     const results = try v.runBytecode(proto, upvalues[0..], &.{}, null);

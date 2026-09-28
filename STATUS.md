@@ -476,6 +476,27 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   исключение R1 из research не утверждено. До implementation нужно
   согласовать единый writable registry owner и ABI-константу PUC 5.5;
   `report.md` как завершённый handoff не переписывать.
+  A1.next-cidx2 research (/tmp/opencode/cidx2_report.md): дизайн замкнут.
+  Рекомендована Model A — единый Vm.l_registry: Value (eager в init;
+  RIDX [1]/[2]/[3] население по PUC init_registry — сейчас отсутствует,
+  ломает lua_pushglobaltable-класс); .registry_slot: *Value writable
+  plain-store + ОБЯЗАТЕЛЬНАЯ перемарка в gcAtomicCommon (паритет
+  lgc.c:1553; без неё UAF-класс при writable-слоте); index2target
+  infallible. Решающее открытие (none_target-оракул): PUC get/set-класс
+  на .none-целях (missing upvalue, empty-positive) РЕЙЗИТ ERRRUN (не
+  lenient nil/no-op); raw-класс — release-UB. registry_write-оракул:
+  PUC lua_copy(x, REGISTRY) пишет table/nil/number с отражением
+  lua_type/GC-выживанием, getfield после не-таблицы рейзит; luazig —
+  полный no-op (negative-before). ABI: чистый switch LUA_REGISTRYINDEX
+  → PUC 5.5 -(INT_MAX/2+1000) без dual-accept (repo-клиенты
+  пересобираются; -1001000 остаётся легитимным стек-индексом при
+  1M-стеке); ловушка: закоммиченные ELF tests/c_api молча мисрезолвят —
+  пересборка в cut'е обязательна; LUAI_MAXSTACK удалить; 255-окно
+  upvalueAt → runtime nupvalues. Разбиение cut'ов: α(registry-owner)
+  → β(C1+константа) → γ(C2+raise-on-.none) → δ(C3 write-пути, требует
+  α); α+δ и γ-без-β не объединяемы. Новые подтверждённые: HIGH
+  raise-on-.none; HIGH RIDX-население; HIGH-условно atomic-перемарка
+  (при writable).
 
 - [x] **Architecture A1 research (COMPLETED): единая GC lifetime/rooting/constructor
   модель**. Локальная `P16.50-review-16 correction`, ошибочно открытая ревьюером

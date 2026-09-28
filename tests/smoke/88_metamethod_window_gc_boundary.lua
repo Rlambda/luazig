@@ -18,6 +18,17 @@
 -- correct-top (PUC ldebug.c:955-957: before count/line hooks, a non-IT
 -- upcoming instruction gets top plain-set to ci->top; an IT upcoming
 -- consumer keeps its live multret bound GC-visible through the hook).
+-- Section [14] covers the full luaG_traceexec dispatch order (PUC
+-- ldebug.c:947-967): the count budget is consumed and the count hook
+-- dispatched BEFORE the line hook; a completed count hook's return
+-- clobbers L->oldpc to the current instruction (rethook, ldo.c:511-512),
+-- so the line hook fires for the SAME instruction right after it; each
+-- executed instruction consumes the budget exactly once across the
+-- hook-completion re-entry passes; a count-only mask without a hit
+-- returns before the correct-top (ldebug.c:950-951); a stripped proto's
+-- count hit publishes top through the same lineinfo-independent owner
+-- (ldebug.c:956-957); a hook yield suppresses every hook on the replayed
+-- opcode (CIST_HOOKYIELD, ldebug.c:952-955).
 -- Differential: C Lua 5.5.0 vs luazig --engine=zig (pure Lua, no testc).
 
 local weak = setmetatable({}, {__mode = "v"})
@@ -298,4 +309,93 @@ do
   local n, same = caller()
   debug.sethook()
   print("hook-it-live", died, n, same)
+end
+
+-- [14] combined COUNT+LINE dispatch order (PUC luaG_traceexec,
+-- ldebug.c:947-967): the count budget is consumed and the count hook
+-- dispatched BEFORE the line hook; per traced instruction the event order
+-- is count then line, and hook-completion re-entries produce no duplicate
+-- line event. count=3 interleaves hits with line events (budget
+-- accounting); a count-only budget>1 hit publishes top exactly at the hit
+-- (ldebug.c:950-951 returns before the correct-top while the budget
+-- lasts); a stripped proto's count hit publishes top through the same
+-- lineinfo-independent owner (ldebug.c:956-957); a count-hook yield must
+-- not re-fire any hook on the replayed opcode (CIST_HOOKYIELD).
+do
+  local out = {}
+  debug.sethook(function(ev) out[#out + 1] = ev end, "l", 1)
+  local x = 1
+  local y = 2
+  debug.sethook()
+  print("hook-order", table.concat(out, ","), x, y)
+
+  local out3 = {}
+  debug.sethook(function(ev) out3[#out3 + 1] = ev end, "l", 3)
+  local a = 1
+  local b = 2
+  local c = 3
+  debug.sethook()
+  print("hook-order-3", table.concat(out3, ","))
+
+  local armed2, seen2
+  local function many2()
+    local o = {}
+    weak[1] = o
+    return 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,o
+  end
+  local function caller2()
+    local t = {many2()}
+    t = nil
+    armed2 = true
+    local x = 1
+    local y = 2
+    return x + y
+  end
+  debug.sethook(function()
+    if armed2 and seen2 == nil then
+      collectgarbage(); collectgarbage()
+      seen2 = weak[1] == nil
+    end
+  end, "", 2)
+  caller2()
+  debug.sethook()
+  print("hook-budget2", seen2, weak[1] == nil)
+
+  armed3 = false
+  local seen3
+  local function h0(w)
+    local function many3()
+      local o = {}
+      w[1] = o
+      return 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,o
+    end
+    local t = {many3()}
+    t = nil
+    armed3 = true
+    return 1
+  end
+  local h = assert(load(string.dump(h0, true)))
+  debug.sethook(function()
+    if armed3 and seen3 == nil then
+      collectgarbage(); collectgarbage()
+      seen3 = weak[1] == nil
+    end
+  end, "", 1)
+  h(weak)
+  debug.sethook()
+  print("hook-stripped-top", seen3, weak[1] == nil)
+
+  local co = coroutine.create(function()
+    local outy = {}
+    debug.sethook(function(ev)
+      outy[#outy + 1] = ev
+      if #outy == 1 then coroutine.yield("y") end
+    end, "l", 1)
+    local x = 1
+    debug.sethook()
+    return table.concat(outy, ",")
+  end)
+  local ok1, yv = coroutine.resume(co)
+  local ok2, r = coroutine.resume(co)
+  print("hook-yield-order", ok1, yv, ok2, r)
 end

@@ -326,7 +326,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   workload'ы в шуме. Старый geomean 0.996 к финалу не относится и
   не используется как acceptance evidence. Open-count 26→25.
 
-- [x] **Parity BLOCKER, ORDINARY-BACKLOG: count/line hook не исправляет
+- [x] **Parity BLOCKER, FIX-NOW: count/line hook не исправляет
   `Thread.top` перед non-IT инструкцией** (review `c1341a4`). PUC
   `luaG_traceexec` (`ldebug.c:955-957`) перед hook делает plain SET
   `L->top = ci->top`, если предстоящая инструкция не `luaP_isIT`
@@ -363,6 +363,56 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   идентичны (1,200,033 hook / 400,010 no-hook) — регрессии нет.
   Гейты: 358/358 D+RF 0 leaks; matrix zig_fail=0; smoke 87/87; c_api
   24-29 PASS оба режима; api580 GREEN; fmt/diff-check clean.
+  REVIEW `97082a6` — закрытие отложено. `Instruction.isIT()` и
+  count-only correct-top доказаны smoke-88 [12]/[13] (RED на
+  c1341a4, GREEN после), но при LINE-маске новая публикация находится
+  внутри `has_line_info`: stripped-чанк с `lineinfo.len==0` не получает
+  её на большинстве инструкций, хотя PUC `luaG_traceexec` делает SET
+  независимо от lineinfo. Независимая форма
+  `/tmp/opencode/review_hktop_stripped.lua`: PUC `6 5`, luazig
+  c1341a4/97082a6 `6 2` (line-event модель также pre-existing,
+  поэтому отдельно изолировать top/GC). При одновременной COUNT+LINE
+  маске luazig вызывает line раньше count; PUC — count раньше line:
+  `/tmp/opencode/review_hktop_order.lua`, PUC начинается
+  `count,line,count,line`, luazig `line,count,line,line` (оба
+  состояния на c1341a4 и 97082a6). Это нарушает заявленный
+  PUC-порядок hook-пути; correction должна иметь один traceexec-owner
+  correct-top до count→line событий с корректным replay/yield.
+  Open-count 25→26.
+  CLOSED (traceexec correction): единый PUC-order traceexec-owner в
+  hook-gate runBytecodeDispatch: count-lane первой (retain/retire
+  resume_skip_count_pc), count-only early-return ДО correct-top (PUC
+  ранний выход), hoisted replay-skip (CIST_HOOKYIELD-позиция),
+  ЕДИНЫЙ correct-top `base+maxstacksize` при non-IT ВНЕ зависимости от
+  lineinfo (stripped-чанки покрыты), COUNT dispatch раньше LINE;
+  completion count-hook ставит last_line_pc=pc (реплика PUC rethook
+  oldpc-clobber), line-hook completion ставит count-маркер против
+  двойного декремента; мёртвый skip_count_once удалён; попутно починена
+  регрессия coroutine.lua:685 (протухший pending-флаг душил count-hit).
+  Evidence: combined COUNT+LINE порядок byte-exact PUC
+  (review_hktop_order: count,line,... — negative-before на immutable
+  97082a6 был line,count,...); smoke-88 [12]/[13] GREEN + мутации ×2
+  RED; НОВАЯ [14] (5 форм: combined/line-only stripped+normal/count-only
+  budget>1 early-return/self-loop); stripped top-coverage через единый
+  SET (line-event модель — отдельный residual: `6 3` vs PUC `6 5`,
+  было `6 2`). Perf redo (native cpu_core/instructions, immutable
+  97082a6↔final, RF, paired): no-hook +0.00% instr/−1.05% cycles;
+  hook +0.24% instr/−4.46% cycles; --stats instructions_total
+  400010=400010 — только контроль Lua-работы. Гейты: 358/358 D+RF;
+  matrix zig_fail=0; smoke 88/88 byte-exact; c_api 24-29 PASS; api580
+  GREEN; fmt/diff-check clean.
+
+- [ ] **Evidence BLOCKER, FIX-NOW: hook perf A/B измерил Lua-opcode,
+  а не CPU instructions** (review `97082a6`). Числа 1,200,033 и
+  400,010 взяты из `--stats` (`instructions_total` — число исполненных
+  Lua-инструкций); они закономерно одинаковы до/после публикации top
+  и не доказывают отсутствие цены на native hook path. Сырые файлы
+  `/tmp/opencode/hktop_perf_*.json` подтверждают класс счётчика;
+  независимый `perf stat -e cpu_core/instructions/u` на immutable
+  бинарях показывает порядка 1.02 млрд CPU-инструкций для hook-формы,
+  а не 1.2 млн. Нужен paired CPU-instructions A/B с immutable hashes
+  и no-hook контролем; скорость не gate, вывод об отсутствии регрессии
+  пока недостоверен. Open-count 26→27.
 
 - [ ] **C API: `lua_pushvalue(lua_upvalueindex(n))` возвращает не upvalue
   (BLOCKER, ORDINARY-BACKLOG)**. Независимый C-оракул

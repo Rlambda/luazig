@@ -2869,7 +2869,6 @@ const DebugHookState = struct {
     has_line: bool = false,
     skip_line_once: bool = false,
     skip_line_until_depth: usize = 0,
-    skip_count_once: bool = false,
     skip_bc_line_once: bool = false,
     /// PUC C hooks may yield; ordinary Lua hooks may not. testC installs its
     /// emulated C hook through a private marker after debug.sethook.
@@ -2918,7 +2917,6 @@ const DebugHookState = struct {
         self.has_line = false;
         self.skip_line_once = false;
         self.skip_line_until_depth = 0;
-        self.skip_count_once = false;
         self.skip_bc_line_once = false;
         self.allow_yield = false;
         self.in_debug_hook = false;
@@ -14433,8 +14431,33 @@ pub const Vm = struct {
 
         switch (cont.post) {
             .resume_instruction => |state| {
-                if (state.skip_count) runtime.u.lua.resume_skip_count_pc = @intCast(exec_frames.getPtr(parent_index).u.lua.pc);
-                if (state.skip_line) self.activeHookState().skip_bc_line_once = true;
+                if (state.skip_count) {
+                    runtime.u.lua.resume_skip_count_pc = @intCast(exec_frames.getPtr(parent_index).u.lua.pc);
+                    // PUC ldebug.c:958-967: a count hook that ran to
+                    // completion (no yield) returns into luaG_traceexec,
+                    // which then runs the line decision. The hook closure's
+                    // own return ran rethook (ldo.c:511-512), setting
+                    // L->oldpc = pcRel(ci->savedpc) — the CURRENT traced
+                    // instruction — so `npci <= oldpc` holds and the line
+                    // hook fires for the SAME instruction, right after the
+                    // count hook. Replicate the clobber via last_line_pc so
+                    // the re-entry pass's line decision fires; the count
+                    // re-fire is separately suppressed by the marker above.
+                    runtime.u.lua.last_line_pc = @intCast(exec_frames.getPtr(parent_index).u.lua.pc);
+                }
+                if (state.skip_line) {
+                    self.activeHookState().skip_bc_line_once = true;
+                    // PUC runs ONE luaG_traceexec pass per executed
+                    // instruction: the count budget was already consumed
+                    // for this pc on the pass that dispatched the line hook
+                    // (ldebug.c:947 decrements before everything else). The
+                    // re-entry pass must not decrement again — arm the same
+                    // count-replay marker the count lane retires at the gate
+                    // end. (A hook that YIELDED is different: PUC's replayed
+                    // pass decrements before the CIST_HOOKYIELD check, so the
+                    // yield path leaves the budget alone.)
+                    runtime.u.lua.resume_skip_count_pc = @intCast(exec_frames.getPtr(parent_index).u.lua.pc);
+                }
                 return null;
             },
             .retry_call => {
@@ -18466,10 +18489,16 @@ pub const Vm = struct {
         const th = self.current_thread orelse return;
         th.bytecode_inplace_suspended = true;
         yielded_in_place.* = true;
+        // PUC ldebug.c:971-975: a hook yield marks CIST_HOOKYIELD on the
+        // frame — ONE mark that suppresses BOTH hooks on the replayed
+        // opcode. skip_bc_line_once is the line lane's half of that skip.
+        self.activeHookState().skip_bc_line_once = true;
         if (skip_count) {
+            // The count lane's half: the marker suppresses the count budget
+            // decrement + dispatch for the replayed opcode (net PUC-equal —
+            // the budget was already reset when the hook fired; PUC's
+            // hookcount=1 undo lands on the same state).
             exec_frames.getPtr(frame_index).u.lua.resume_skip_count_pc = @intCast(pc);
-        } else {
-            self.activeHookState().skip_bc_line_once = true;
         }
     }
 
@@ -19162,204 +19191,270 @@ pub const Vm = struct {
                         // The occupied bound is th.top itself
                         // — no separate sync needed for it.
                         fr.u.lua.pc = ctx.pc;
-                        // P15.51n: current_line derived from proto.lineinfo[pc].
                         const hook_state = self.activeHookState();
                         const th = self.activeBytecodeThread();
-                        if (hook_state.has_line and !self.isInDebugHook() and self.debug_hooks_suppressed == 0) {
-                            const has_line_info = fr.u.lua.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[fr.u.lua.pc] != 0;
-                            if (has_line_info) {
-                                const current_line: i64 = @intCast(ctx.cur_proto.lineinfo[fr.u.lua.pc]);
+                        // PUC luaG_traceexec (ldebug.c:941-944): without a
+                        // line/count mask nothing runs here (trap off);
+                        // call/return hooks fire at their own activation sites.
+                        // in_debug_hook (PUC allowhook=0 while a hook runs) and
+                        // suppression gate both lanes, like PUC's luaD_hook
+                        // entry checks.
+                        const hook_armed = !self.isInDebugHook() and self.debug_hooks_suppressed == 0;
+                        const line_armed = hook_state.has_line and hook_armed;
+                        const count_armed = hook_state.count > 0 and hook_armed;
 
-                                // A direct coroutine yield resumes by replaying the
-                                // suspended CALL/TAILCALL opcode. That replay is a VM
-                                // continuation, not a new source-line transition.
-                                var skip_replayed_hook = fr.isHookYield() and fr.u.lua.pc == @as(usize, fr.u.lua.resume_pc);
-                                {
-                                    const skip_pc = exec_frames.getPtr(ctx.frame_index).u.lua.skip_line_hook_pc;
-                                    if (skip_pc != INVALID_PC) {
-                                        if (skip_pc == @as(u32, @intCast(fr.u.lua.pc))) skip_replayed_hook = true;
-                                        exec_frames.getPtr(ctx.frame_index).u.lua.skip_line_hook_pc = INVALID_PC;
-                                    }
-                                }
-                                if (!skip_replayed_hook and hook_state.skip_bc_line_once) {
-                                    skip_replayed_hook = true;
-                                    hook_state.skip_bc_line_once = false;
-                                }
-
-                                // PUC luaG_traceexec (ldebug.c:955-957): before
-                                // the count/line hooks, correct top to the
-                                // register file end — `if (!luaP_isIT(next))
-                                // L->top.p = ci->top.p`. The upcoming
-                                // instruction (ctx.pc, already published to
-                                // fr.u.lua.pc) is the consumer of any multret
-                                // the previous OT instruction left above the
-                                // file: an IT consumer (CALL/TAILCALL/RETURN
-                                // with B==0, SETLIST with count 0, VARARGPREP)
-                                // derives its bound from top, so its live
-                                // multret must stay GC-visible through the
-                                // hook; anything else means the region is
-                                // dead (e.g. the stale multret end a B==0
-                                // SETLIST leaves behind), and this plain SET
-                                // — it may LOWER top — makes it GC-invisible
-                                // for the hook's collections. Skipped on a
-                                // hook-yield replay like every other
-                                // traceexec action (PUC's CIST_HOOKYIELD check
-                                // precedes the correct-top).
-                                if (!skip_replayed_hook and !inst.isIT()) {
-                                    th.top = ctx.base + ctx.cur_proto.maxstacksize;
-                                }
-
-                                // PUC starts tracing a vararg function after OP_VARARGPREP:
-                                // the first source-visible line is the instruction that
-                                // follows it. Record OP_VARARGPREP as oldpc, but do not
-                                // dispatch a line event for it.
-                                const suppress_varargprep = fr.u.lua.pc == 0 and op == .varargprep;
-                                const previous_pc = exec_frames.getPtr(ctx.frame_index).u.lua.last_line_pc;
-                                var should_dispatch = false;
-                                if (!skip_replayed_hook and !suppress_varargprep) {
-                                    if (previous_pc != INVALID_PC) {
-                                        const old_pc: usize = previous_pc;
-                                        const old_line: i64 = if (old_pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[old_pc] != 0)
-                                            @intCast(ctx.cur_proto.lineinfo[old_pc])
-                                        else
-                                            current_line;
-                                        should_dispatch = fr.u.lua.pc <= old_pc or old_line != current_line;
-                                    } else {
-                                        should_dispatch = true;
-                                    }
-                                }
-
-                                // Track every opcode, not only opcodes that emitted a
-                                // hook. This is luaG_traceexec's oldpc invariant, kept
-                                // per activation so returning from a child on the same
-                                // source line does not create a synthetic event merely
-                                // because our bytecode density differs from PUC's.
-                                if (!suppress_varargprep) {
-                                    exec_frames.getPtr(ctx.frame_index).u.lua.last_line_pc = @intCast(fr.u.lua.pc);
-                                }
-
-                                if (should_dispatch) {
-                                    th.last_hook_line = current_line;
-                                    if (try self.tryPushBytecodeDebugHook(
-                                        exec_frames,
-                                        ctx.frame_index,
-                                        "line",
-                                        current_line,
-                                        null,
-                                        null,
-                                        1,
-                                        .{ .resume_instruction = .{ .skip_line = true } },
-                                    )) {
-                                        continue :frame_loop;
-                                    }
-                                    self.dispatchBytecodeHook("line", current_line, null) catch |hook_err| {
-                                        if (hook_err == error.Yield) {
-                                            self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.u.lua.pc, false, yielded_in_place);
-                                        }
-                                        return hook_err;
-                                    };
-                                    // The hook can execute Lua and grow both the shared
-                                    // value stack and runtime-frame array.
-                                    ctx.regs = ctx.th.stack[ctx.base .. ctx.base + ctx.cap];
-                                    fr = exec_frames.getPtr(ctx.frame_index);
-                                    ctx.pc = fr.u.lua.pc;
-                                }
-                            } else if (ctx.cur_proto.lineinfo.len == 0 and th.last_hook_line != -2) {
-                                // Stripped chunks still produce one line event at the
-                                // first instruction, with no line number.
-                                const skip_replayed_hook = hook_state.skip_bc_line_once;
-                                if (skip_replayed_hook) hook_state.skip_bc_line_once = false;
-                                th.last_hook_line = -2;
-                                if (!skip_replayed_hook) {
-                                    if (try self.tryPushBytecodeDebugHook(
-                                        exec_frames,
-                                        ctx.frame_index,
-                                        "line",
-                                        null,
-                                        null,
-                                        null,
-                                        1,
-                                        .{ .resume_instruction = .{ .skip_line = true } },
-                                    )) {
-                                        continue :frame_loop;
-                                    }
-                                    self.dispatchBytecodeHook("line", null, null) catch |hook_err| {
-                                        if (hook_err == error.Yield) {
-                                            self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.u.lua.pc, false, yielded_in_place);
-                                        }
-                                        return hook_err;
-                                    };
-                                    ctx.regs = ctx.th.stack[ctx.base .. ctx.base + ctx.cap];
-                                    fr = exec_frames.getPtr(ctx.frame_index);
-                                    ctx.pc = fr.u.lua.pc;
-                                }
-                            }
-                        }
-
-                        if (hook_state.count > 0 and !self.isInDebugHook() and self.debug_hooks_suppressed == 0) {
-                            // PUC luaG_traceexec (ldebug.c:...): every executed
-                            // instruction decrements the count-hook budget. With
-                            // PUC-parity codegen there are no extra bookkeeping
-                            // MOVE/LOADNIL/CLOSE instructions to mask out.
+                        // PUC luaG_traceexec (ldebug.c:947-949): the count
+                        // budget is consumed FIRST, before any line
+                        // bookkeeping or top publication. Every executed
+                        // instruction decrements the budget (PUC-parity
+                        // codegen has no extra bookkeeping instructions to
+                        // mask out). resume_skip_count_pc marks an opcode
+                        // whose count hook already ran at this pc — a
+                        // hook-completion re-entry pass or a yield-resume
+                        // replay. An async hook splits one opcode execution
+                        // into several gate passes; the marker must survive
+                        // every re-entry pass at the same pc (each lane fires
+                        // at most once per EXECUTION) and is retired below
+                        // when a pass actually executes the opcode, so a
+                        // loop back-edge to the same pc consumes the budget
+                        // and fires again like PUC's per-execution decrement.
+                        var counthook = false;
+                        if (count_armed) {
                             var count_this_inst = true;
                             if (fr.u.lua.resume_skip_count_pc != INVALID_PC) {
                                 const skip_pc = fr.u.lua.resume_skip_count_pc;
                                 if (skip_pc == @as(u32, @intCast(fr.u.lua.pc))) {
-                                    // A count hook yielded before this opcode ran. On
-                                    // resume, execute that opcode without immediately
-                                    // firing the same hook again.
+                                    // PUC ldebug.c:971-975: a count hook that
+                                    // yielded re-arms hookcount to 1 and marks
+                                    // CIST_HOOKYIELD; the replayed opcode
+                                    // decrements to the hit, resets the
+                                    // budget, and the CIST_HOOKYIELD return
+                                    // skips the dispatch — net: budget
+                                    // re-armed, no hook. resume_skip_count_pc
+                                    // is our equivalent: the budget was
+                                    // already reset when the hook fired, so
+                                    // skipping the decrement lands on the
+                                    // same state.
                                     count_this_inst = false;
-                                    fr.u.lua.resume_skip_count_pc = INVALID_PC;
                                 } else {
                                     fr.u.lua.resume_skip_count_pc = INVALID_PC;
                                 }
-                            } else if (hook_state.skip_count_once) {
-                                hook_state.skip_count_once = false;
-                                count_this_inst = false;
                             }
-
                             if (count_this_inst) {
                                 hook_state.budget -= 1;
                                 if (hook_state.budget <= 0) {
                                     hook_state.budget = hook_state.count;
-                                    // PUC luaG_traceexec: the count hook fires
-                                    // here, so the correct-top (see the line
-                                    // lane above for the full invariant) runs
-                                    // at the same point — with count-only
-                                    // hooks this is the ONLY publication
-                                    // (PUC returns early, before the
-                                    // correct-top, while the budget lasts).
-                                    // With a line hook also active the line
-                                    // lane already published this instruction;
-                                    // the re-SET is idempotent (both hook
-                                    // paths restore top exactly).
-                                    if (!inst.isIT()) {
-                                        th.top = ctx.base + ctx.cur_proto.maxstacksize;
-                                    }
-                                    if (try self.tryPushBytecodeDebugHook(
-                                        exec_frames,
-                                        ctx.frame_index,
-                                        "count",
-                                        null,
-                                        null,
-                                        null,
-                                        1,
-                                        .{ .resume_instruction = .{ .skip_count = true } },
-                                    )) {
-                                        continue :frame_loop;
-                                    }
-                                    self.dispatchBytecodeHook("count", null, null) catch |hook_err| {
-                                        if (hook_err == error.Yield) {
-                                            self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.u.lua.pc, true, yielded_in_place);
-                                        }
-                                        return hook_err;
-                                    };
-                                    // A hook can recursively run Lua and reallocate
-                                    // both arrays used by the explicit dispatch loop.
-                                    ctx.regs = ctx.th.stack[ctx.base .. ctx.base + ctx.cap];
-                                    fr = exec_frames.getPtr(ctx.frame_index);
-                                    ctx.pc = fr.u.lua.pc;
+                                    counthook = true;
                                 }
+                            }
+                        }
+
+                        // PUC ldebug.c:950-951: a count-only mask without a
+                        // hit returns BEFORE the correct-top — top is not
+                        // published while the budget lasts.
+                        // PUC ldebug.c:950-955: the count-only early return
+                        // fires only when the budget didn't hit; a
+                        // hook-yield replay ALWAYS reaches the CIST_HOOKYIELD
+                        // check (a count-hook yield re-arms hookcount to 1,
+                        // ldebug.c:973, so the replayed pass decrements to a
+                        // hit and passes the early return). A pending
+                        // skip_bc_line_once therefore enters this block even
+                        // with a count-only mask and no hit, so the flag is
+                        // consumed on the very next pass of this thread
+                        // instead of leaking onto a later, legitimate count
+                        // hit and suppressing it.
+                        if (counthook or line_armed or hook_state.skip_bc_line_once) {
+                            // PUC ldebug.c:952-955 (CIST_HOOKYIELD): an
+                            // opcode replayed after a hook yield is a VM
+                            // continuation — no top publication, no duplicate
+                            // hook. skip_bc_line_once is the marker (set by
+                            // parkBytecodeIrHookYield and the hook
+                            // continuation's resume_instruction post); like
+                            // PUC's flag it is consumed by the next pass that
+                            // gets past the early return above, whether or
+                            // not anything dispatches.
+                            var skip_replayed_hook = false;
+                            if (hook_state.skip_bc_line_once) {
+                                hook_state.skip_bc_line_once = false;
+                                skip_replayed_hook = true;
+                            }
+
+                            // PUC luaG_traceexec (ldebug.c:956-957): before
+                            // the count/line hooks, correct top to the
+                            // register file end — `if (!luaP_isIT(next))
+                            // L->top.p = ci->top.p`. The upcoming instruction
+                            // (ctx.pc, already published to fr.u.lua.pc) is
+                            // the consumer of any multret the previous OT
+                            // instruction left above the file: an IT consumer
+                            // (CALL/TAILCALL/RETURN with B==0, SETLIST with
+                            // count 0, VARARGPREP) derives its bound from
+                            // top, so its live multret must stay GC-visible
+                            // through the hook; anything else means the
+                            // region is dead (e.g. the stale multret end a
+                            // B==0 SETLIST leaves behind), and this plain SET
+                            // — it may LOWER top — makes it GC-invisible for
+                            // the hook's collections. PUC has no lineinfo
+                            // condition here: the SET runs for stripped
+                            // protos too, whenever the line mask is active or
+                            // the count hook hit. Skipped on a hook-yield
+                            // replay like every other traceexec action (PUC's
+                            // CIST_HOOKYIELD check precedes the correct-top).
+                            if (!skip_replayed_hook and !inst.isIT()) {
+                                th.top = ctx.base + ctx.cur_proto.maxstacksize;
+                            }
+
+                            // PUC ldebug.c:958-959: the count hook fires
+                            // BEFORE the line hook. A line-yield replay still
+                            // decremented the budget above (PUC decrements
+                            // before the CIST_HOOKYIELD check), so counthook
+                            // can be set here — the dispatch is what
+                            // CIST_HOOKYIELD suppresses.
+                            if (counthook and !skip_replayed_hook) {
+                                if (try self.tryPushBytecodeDebugHook(
+                                    exec_frames,
+                                    ctx.frame_index,
+                                    "count",
+                                    null,
+                                    null,
+                                    null,
+                                    1,
+                                    .{ .resume_instruction = .{ .skip_count = true } },
+                                )) {
+                                    continue :frame_loop;
+                                }
+                                self.dispatchBytecodeHook("count", null, null) catch |hook_err| {
+                                    if (hook_err == error.Yield) {
+                                        self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.u.lua.pc, true, yielded_in_place);
+                                    }
+                                    return hook_err;
+                                };
+                                // A hook can recursively run Lua and reallocate
+                                // both arrays used by the explicit dispatch loop.
+                                ctx.regs = ctx.th.stack[ctx.base .. ctx.base + ctx.cap];
+                                fr = exec_frames.getPtr(ctx.frame_index);
+                                ctx.pc = fr.u.lua.pc;
+                            }
+
+                            if (line_armed) {
+                                const has_line_info = fr.u.lua.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[fr.u.lua.pc] != 0;
+                                if (has_line_info) {
+                                    const current_line: i64 = @intCast(ctx.cur_proto.lineinfo[fr.u.lua.pc]);
+
+                                    // A direct coroutine yield resumes by replaying
+                                    // the suspended CALL/TAILCALL opcode, and a
+                                    // call-hook retry replays OP_CALL. Those
+                                    // replays are VM continuations, not new
+                                    // source-line transitions. (The count lane
+                                    // needs no matching guard: both replays are
+                                    // IT opcodes, and the correct-top above
+                                    // already skips IT.)
+                                    var skip_line_event = fr.isHookYield() and fr.u.lua.pc == @as(usize, fr.u.lua.resume_pc);
+                                    {
+                                        const skip_pc = exec_frames.getPtr(ctx.frame_index).u.lua.skip_line_hook_pc;
+                                        if (skip_pc != INVALID_PC) {
+                                            if (skip_pc == @as(u32, @intCast(fr.u.lua.pc))) skip_line_event = true;
+                                            exec_frames.getPtr(ctx.frame_index).u.lua.skip_line_hook_pc = INVALID_PC;
+                                        }
+                                    }
+                                    // A hook-yield replay is suppressed by
+                                    // skip_replayed_hook, consumed above at the
+                                    // CIST_HOOKYIELD position.
+
+                                    // PUC starts tracing a vararg function after OP_VARARGPREP:
+                                    // the first source-visible line is the instruction that
+                                    // follows it. Record OP_VARARGPREP as oldpc, but do not
+                                    // dispatch a line event for it.
+                                    const suppress_varargprep = fr.u.lua.pc == 0 and op == .varargprep;
+                                    const previous_pc = exec_frames.getPtr(ctx.frame_index).u.lua.last_line_pc;
+                                    var should_dispatch = false;
+                                    if (!skip_line_event and !skip_replayed_hook and !suppress_varargprep) {
+                                        if (previous_pc != INVALID_PC) {
+                                            const old_pc: usize = previous_pc;
+                                            const old_line: i64 = if (old_pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[old_pc] != 0)
+                                                @intCast(ctx.cur_proto.lineinfo[old_pc])
+                                            else
+                                                current_line;
+                                            should_dispatch = fr.u.lua.pc <= old_pc or old_line != current_line;
+                                        } else {
+                                            should_dispatch = true;
+                                        }
+                                    }
+
+                                    // Track every opcode, not only opcodes that emitted a
+                                    // hook. This is luaG_traceexec's oldpc invariant, kept
+                                    // per activation so returning from a child on the same
+                                    // source line does not create a synthetic event merely
+                                    // because our bytecode density differs from PUC's.
+                                    if (!suppress_varargprep) {
+                                        exec_frames.getPtr(ctx.frame_index).u.lua.last_line_pc = @intCast(fr.u.lua.pc);
+                                    }
+
+                                    if (should_dispatch) {
+                                        th.last_hook_line = current_line;
+                                        if (try self.tryPushBytecodeDebugHook(
+                                            exec_frames,
+                                            ctx.frame_index,
+                                            "line",
+                                            current_line,
+                                            null,
+                                            null,
+                                            1,
+                                            .{ .resume_instruction = .{ .skip_line = true } },
+                                        )) {
+                                            continue :frame_loop;
+                                        }
+                                        self.dispatchBytecodeHook("line", current_line, null) catch |hook_err| {
+                                            if (hook_err == error.Yield) {
+                                                self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.u.lua.pc, false, yielded_in_place);
+                                            }
+                                            return hook_err;
+                                        };
+                                        // The hook can execute Lua and grow both the shared
+                                        // value stack and runtime-frame array.
+                                        ctx.regs = ctx.th.stack[ctx.base .. ctx.base + ctx.cap];
+                                        fr = exec_frames.getPtr(ctx.frame_index);
+                                        ctx.pc = fr.u.lua.pc;
+                                    }
+                                } else if (ctx.cur_proto.lineinfo.len == 0 and th.last_hook_line != -2) {
+                                    // Stripped chunks still produce one line event at the
+                                    // first instruction, with no line number.
+                                    th.last_hook_line = -2;
+                                    if (!skip_replayed_hook) {
+                                        if (try self.tryPushBytecodeDebugHook(
+                                            exec_frames,
+                                            ctx.frame_index,
+                                            "line",
+                                            null,
+                                            null,
+                                            null,
+                                            1,
+                                            .{ .resume_instruction = .{ .skip_line = true } },
+                                        )) {
+                                            continue :frame_loop;
+                                        }
+                                        self.dispatchBytecodeHook("line", null, null) catch |hook_err| {
+                                            if (hook_err == error.Yield) {
+                                                self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.u.lua.pc, false, yielded_in_place);
+                                            }
+                                            return hook_err;
+                                        };
+                                        ctx.regs = ctx.th.stack[ctx.base .. ctx.base + ctx.cap];
+                                        fr = exec_frames.getPtr(ctx.frame_index);
+                                        ctx.pc = fr.u.lua.pc;
+                                    }
+                                }
+                            }
+                        }
+
+                        // This pass falls through to execute ctx.pc: retire the
+                        // count-replay marker. The count hook has run for THIS
+                        // execution of the opcode (or nothing is pending), and
+                        // the next execution of the same pc — a loop back-edge
+                        // — must consume the budget and fire again.
+                        {
+                            const fr_end = exec_frames.getPtr(ctx.frame_index);
+                            if (fr_end.u.lua.resume_skip_count_pc != INVALID_PC) {
+                                fr_end.u.lua.resume_skip_count_pc = INVALID_PC;
                             }
                         }
                     }
@@ -27965,10 +28060,16 @@ pub const Vm = struct {
                                 const cont = pending.completion.hook;
                                 th.stack[parent.func_slot] = cont.saved_parent_callee;
                                 parent.setTailCallBool(cont.saved_parent_tailcall);
-                                // For count hooks, set resume_skip_count_pc so the
-                                // count hook doesn't immediately re-fire on resume.
+                                // For count hooks, set resume_skip_count_pc so
+                                // the count hook doesn't re-fire on the
+                                // resume's opcode replay, and skip_bc_line_once
+                                // so the replayed opcode produces no line event
+                                // either — PUC's single CIST_HOOKYIELD mark
+                                // suppresses both hooks (ldebug.c:952-955; see
+                                // parkBytecodeIrHookYield).
                                 if (cont.post == .resume_instruction and cont.post.resume_instruction.skip_count) {
                                     parent.u.lua.resume_skip_count_pc = @intCast(parent.u.lua.pc);
+                                    self.activeHookState().skip_bc_line_once = true;
                                 }
                                 // For line hooks, set skip_bc_line_once so the
                                 // line hook doesn't immediately re-fire on resume.
@@ -38299,7 +38400,6 @@ pub const Vm = struct {
         hook_state.tick = 0;
         hook_state.skip_line_once = false;
         hook_state.skip_line_until_depth = 0;
-        hook_state.skip_count_once = false;
         hook_state.skip_bc_line_once = false;
         if (hook_state.has_line) {
             if (target_thread == null and self.activeBytecodeThread().call_frames.len() != 0) {

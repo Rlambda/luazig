@@ -37,7 +37,7 @@ pub const lua_Alloc = ?*const fn (
 ) callconv(.c) ?*anyopaque;
 
 /// PUC `LUA_REGISTRYINDEX` (lua.h:43): pseudo-index for the registry table.
-pub const LUA_REGISTRYINDEX: c_int = -1001000;
+pub const LUA_REGISTRYINDEX: c_int = api.State.LUA_REGISTRYINDEX;
 
 /// PUC reference sentinels (lauxlib.h).
 pub const LUA_REFNIL: c_int = -1;
@@ -77,23 +77,6 @@ const normalizeIndex = api.normalizeIndex;
 const typeCode = api.typeCode;
 const statusCode = api.statusCode;
 const mapCompileError = api.mapCompileError;
-
-/// Resolve a C API index that may be an upvalue pseudo-index.
-/// Returns the Value pointer for the upvalue, or null if not an upvalue index.
-fn upvalueAt(h: *lua_State, idx: c_int) ?Value {
-    // Upvalue indices are LUA_REGISTRYINDEX - n (n=1,2,...)
-    // LUA_REGISTRYINDEX = -1001000
-    if (idx < -1001000 and idx >= -1001255) {
-        const upv_n: usize = @intCast(-1001000 - idx); // 1-based
-        // PUC: the running closure is the top C-frame's callee (ci->func).
-        if (Vm.runningCClosureOnThread(Vm.handleThread(h))) |cl| {
-            if (upv_n >= 1 and upv_n <= cl.upvalues.len) {
-                return cl.upvalues[upv_n - 1].value;
-            }
-        }
-    }
-    return null;
-}
 
 /// PUC `luaL_Buffer` (lauxlib.h): dynamic string builder used by C libraries.
 /// Layout matches PUC 5.5 exactly so C code allocating it on the C stack is
@@ -1090,10 +1073,8 @@ pub export fn lua_stringtonumber(L: ?*lua_State, s: [*:0]const u8) usize {
 /// (with ".0" appended if the result looks like an integer). luazig uses
 /// Zig's `{d}` format, which produces the shortest round-trip representation.
 pub export fn lua_numbertocstring(L: ?*lua_State, idx: c_int, buff: [*]u8) c_uint {
-    const h = L orelse return 0;
-    const n2s_th = Vm.handleThread(h);
-    const abs = Vm.cWindowSlot(n2s_th, idx) orelse return 0;
-    const val = n2s_th.stack[abs];
+    const st = api.State.fromHandle(L orelse return 0);
+    const val = st.index2value(idx);
 
     switch (val) {
         .Int => |i| {
@@ -1501,67 +1482,41 @@ pub export fn lua_rotate(L: ?*lua_State, idx: c_int, n: c_int) void {
     s.rotate(idx, n) catch {}; // (c): in-stack rotate, InvalidIndex-only
 }
 
-/// Resolve a lua_copy source index: registry slot, upvalue pseudo-index,
-/// or a window slot. Returns null for an invalid index.
-fn copySourceValue(h: *lua_State, fromidx: c_int) ?Value {
-    const vm = h.vm;
-    if (fromidx == LUA_REGISTRYINDEX) return vm.l_registry;
-    if (upvalueAt(h, fromidx)) |v| return v;
-    const th = Vm.handleThread(h);
-    const slot = Vm.cWindowSlot(th, fromidx) orelse return null;
-    return th.stack[slot];
-}
-
 pub export fn lua_copy(L: ?*lua_State, fromidx: c_int, toidx: c_int) void {
     const h = L orelse return;
     const vm = h.vm;
-    const th = Vm.handleThread(h);
-    // Registry slot as destination (PUC index2value(LUA_REGISTRYINDEX) =
-    // &G->l_registry): a plain setobj with NO barrier — PUC lapi.c:264-265:
-    // "LUA_REGISTRYINDEX does not need gc barrier (collector revisits it
-    // before finishing collection)". The atomic re-mark (gcAtomicCommon,
-    // PUC lgc.c:1553 parity) is what keeps a mid-cycle slot store alive.
-    if (toidx == LUA_REGISTRYINDEX) {
-        const src = copySourceValue(h, fromidx) orelse return;
-        vm.l_registry = src;
-        return;
-    }
-    // Handle upvalue pseudo-index as destination (write to upvalue)
-    if (toidx < -1001000 and toidx >= -1001255) {
-        const src = copySourceValue(h, fromidx) orelse return;
-        const upv_n: usize = @intCast(-1001000 - toidx);
-        if (Vm.runningCClosureOnThread(th)) |cl| {
-            if (upv_n >= 1 and upv_n <= cl.upvalues.len) {
-                const cell = cl.upvalues[upv_n - 1];
-                // Class 13 (F7): PUC lua_copy's upvalue arm runs luaC_barrier
-                // (lapi.c) — the old direct `.value` store missed the
-                // generational barrier: a young value written into an old
-                // closed cell was swept → use-after-free. Reserve BEFORE the
-                // observable store (lua_setupvalue's prepare/commit contract).
-                const plan = vm.gcPrepareWriteBarrierCell(cell, src) catch |e| cThrowOn(vm, h, e);
-                // PUC: open cells write through to the owning stack slot,
-                // closed cells to the cell's own value (Cell.set = both).
-                cell.set(vm, src);
-                vm.gcCommitWriteBarrierCell(cell, src, plan);
-            }
-        }
-        return;
-    }
-    // Registry slot as source: read the slot value into the window.
-    if (fromidx == LUA_REGISTRYINDEX) {
-        const slot = Vm.cWindowSlot(th, toidx) orelse return;
-        th.stack[slot] = vm.l_registry;
-        return;
-    }
-    // Handle upvalue pseudo-index as source (read from upvalue)
-    if (fromidx < -1001000 and fromidx >= -1001255) {
-        const src = upvalueAt(h, fromidx) orelse return;
-        const slot = Vm.cWindowSlot(th, toidx) orelse return;
-        th.stack[slot] = src;
-        return;
-    }
     var s = api.State.fromHandle(h);
-    s.copy(fromidx, toidx) catch {}; // (c): in-stack write, InvalidIndex-only
+    // PUC lua_copy (lapi.c:256-266): fr = index2value (a copy), to =
+    // index2value target, setobj through the target. An invalid source
+    // resolves to the nilvalue and really copies nil (PUC release); a .none
+    // destination is PUC's api_check "invalid index" (release: setobj into
+    // the nilvalue — UB) — a lenient no-op here.
+    const src = s.index2value(fromidx);
+    switch (s.index2target(toidx)) {
+        .stack_slot => |slot| {
+            const th = Vm.handleThread(h);
+            th.stack[slot] = src;
+        },
+        .upvalue_cell => |cell| {
+            // Class 13 (F7): PUC lua_copy's upvalue arm runs luaC_barrier
+            // (lapi.c) — reserve BEFORE the observable store
+            // (lua_setupvalue's prepare/commit contract). Open cells write
+            // through to the owning stack slot, closed cells to the cell's
+            // own value (Cell.set = both).
+            const plan = vm.gcPrepareWriteBarrierCell(cell, src) catch |e| cThrowOn(vm, h, e);
+            cell.set(vm, src);
+            vm.gcCommitWriteBarrierCell(cell, src, plan);
+        },
+        .registry_slot => |rslot| {
+            // Plain setobj with NO barrier — PUC lapi.c:264-265:
+            // "LUA_REGISTRYINDEX does not need gc barrier (collector
+            // revisits it before finishing collection)". The atomic re-mark
+            // (gcAtomicCommon, PUC lgc.c:1553 parity) keeps a mid-cycle slot
+            // store alive.
+            rslot.* = src;
+        },
+        .none => {},
+    }
 }
 
 pub export fn lua_insert(L: ?*lua_State, idx: c_int) void {
@@ -1767,40 +1722,20 @@ pub export fn lua_pushexternalstring(
 // --- Type / conversion ---
 
 pub export fn lua_type(L: ?*lua_State, idx: c_int) c_int {
-    const h = L orelse return -1;
-    if (upvalueAt(h, idx)) |v| return typeCode(api.valueType(v));
-    var s = api.State.fromHandle(h);
+    var s = api.State.fromHandle(L orelse return -1);
     return if (s.typeOf(idx)) |t| typeCode(t) else -1;
 }
 
 pub export fn lua_toboolean(L: ?*lua_State, idx: c_int) c_int {
-    const h = L orelse return 0;
-    if (upvalueAt(h, idx)) |v| return switch (v) {
-        .Nil => 0,
-        .Bool => |b| if (b) 1 else 0,
-        else => 1,
-    };
-    var s = api.State.fromHandle(h);
+    var s = api.State.fromHandle(L orelse return 0);
     return if (s.toboolean(idx)) 1 else 0;
 }
 
 pub export fn lua_tointegerx(L: ?*lua_State, idx: c_int, isnum: ?*c_int) i64 {
-    const h = L orelse {
+    var s = api.State.fromHandle(L orelse {
         if (isnum) |p| p.* = 0;
         return 0;
-    };
-    if (upvalueAt(h, idx)) |v| {
-        const result: ?i64 = switch (v) {
-            .Int => |i| i,
-            .Num => |n| if (n == @round(n)) @as(i64, @intFromFloat(n)) else null,
-            else => null,
-        };
-        if (result) |r| {
-            if (isnum) |p| p.* = 1;
-            return r;
-        }
-    }
-    var s = api.State.fromHandle(h);
+    });
     if (s.tointeger(idx)) |v| {
         if (isnum) |p| p.* = 1;
         return v;
@@ -1810,22 +1745,10 @@ pub export fn lua_tointegerx(L: ?*lua_State, idx: c_int, isnum: ?*c_int) i64 {
 }
 
 pub export fn lua_tonumberx(L: ?*lua_State, idx: c_int, isnum: ?*c_int) f64 {
-    const h = L orelse {
+    var s = api.State.fromHandle(L orelse {
         if (isnum) |p| p.* = 0;
         return 0;
-    };
-    if (upvalueAt(h, idx)) |v| {
-        const result: ?f64 = switch (v) {
-            .Int => |i| @floatFromInt(i),
-            .Num => |n| n,
-            else => null,
-        };
-        if (result) |r| {
-            if (isnum) |p| p.* = 1;
-            return r;
-        }
-    }
-    var s = api.State.fromHandle(h);
+    });
     if (s.tonumber(idx)) |v| {
         if (isnum) |p| p.* = 1;
         return v;

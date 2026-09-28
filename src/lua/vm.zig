@@ -69498,7 +69498,7 @@ fn a11s13Cf(L: ?*@import("c_api.zig").lua_State) callconv(.c) c_int {
     // mode 2: reset the upvalue to a string (teardown hygiene).
     if (a11s13_mode == 2) {
         c_api.lua_pushlstring(L, "a11s13up", 8);
-        c_api.lua_copy(L, -1, -1001001);
+        c_api.lua_copy(L, -1, c_api.LUA_REGISTRYINDEX - 1);
         c_api.lua_pop(L, 1);
         return 0;
     }
@@ -69507,7 +69507,7 @@ fn a11s13Cf(L: ?*@import("c_api.zig").lua_State) callconv(.c) c_int {
     // read it at window top.
     const th = h.thread.?;
     a11s13_tbl = .{ .table = th.stack[th.top - 1].Table };
-    c_api.lua_copy(L, -1, -1001001);
+    c_api.lua_copy(L, -1, c_api.LUA_REGISTRYINDEX - 1);
     if (a11s13_mode == 1) {
         c_api.lua_setglobal(L, "a11s13_root");
     } else {
@@ -70325,25 +70325,24 @@ var a11p7_inner_up1: i64 = -1;
 
 fn a11p7InnerCf(L: ?*@import("c_api.zig").lua_State) callconv(.c) c_int {
     const c_api = @import("c_api.zig");
-    // lua_upvalueindex(1) = LUA_REGISTRYINDEX - 1 = -1001001: while THIS
-    // frame is on top it must resolve to the INNER closure's upvalue
-    // (777), never the outer's (111).
-    a11p7_inner_up1 = c_api.lua_tointegerx(L, -1001001, null);
+    // lua_upvalueindex(1): while THIS frame is on top it must resolve to the
+    // INNER closure's upvalue (777), never the outer's (111).
+    a11p7_inner_up1 = c_api.lua_tointegerx(L, c_api.LUA_REGISTRYINDEX - 1, null);
     return 0;
 }
 
 fn a11p7OuterCf(L: ?*@import("c_api.zig").lua_State) callconv(.c) c_int {
     const c_api = @import("c_api.zig");
     // Own upvalues via pseudo-indices (the outer frame is on top).
-    a11p7_outer_up1 = c_api.lua_tointegerx(L, -1001001, null);
-    a11p7_outer_up2 = c_api.lua_tointegerx(L, -1001002, null);
+    a11p7_outer_up1 = c_api.lua_tointegerx(L, c_api.LUA_REGISTRYINDEX - 1, null);
+    a11p7_outer_up2 = c_api.lua_tointegerx(L, c_api.LUA_REGISTRYINDEX - 2, null);
     // Nested C→C: stage the inner closure with its own upvalue and call
     // it — inside, the pseudo-index must switch to the inner closure.
     _ = c_api.lua_pushinteger(L, 777);
     c_api.lua_pushcclosure(L, a11p7InnerCf, 1);
     c_api.lua_callk(L, 0, 0, 0, null);
     // The inner frame popped: the pseudo-index is OUR upvalue again.
-    a11p7_outer_up1_after_inner = c_api.lua_tointegerx(L, -1001001, null);
+    a11p7_outer_up1_after_inner = c_api.lua_tointegerx(L, c_api.LUA_REGISTRYINDEX - 1, null);
     return 0;
 }
 

@@ -104,6 +104,91 @@ pub const State = struct {
         return self.curThread().stack[s];
     }
 
+    /// PUC `LUA_REGISTRYINDEX` (lua.h:43): the registry pseudo-index.
+    /// PUC 5.5 defines it as -(INT_MAX/2 + 1000); upvalue pseudo-indices are
+    /// `LUA_REGISTRYINDEX - n` for n = 1, 2, ...
+    pub const LUA_REGISTRYINDEX: c_int = -(std.math.maxInt(c_int) / 2 + 1000);
+
+    /// PUC `index2value`/`index2stack` resolution result (lapi.c:58-106).
+    /// The single authority mapping a C API index to its value storage:
+    /// every pseudo-index-aware entry point resolves through this union,
+    /// while pure stack operations (rotate/insert/remove/toclose/closeslot)
+    /// keep the window-only `slot` fast path (PUC index2stack — pseudo
+    /// indices are api_check errors there, never resolved).
+    pub const IndexTarget = union(enum) {
+        /// Writable absolute `th.stack` slot. Re-fetch after any operation
+        /// that can grow (and therefore move) the stack.
+        stack_slot: usize,
+        /// Writable upvalue cell of the running C closure (PUC: the CClosure
+        /// at `ci->func` of the top C frame). Writes use the existing
+        /// prepare/`Cell.set`/commit barrier contract.
+        upvalue_cell: *vm_mod.Cell,
+        /// Writable registry slot (PUC `&G->l_registry`). Plain store, no
+        /// barrier — the atomic re-mark keeps a mid-cycle store alive
+        /// (PUC lgc.c:1553 parity).
+        registry_slot: *vm_mod.Value,
+        /// PUC `&G->nilvalue`: reads behave like nil, `lua_type` yields
+        /// LUA_TNONE. Not writable (PUC release setobj into it is UB).
+        none,
+    };
+
+    /// PUC `index2value` (lapi.c:58-86): resolve `idx` on THIS State's
+    /// handle thread. Infallible — every out-of-range form collapses to
+    /// `.none` (PUC release resolves to `&G->nilvalue` there).
+    pub fn index2target(self: *const State, idx: i32) IndexTarget {
+        const th = self.curThread();
+        if (idx > 0) {
+            // Acceptable-but-empty: PUC release resolves ANY positive index
+            // at or above top to the nilvalue (the ci->top bound is
+            // api_check-only).
+            const base = vm_mod.Vm.cWindowBase(th);
+            const s = base + @as(usize, @intCast(idx - 1));
+            return if (s < th.top) .{ .stack_slot = s } else .none;
+        }
+        if (idx == LUA_REGISTRYINDEX)
+            return .{ .registry_slot = &self.vm.l_registry };
+        if (idx < LUA_REGISTRYINDEX) {
+            // Upvalue arm: upv_n counted in i64 so every idx below the
+            // registry pseudo-index is a well-formed upvalue number (PUC int
+            // arithmetic is release-UB past MAXUPVAL+1; here an out-of-range
+            // n simply misses the closure's upvalues and lands on .none).
+            const upv_n: i64 = @as(i64, LUA_REGISTRYINDEX) - @as(i64, idx);
+            if (vm_mod.Vm.runningCClosureOnThread(th)) |cl| {
+                if (upv_n >= 1 and upv_n <= @as(i64, @intCast(cl.upvalues.len)))
+                    return .{ .upvalue_cell = cl.upvalues[@intCast(upv_n - 1)] };
+            }
+            // Light C function, Lua frame (hook lane), or n out of range:
+            // PUC resolves all of these to the nilvalue.
+            return .none;
+        }
+        if (idx < 0) {
+            // Negative window index (0 is invalid).
+            if (vm_mod.Vm.cWindowSlot(th, idx)) |s| return .{ .stack_slot = s };
+            return .none;
+        }
+        return .none;
+    }
+
+    /// The value stored at a resolved target (PUC reading through the
+    /// TValue*): `.none` reads as nil. Open upvalue cells read through to
+    /// the owning stack slot (`Cell.get`, PUC `uv->v.p`).
+    fn targetValue(self: *const State, t: IndexTarget) vm_mod.Value {
+        return switch (t) {
+            .stack_slot => |s| self.curThread().stack[s],
+            .upvalue_cell => |c| c.get(self.vm),
+            .registry_slot => |p| p.*,
+            .none => .Nil,
+        };
+    }
+
+    /// PUC `index2value` read form: a Value COPY of the resolved target
+    /// (`.none` reads as nil). Callers that must distinguish LUA_TNONE from
+    /// LUA_TNIL (lua_type) or apply the isvalid rule (rawequal/compare) use
+    /// `index2target` instead.
+    pub fn index2value(self: *const State, idx: i32) vm_mod.Value {
+        return self.targetValue(self.index2target(idx));
+    }
+
     /// PUC `api_incr_top`: push one value onto the anchored window.
     pub fn push(self: *State, v: vm_mod.Value) ApiError!void {
         self.vm.cWindowPush(self.curThread(), v) catch |e| return mapVmError(e);
@@ -342,9 +427,14 @@ pub const State = struct {
     /// same type and equal value (pointer identity for tables/closures,
     /// byte comparison for strings, numeric cross-comparison for Int/Num).
     pub fn rawequal(self: *State, idx1: i32, idx2: i32) bool {
-        const v1 = self.valueAt(idx1) orelse return false;
-        const v2 = self.valueAt(idx2) orelse return false;
-        return vm_mod.Vm.apiRawEqual(v1, v2);
+        // PUC isvalid rule (lapi.c:326-331): 0 if EITHER operand resolves to
+        // the nilvalue (a .none target); a real nil stored in the registry
+        // slot is a valid value and compares normally.
+        const t1 = self.index2target(idx1);
+        if (t1 == .none) return false;
+        const t2 = self.index2target(idx2);
+        if (t2 == .none) return false;
+        return vm_mod.Vm.apiRawEqual(self.targetValue(t1), self.targetValue(t2));
     }
 
     /// PUC `lua_compare` (lapi.c:lua_compare): comparison with metamethods.
@@ -352,16 +442,23 @@ pub const State = struct {
     /// tries __eq/__lt/__le metamethods. Returns false if either index is
     /// invalid or the comparison is not possible.
     pub fn compare(self: *State, idx1: i32, idx2: i32, op: CompareOp) ApiError!bool {
-        const a = self.valueAt(idx1) orelse return false;
-        const b = self.valueAt(idx2) orelse return false;
-        return self.vm.apiCompare(@intFromEnum(op), a, b) catch |e| return mapVmError(e);
+        // PUC isvalid rule (lapi.c:349-369): 0 if either operand is the
+        // nilvalue.
+        const t1 = self.index2target(idx1);
+        if (t1 == .none) return false;
+        const t2 = self.index2target(idx2);
+        if (t2 == .none) return false;
+        return self.vm.apiCompare(@intFromEnum(op), self.targetValue(t1), self.targetValue(t2)) catch |e| return mapVmError(e);
     }
 
     /// PUC `lua_len` (lapi.c:lua_len): push the length of the value at idx.
     /// For strings: byte length. For tables: border length (or __len
     /// metamethod). For other types: tries __len metamethod, errors if none.
     pub fn len(self: *State, idx: i32) ApiError!void {
-        const v = self.valueAt(idx) orelse return error.InvalidIndex;
+        // PUC lua_len: index2value feeds luaV_objlen — a .none target (the
+        // nilvalue) raises the standard "attempt to get length" error
+        // through the metamethod path, exactly like a nil operand.
+        const v = self.index2value(idx);
         const result = self.vm.apiLen(v) catch |e| return mapVmError(e);
         try self.push(result);
     }
@@ -421,20 +518,19 @@ pub const State = struct {
     }
 
     pub fn pushvalue(self: *State, idx: i32) ApiError!void {
-        const v = self.valueAt(idx) orelse return error.InvalidIndex;
-        try self.push(v);
+        // PUC lua_pushvalue: setobj2s from index2value — invalid and pseudo
+        // forms resolve to the nilvalue, so the push itself is the only
+        // failure mode (OOM).
+        try self.push(self.index2value(idx));
     }
 
     pub fn typeOf(self: *const State, idx: i32) ?Type {
-        // LUA_REGISTRYINDEX resolves to the registry SLOT value (PUC
-        // index2value → &G->l_registry): lua_type reflects whatever the
-        // slot currently holds — table, nil, number, anything.
-        const registry_idx: c_int = -1001000;
-        const v = if (idx == registry_idx)
-            self.vm.l_registry
-        else
-            self.valueAt(idx) orelse return null;
-        return valueType(v);
+        // PUC lua_type (lapi.c:282-286): isvalid(&G->nilvalue) is false —
+        // ONLY a .none target yields LUA_TNONE; a real nil stored in the
+        // registry slot reads LUA_TNIL.
+        const t = self.index2target(idx);
+        if (t == .none) return null;
+        return valueType(self.targetValue(t));
     }
 
     pub fn isuserdata(self: *const State, idx: i32) bool {
@@ -444,7 +540,7 @@ pub const State = struct {
     }
 
     pub fn toboolean(self: *const State, idx: i32) bool {
-        const v = self.valueAt(idx) orelse return false;
+        const v = self.index2value(idx);
         return switch (v) {
             .Nil => false,
             .Bool => |b| b,
@@ -453,7 +549,7 @@ pub const State = struct {
     }
 
     pub fn tointeger(self: *const State, idx: i32) ?i64 {
-        const v = self.valueAt(idx) orelse return null;
+        const v = self.index2value(idx);
         return switch (v) {
             .Int => |i| i,
             .Num => |n| if (n == @round(n)) @as(i64, @intFromFloat(n)) else null,
@@ -462,7 +558,7 @@ pub const State = struct {
     }
 
     pub fn tonumber(self: *const State, idx: i32) ?f64 {
-        const v = self.valueAt(idx) orelse return null;
+        const v = self.index2value(idx);
         return switch (v) {
             .Int => |i| @floatFromInt(i),
             .Num => |n| n,
@@ -471,7 +567,7 @@ pub const State = struct {
     }
 
     pub fn tostring(self: *const State, idx: i32) ?[]const u8 {
-        const v = self.valueAt(idx) orelse return null;
+        const v = self.index2value(idx);
         return switch (v) {
             .String => |s| s.bytes(),
             else => null,
@@ -486,7 +582,7 @@ pub const State = struct {
     /// convertible to a number. Currently checks Int/Num only; string-to-number
     /// conversion will be added when `lua_tonumberx` supports it.
     pub fn isnumber(self: *const State, idx: i32) bool {
-        const v = self.valueAt(idx) orelse return false;
+        const v = self.index2value(idx);
         return switch (v) {
             .Int, .Num => true,
             else => false,
@@ -496,7 +592,7 @@ pub const State = struct {
     /// PUC `lua_isstring` (lapi.c): true if the value is a string or a number
     /// (both are "string-convertible" in PUC's cvt2str sense).
     pub fn isstring(self: *const State, idx: i32) bool {
-        const v = self.valueAt(idx) orelse return false;
+        const v = self.index2value(idx);
         return switch (v) {
             .String, .Int, .Num => true,
             else => false,
@@ -506,7 +602,7 @@ pub const State = struct {
     /// PUC `lua_isinteger` (lapi.c): true if the value is specifically an
     /// integer (not a float).
     pub fn isinteger(self: *const State, idx: i32) bool {
-        const v = self.valueAt(idx) orelse return false;
+        const v = self.index2value(idx);
         return v == .Int;
     }
 
@@ -514,7 +610,7 @@ pub const State = struct {
     /// (a Closure with `c_func != null`). Lua closures (bytecode protos)
     /// return false.
     pub fn iscfunction(self: *const State, idx: i32) bool {
-        const v = self.valueAt(idx) orelse return false;
+        const v = self.index2value(idx);
         return switch (v) {
             .Closure => |c| c.c_func != null,
             else => false,
@@ -539,19 +635,36 @@ pub const State = struct {
     /// luaS_new (an allocation) — an OOM there is LUA_ERRMEM, not a silent
     /// null. The signature is now fallible: `ApiError!?[]const u8`.
     pub fn tolstring(self: *State, idx: i32) ApiError!?[]const u8 {
-        const s = self.slot(idx) orelse return null;
-        const th = self.curThread();
-        switch (th.stack[s]) {
-            .String => |st| return st.bytes(),
-            .Int, .Num => {
-                // PUC lua_tolstring: convert number to string in place on stack.
-                // valueToInternedStr uses the same formatting as PUC's
-                // luaO_tostringbuff (%.14g equivalent + ".0" for integer floats).
-                const ls = self.vm.valueToInternedStr(th.stack[s]) catch |e| return mapDispatchError(e);
-                th.stack[s] = .{ .String = ls };
-                return th.stack[s].String.bytes();
+        switch (self.index2target(idx)) {
+            .stack_slot => |s| {
+                const th = self.curThread();
+                switch (th.stack[s]) {
+                    .String => |st| return st.bytes(),
+                    .Int, .Num => {
+                        // PUC lua_tolstring: convert number to string in place on stack.
+                        // valueToInternedStr uses the same formatting as PUC's
+                        // luaO_tostringbuff (%.14g equivalent + ".0" for integer floats).
+                        const ls = self.vm.valueToInternedStr(th.stack[s]) catch |e| return mapDispatchError(e);
+                        th.stack[s] = .{ .String = ls };
+                        return th.stack[s].String.bytes();
+                    },
+                    else => return null,
+                }
             },
-            else => return null,
+            // Read-only arms: a number-to-string in-place mutation of an
+            // upvalue cell or the registry slot writes through the target
+            // (PUC lapi.c re-resolves and setobj's it) — a writable-target
+            // concern; here strings return their bytes, everything else is
+            // not string-convertible.
+            .upvalue_cell => |c| return switch (c.get(self.vm)) {
+                .String => |st| st.bytes(),
+                else => null,
+            },
+            .registry_slot => |p| return switch (p.*) {
+                .String => |st| st.bytes(),
+                else => null,
+            },
+            .none => return null,
         }
     }
 
@@ -559,7 +672,7 @@ pub const State = struct {
     /// String: byte length. Table: border length (luaH_getn). Userdata:
     /// payload size. Returns 0 for other types.
     pub fn rawlen(self: *State, idx: i32) usize {
-        const v = self.valueAt(idx) orelse return 0;
+        const v = self.index2value(idx);
         return switch (v) {
             .String => |s| s.bytes().len,
             .Table => |t| @intCast(self.vm.tableBorderLen(t)),
@@ -571,7 +684,7 @@ pub const State = struct {
     /// PUC `lua_tocfunction` (lapi.c:lua_tocfunction): return the C function
     /// pointer from a Closure, or null if the value is not a C closure.
     pub fn tocfunction(self: *const State, idx: i32) ?*const fn (?*vm_mod.lua_State) callconv(.c) c_int {
-        const v = self.valueAt(idx) orelse return null;
+        const v = self.index2value(idx);
         return switch (v) {
             .Closure => |c| c.c_func,
             else => null,
@@ -767,11 +880,10 @@ pub const State = struct {
     }
 
     pub fn getfield(self: *State, idx: i32, key: []const u8) ApiError!Type {
-        const registry_idx: c_int = -1001000;
         // PUC index2value(LUA_REGISTRYINDEX) = &G->l_registry: the slot
         // VALUE itself, whatever it holds — a non-table slot flows into
         // luaV_finishget and raises the standard index error.
-        const object: vm_mod.Value = if (idx == registry_idx)
+        const object: vm_mod.Value = if (idx == LUA_REGISTRYINDEX)
             self.vm.l_registry
         else
             self.valueAt(idx) orelse return error.InvalidIndex;
@@ -783,8 +895,7 @@ pub const State = struct {
     pub fn setfield(self: *State, idx: i32, key: []const u8) ApiError!void {
         const th = self.curThread();
         if (self.count() == 0) return error.InvalidState;
-        const registry_idx: c_int = -1001000;
-        const object: vm_mod.Value = if (idx == registry_idx)
+        const object: vm_mod.Value = if (idx == LUA_REGISTRYINDEX)
             self.vm.l_registry
         else blk: {
             const s = self.slot(idx) orelse return error.InvalidIndex;
@@ -842,8 +953,7 @@ pub const State = struct {
     }
 
     pub fn rawgeti(self: *State, idx: i32, n: i64) ApiError!Type {
-        const registry_idx: c_int = -1001000;
-        const object = if (idx == registry_idx)
+        const object = if (idx == LUA_REGISTRYINDEX)
             self.vm.l_registry
         else
             self.valueAt(idx) orelse return error.InvalidIndex;
@@ -859,8 +969,7 @@ pub const State = struct {
     pub fn rawseti(self: *State, idx: i32, n: i64) ApiError!void {
         const th = self.curThread();
         if (self.count() == 0) return error.InvalidState;
-        const registry_idx: c_int = -1001000;
-        const tbl = if (idx == registry_idx) blk: {
+        const tbl = if (idx == LUA_REGISTRYINDEX) blk: {
             break :blk self.vm.registryTable() orelse return error.Type;
         } else blk: {
             const s = self.slot(idx) orelse return error.InvalidIndex;
@@ -912,8 +1021,11 @@ pub const State = struct {
     pub fn next(self: *State, idx: i32) ApiError!bool {
         const th = self.curThread();
         if (self.count() == 0) return error.InvalidState;
-        const s = self.slot(idx) orelse return error.InvalidIndex;
-        const tbl = switch (th.stack[s]) {
+        // PUC lua_next resolves the table through index2value and
+        // api_check's the type ("table expected"); a .none target is that
+        // api_check class (PUC release dereferences the nilvalue as a Table
+        // — UB; here a plain Type error).
+        const tbl = switch (self.index2value(idx)) {
             .Table => |t| t,
             else => return error.Type,
         };
@@ -1027,12 +1139,12 @@ pub const State = struct {
     }
 
     pub fn getmetatable(self: *State, idx: i32) ApiError!bool {
-        const v = self.valueAt(idx) orelse return error.InvalidIndex;
         // PUC lua_getmetatable (lapi.c:951-960): tables/userdata read
-        // their own metatable; every other type reads the TYPE-LEVEL slot
-        // G(L)->mt[ttype(o)] (P16.50-review-13 — the C-API get previously
-        // returned nothing for type-level metatables while the Lua-level
-        // getmetatable already did).
+        // their own metatable; every other type (a .none target reads as
+        // nil) reads the TYPE-LEVEL slot G(L)->mt[ttype(o)]
+        // (P16.50-review-13 — the C-API get previously returned nothing for
+        // type-level metatables while the Lua-level getmetatable already did).
+        const v = self.index2value(idx);
         const mt: ?*vm_mod.Table = self.vm.valueMetatable(v);
         if (mt) |m| {
             try self.push(.{ .Table = m });
@@ -1044,7 +1156,6 @@ pub const State = struct {
     pub fn setmetatable(self: *State, idx: i32) ApiError!void {
         const th = self.curThread();
         if (self.count() < 1) return error.InvalidState;
-        const s = self.slot(idx) orelse return error.InvalidIndex;
         // P16.50-review-13: PUC lua_setmetatable (lapi.c:964-1000) — the
         // metatable stays ROOTED on the stack until the transaction
         // commits, api_check requires table-or-nil, and the default arm
@@ -1059,7 +1170,10 @@ pub const State = struct {
             .Nil => null,
             else => return error.Type, // PUC api_check: table or nil
         };
-        const target = th.stack[s];
+        // PUC lua_setmetatable resolves the target through index2value; a
+        // .none target reads as nil and lands in the default (type-level)
+        // arm — G(L)->mt[LUA_TNIL] (lapi.c:964-1000).
+        const target = self.index2value(idx);
         switch (target) {
             .Table, .Userdata => {
                 const owner = vm_mod.GcObject.fromValue(target).?;
@@ -1218,7 +1332,7 @@ pub const State = struct {
     /// Return payload pointer for full userdata at `idx`, or lightuserdata
     /// pointer, or null.
     pub fn touserdata(self: *State, idx: i32) ?*anyopaque {
-        const v = self.valueAt(idx) orelse return null;
+        const v = self.index2value(idx);
         return switch (v) {
             .Userdata => |ud| if (ud.payload.len > 0) @ptrCast(ud.payload.ptr) else @ptrCast(ud),
             .LightUserdata => |p| p,
@@ -1228,7 +1342,7 @@ pub const State = struct {
 
     /// Return raw pointer for GC objects (userdata, table, thread, string).
     pub fn topointer(self: *State, idx: i32) ?*anyopaque {
-        const v = self.valueAt(idx) orelse return null;
+        const v = self.index2value(idx);
         return switch (v) {
             .Userdata => |ud| @ptrCast(ud),
             .LightUserdata => |p| p,
@@ -1243,9 +1357,13 @@ pub const State = struct {
     pub fn setiuservalue(self: *State, idx: i32, n: usize) ApiError!bool {
         const th = self.curThread();
         if (self.count() < 1) return error.InvalidState;
-        const s = self.slot(idx) orelse return error.InvalidIndex;
         const val = th.stack[th.top - 1];
-        switch (th.stack[s]) {
+        // PUC lua_setiuservalue resolves the target through index2value and
+        // api_check's "full userdata expected"; a non-userdata target (a
+        // .none target reads as nil) is that api_check class — PUC release
+        // dereferences the nilvalue as a Udata (UB); here a plain pop+false,
+        // keeping the stack shape PUC has after the unconditional pop.
+        switch (self.index2value(idx)) {
             .Userdata => |ud| {
                 const n_idx = n - 1;
                 if (n_idx >= ud.uservalues.len) {
@@ -1279,10 +1397,9 @@ pub const State = struct {
 
     /// Push the n-th uservalue from the userdata at `idx`.
     pub fn getiuservalue(self: *State, idx: i32, n: usize) ApiError!Type {
-        const v = self.valueAt(idx) orelse {
-            try self.push(.Nil);
-            return .nil;
-        };
+        // PUC lua_getiuservalue resolves through index2value; a .none target
+        // reads as nil and takes the not-a-userdata arm (push nil).
+        const v = self.index2value(idx);
         switch (v) {
             .Userdata => |ud| {
                 const n_idx = n - 1;
@@ -1351,8 +1468,7 @@ pub const State = struct {
             return -1;
         }
 
-        const registry_idx: c_int = -1001000;
-        const tbl = if (t == registry_idx) blk: {
+        const tbl = if (t == LUA_REGISTRYINDEX) blk: {
             // The registry table from the slot; a non-table slot cannot
             // hold refs (PUC would UB on hvalue — here a lenient -2).
             break :blk self.vm.registryTable() orelse return -2;
@@ -1374,8 +1490,7 @@ pub const State = struct {
 
     /// Release reference `ref` from table at `t` (PUC free-list recycling).
     pub fn unref(self: *State, t: i32, ref_id: i32) void {
-        const registry_idx: c_int = -1001000;
-        const tbl = if (t == registry_idx) blk: {
+        const tbl = if (t == LUA_REGISTRYINDEX) blk: {
             break :blk self.vm.registryTable() orelse return;
         } else blk: {
             const v = self.valueAt(t) orelse return;
@@ -1542,7 +1657,7 @@ pub const State = struct {
     }
 
     fn threadAt(self: *const State, idx: i32) ?*vm_mod.Thread {
-        const v = self.valueAt(idx) orelse return null;
+        const v = self.index2value(idx);
         return switch (v) {
             .Thread => |th| th,
             else => null,

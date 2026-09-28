@@ -201,11 +201,6 @@
 ** ===================================================================
 */
 
-/* LUAI_MAXSTACK limits the size of the Lua stack. PUC Lua 5.5 uses
-** 1000000 for 64-bit systems (ldo.c:192). This is also referenced by
-** LUA_REGISTRYINDEX in lua.h. */
-#define LUAI_MAXSTACK		1000000
-
 /* LUAI_MAXCCALLS limits the number of nested C calls (PUC ldo.h:63).
 ** Prevents stack overflow from infinite C recursion. */
 #define LUAI_MAXCCALLS		200

@@ -80,11 +80,15 @@ typedef void (*lua_WarnFunction)(void *ud, const char *msg, int tocont);
 #define LUA_ERRERR 5
 
 /* ----------------------------------------------------------------------- */
-/* Pseudo-indices (lua.h:43)                                               */
+/* Pseudo-indices (lua.h:38-44)                                            */
 /* ----------------------------------------------------------------------- */
 
-/* LUAI_MAXSTACK is defined in luaconf.h. */
-#define LUA_REGISTRYINDEX (-LUAI_MAXSTACK - 1000)
+/*
+** Pseudo-indices
+** (The stack size is limited to INT_MAX/2; we keep some free empty
+** space after that to help overflow detection.)
+*/
+#define LUA_REGISTRYINDEX	(-(INT_MAX/2 + 1000))
 
 /* ----------------------------------------------------------------------- */
 /* Type codes (lua.h:83)                                                   */

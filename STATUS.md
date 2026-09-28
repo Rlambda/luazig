@@ -497,6 +497,55 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   α); α+δ и γ-без-β не объединяемы. Новые подтверждённые: HIGH
   raise-on-.none; HIGH RIDX-население; HIGH-условно atomic-перемарка
   (при writable).
+  A1.next-cidx3 research (/tmp/opencode/cidx3_report.md):
+  post-resolver owner-разрыв доказан ИСПОЛНЕНИЕМ (диагностический
+  /tmp-патч, имитирующий α-δ резолвер): после замены registry[2]
+  getglobal читает 0 (PUC 73), setglobal пишет мимо, НОВЫЙ chunk
+  получает СТАРЫЙ _ENV — apiGet/apiSetGlobal/load читают отдельный
+  Vm.global_env (vm.zig:24900-24913, c_api 954/1316/1399) — второй
+  mutable authority, план α-δ его не трогает (HIGH, FIX-NOW в новом
+  cut ε). Тот же класс: get/setglobal обязаны быть RAW (без
+  __index/__newindex на metatable _G — PUC 42/zig 0, MEDIUM) и без
+  спец-кейсов _G/_ENV/_VERSION после замены (PUC nil/zig table).
+  Рекомендация: вариант (a) RIDX[2]-canonical — удалить global_env;
+  apiGet/apiSetGlobal → registry[2]+metamethod-путь; load-env из
+  registry[2]; OP_GETTABUP читает _ENV-upvalue напрямую — hot path
+  не затронут. Cut-ревизия: ε ПОСЛЕ γ (предусловие α); оракул
+  review_cidx2_globals GREEN только после ε (после γ — RED 0/0,
+  доказанное ожидаемое состояние). ARCHITECTURAL-BACKLOG:
+  debugFindGlobalFuncName _G vs _LOADED (MEDIUM).
+
+- [ ] **Parity BLOCKER, ARCHITECTURAL-BACKLOG: C globals остаются привязаны
+  к `Vm.global_env` независимо от `registry[LUA_RIDX_GLOBALS]`.**
+  Независимый статический C-дифференциал
+  `/tmp/opencode/review_cidx2_globals.c`: после записи новой таблицы в
+  `registry[2]` PUC 5.5 даёт `getglobal=73`, `setglobal=91`, luazig —
+  `0/0` (сегодня первая неверная операция — `rawseti(REG,2)` no-op).
+  PUC `lapi.c:getGlobalTable` читает RIDX_GLOBALS при `lua_getglobal`,
+  `lua_setglobal` и `lua_load`; luazig `apiGetGlobal`/`apiSetGlobal`,
+  VM `getGlobal`/`setGlobal` и загрузка чанков продолжают читать
+  `Vm.global_env`. Предложенная cidx2 Model A населяет RIDX[2], но
+  не мигрирует эти потребители: после исправления rawseti расхождение
+  останется и возникнут два mutable источника глобального окружения.
+  До implementation нужен bounded inventory владельца `_ENV`/globals,
+  design с одним authority и differential после замены RIDX[2].
+  Origin pre-existing; открытых пунктов 26→27.
+  A1.next-cidx3 research — ВЫПОЛНЕНО (см. также расширение пункта
+  pseudo-index выше): post-resolver owner-разрыв доказан ИСПОЛНЕНИЕМ
+  (/tmp-патч, имитирующий α-δ резолвер: getglobal PUC 73/zig 0;
+  setglobal мимо; НОВЫЙ chunk получает СТАРЫЙ _ENV). Полный inventory
+  и рекомендованный дизайн: вариант (a) RIDX[2]-canonical — УДАЛИТЬ
+  Vm.global_env; apiGet/apiSetGlobal → registry[2] + RAW-семантика
+  (без __index/__newindex на metatable _G — сейчас PUC 42/zig 0) и без
+  спец-кейсов _G/_ENV/_VERSION после замены; load-env из registry[2]
+  (PUC lua_load-форма); OP_GETTABUP читает _ENV-upvalue напрямую —
+  hot path НЕ затронут; захват старых closures не меняется (PUC-parity
+  подтверждён формой D). Cut-ревизия: новый cut ε ПОСЛЕ γ (жёсткое
+  предусловие α); review_cidx2_globals GREEN только после ε (после γ —
+  RED 0/0, доказанное ожидаемое состояние). Отчёт:
+  /tmp/opencode/cidx3_report.md; оракулы /tmp/opencode/cidx3/
+  (globals_postresolver, globals_meta, closure-before/after, restore,
+  GC-формы). Пункт остаётся открытым до cut ε.
 
 - [x] **Architecture A1 research (COMPLETED): единая GC lifetime/rooting/constructor
   модель**. Локальная `P16.50-review-16 correction`, ошибочно открытая ревьюером

@@ -402,7 +402,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   matrix zig_fail=0; smoke 88/88 byte-exact; c_api 24-29 PASS; api580
   GREEN; fmt/diff-check clean.
 
-- [ ] **Evidence BLOCKER, FIX-NOW: hook perf A/B измерил Lua-opcode,
+- [x] **Evidence BLOCKER, FIX-NOW: hook perf A/B измерил Lua-opcode,
   а не CPU instructions** (review `97082a6`). Числа 1,200,033 и
   400,010 взяты из `--stats` (`instructions_total` — число исполненных
   Lua-инструкций); они закономерно одинаковы до/после публикации top
@@ -413,6 +413,28 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   а не 1.2 млн. Нужен paired CPU-instructions A/B с immutable hashes
   и no-hook контролем; скорость не gate, вывод об отсутствии регрессии
   пока недостоверен. Open-count 26→27.
+  CLOSED (review `8845275`): immutable RF `97082a6`→final измерены
+  `perf stat` native `cpu_core/instructions/u`, 7 paired повторов на
+  одном core; no-hook +0.00%, count-hook +0.24% инструкций. Ревьювер
+  повторил runner на тех же бинарях: no-hook +0.01%, count-hook +0.24%.
+  `--stats.instructions_total` теперь используется только для контроля
+  одинаковой Lua-работы. Вывод о цене native-инструкций подтверждён;
+  cycles шумят (повторный медианный результат −2.48% вместо заявленных
+  −4.46%), устойчивый выигрыш по cycles не установлен.
+
+- [ ] **Parity BLOCKER, ORDINARY-BACKLOG: stripped line-hook пропускает
+  события на обратных переходах.** При `lineinfo.len==0` luazig
+  выдаёт первый line-event, но не повторяет его на `npci <= oldpc`,
+  тогда как PUC `luaG_traceexec` проверяет back-edge независимо от
+  наличия lineinfo (`ldebug.c:963-967`, `changedline` для stripped
+  возвращает false). Независимая валидная форма
+  `/tmp/opencode/review_hktop_stripped.lua`: PUC 5.5 `6 5`, luazig
+  `97082a6` `6 2`, `8845275` `6 3`. Origin pre-existing; correction
+  улучшила один event, но оставшиеся два не закрыла. Это отдельная
+  event-scheduling parity, не correct-top publication; следующий
+  focused шаг — сверить oldpc/pc на back-edge и line-hook completion,
+  затем C/Lua hook differential с yield/re-entry. Perf-evidence закрыт,
+  stripped-пункт открыт: заявленный open-count 25 не уменьшается.
 
 - [ ] **C API: `lua_pushvalue(lua_upvalueindex(n))` возвращает не upvalue
   (BLOCKER, ORDINARY-BACKLOG)**. Независимый C-оракул
@@ -428,6 +450,24 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   error object). Нужен общий index2value/pseudo-index contract для всех
   принимающих индекс C API функций, не точечный guard в финализаторе.
   Open-count 25→26.
+  A1.next-cidx research (read-only, /tmp/opencode/cidx_report.md):
+  полный inventory ~163 export'ов: паритет сегодня только у 4 value-функций
+  (lua_type/toboolean/tointegerx/tonumberx через upvalueAt) и
+  getfield/setfield/ref/unref (registry); ~30 exported-функций молча
+  деградируют на псевдо-индексах (valueAt→cWindowSlot только реальные
+  слоты). Рекомендован дизайн C: typed writable-target resolver
+  api.State.index2target (stack_slot/upvalue_cell/registry/none union) +
+  read-helper; index2stack-класс (rotate/toclose/closeslot/pcallk-errfunc)
+  остаётся без псевдо — PUC api_check-parity. Подтверждённые расширения
+  класса (все pre-existing, дифференциалы cidx/): set-класс на upvalue —
+  lenient no-op БЕЗ pop операндов → stack-shape corruption (HIGH);
+  hook-лейн pushvalue no-op → C-окно читает регистры прерванного
+  Lua-фрейма (HIGH); lua_pushglobaltable сломан (HIGH, входит в класс);
+  LUA_REGISTRYINDEX-константа ≠ PUC 5.5 (-1001000 vs -(INT_MAX/2+1000),
+  MEDIUM, ABI-риск — решение владельца); lua_absindex без passthrough
+  (MEDIUM); tolstring/is* read-write асимметрия (MEDIUM);
+  acceptable-but-empty pushvalue обязан nil (MEDIUM). Готов к
+  implementation-cut (gates C1-C4 в отчёте §7).
 
 - [x] **Architecture A1 research (COMPLETED): единая GC lifetime/rooting/constructor
   модель**. Локальная `P16.50-review-16 correction`, ошибочно открытая ревьюером

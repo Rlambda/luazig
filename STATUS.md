@@ -45,6 +45,48 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
+- [x] **C API lauxlib argument-error parity после cidx (BLOCKER,
+  FIX-NOW).** В изменённом `luaL_checklstring`/`luaL_optlstring` путь
+  non-string теперь бросает ошибку, но вручную формирует другой error
+  object вместо PUC `tag_error` → `luaL_typeerror` → `luaL_argerror`.
+  Независимый C-дифференциал `/tmp/review_cidx_checklstring.c` на
+  `00a5ea0`: `lua_pcall` даёт status=2 в обеих реализациях, но PUC
+  возвращает `bad argument #1 to '?' (string expected, got boolean)`,
+  luazig — `bad argument #1 (string expected, got boolean)`.
+  `luaL_checkoption` использует такой же ручной error-путь для invalid
+  option. Первая неверная операция — `lua_pushfstring` с укороченным
+  шаблоном в `src/lua/c_api.zig`; исправить общим PUC-подобным
+  аргументным error-механизмом и проверить контекст имени функции,
+  метода/self, missing argument и `__name`. Cidx milestone не принят
+  полностью до correction этого изменённого пути; open-count 25→26.
+  CLOSED (lauxlib argerror correction): ОДИН общий PUC 5.5 путь
+  luaL_typeerror → luaL_argerror → luaL_error (lauxlib.c:171-208):
+  msg «%s expected, got %s» → where(L,1)-prefix + function-name
+  (getinfo "n"; ar.name==NULL → pushglobalfuncname через
+  registry._LOADED (pushGlobalFuncName pub; cFuncEqual для PUC VLCF
+  rawequal) или '?') + method/self-коррекция (arg--; arg==0 →
+  «calling '%s' on bad self (%s)») → «bad argument #N to 'NAME'
+  (EXTRA)» + concat + lua_error. luaL_checklstring/optlstring non-string
+  и luaL_typeerror → общий путь; luaL_checkoption invalid → luaL_argerror
+  («invalid option '%s'»). Контексты: host-C '?'-форма, missing
+  argument («no value»), lightuserdata, __name-metatable typearg,
+  Buffer-typearg, method/self, named-function, Lua call-sites. Evidence:
+  canonical 35_lauxlib_argerror (28 контекстов, host-pcall + Lua) —
+  byte-exact PUC 5.5 Debug+RF (reviewer-форма «bad argument #1 to '?'
+  (string expected, got boolean)» = PUC); negative-before pristine
+  6bfacc2 (без to '?') дословно; mutation короткого шаблона → RED →
+  revert. Гейты: 358/358 D+RF 0 leaks; matrix (свежий RF) zig_fail=0;
+  smoke PASS; c_api 24-35 DIFF PASS оба режима; api580 GREEN;
+  fmt/diff-check clean; perf — только cold error path (A/B
+  неприменим, обосновано). Документированная граница: PUC 5.5
+  ar.extraargs (CIST_CCMT __call-chain count) не персистится per-frame —
+  __call-достигнутые C-функции репортят chain-selfs как обычные
+  аргументы; смежно debug.getinfo("t").extraargs возвращает vararg-count
+  (zig 3 vs PUC 0, тот же корень) — ARCHITECTURAL-BACKLOG.
+  ORDINARY-BACKLOG: остальные ручные шаблоны (checkudata/checkinteger/
+  checktype/checkany/checknumber); LOW: debugFindGlobalFuncName
+  pointer-only compare.
+
 - [x] **A1.next review correction — warning финализатора при OOM (BLOCKER,
   FIX-NOW)**. Intrusive `allgc/finobj/tobefnz` и post-sweep `callfin`
   сохраняются: найденный дефект находится в новом error-path, а не в

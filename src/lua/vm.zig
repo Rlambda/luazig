@@ -52110,6 +52110,18 @@ pub const Vm = struct {
     /// and must have the metamethods.
     const TabCheck = struct { read: bool = false, write: bool = false, len: bool = false };
 
+    /// PUC `luaV_equalobj` function arm as used by findfield's rawequal:
+    /// a 0-upvalue C closure is luazig's shape for PUC's light C function
+    /// (pushcclosure n==0 pushes LUA_VLCF, compared by the function
+    /// pointer), so two fresh pushes of the same `lua_CFunction` are
+    /// equal; every other closure is PUC's heap-closure arm — object
+    /// identity.
+    fn cFuncEqual(a: *Closure, b: *Closure) bool {
+        if (a == b) return true;
+        if (a.c_func == null or b.c_func == null) return false;
+        return a.upvalues.len == 0 and b.upvalues.len == 0 and a.c_func.? == b.c_func.?;
+    }
+
     /// PUC `pushglobalfuncname` (lauxlib.c:74-92): search the registry
     /// `_LOADED` table for the function value — `findfield` with level 2
     /// walks each loaded module table's fields — and return the dotted
@@ -52119,7 +52131,7 @@ pub const Vm = struct {
     /// ("setmetatable"), exactly like PUC. Returns null when not found.
     /// The result is written into `buf` (no allocation — error paths must
     /// not be able to fail with OOM while building a message).
-    fn pushGlobalFuncName(self: *Vm, buf: []u8, func: Value) ?[]const u8 {
+    pub fn pushGlobalFuncName(self: *Vm, buf: []u8, func: Value) ?[]const u8 {
         const reg = self.registryTable() orelse return null;
         const loaded = switch (self.getFieldOpt(reg, "_LOADED") orelse return null) {
             .Table => |t| t,
@@ -52139,10 +52151,17 @@ pub const Vm = struct {
             for (mod_table.hash) |*field_node| {
                 if (!ltable.Node.isStringTag(field_node.key_tt)) continue;
                 if (field_node.value == .Nil) continue;
-                // Tag-guarded comparison (reading the wrong union payload
-                // is UB in ReleaseFast — see debugFindGlobalFuncName).
+                // PUC findfield matches with lua_rawequal. A 0-upvalue C
+                // closure is luazig's shape for PUC's light C function
+                // (lua_pushcclosure n==0 pushes LUA_VLCF; luaV_equalobj
+                // compares those by the function POINTER), so two fresh
+                // pushes of the same lua_CFunction match. Upvalue-carrying
+                // C closures and bytecode closures are PUC's heap-closure
+                // arm — object identity. Tag-guarded reads (wrong-union
+                // payload reads are UB in ReleaseFast — see
+                // debugFindGlobalFuncName).
                 const matches = switch (field_node.value) {
-                    .Closure => |cl| func == .Closure and cl == func.Closure,
+                    .Closure => |cl| func == .Closure and cFuncEqual(cl, func.Closure),
                     .Builtin => |b| func == .Builtin and b == func.Builtin,
                     else => false,
                 };

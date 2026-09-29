@@ -2706,10 +2706,12 @@ pub export fn luaL_checklstring(L: ?*lua_State, arg: c_int, l: ?*usize) [*:0]con
         if (l) |p| p.* = b.len;
         return @ptrCast(@constCast(b.ptr));
     }
-    // PUC tag_error: "bad argument #n (string expected, got <type>)".
-    const actual = if (s.typeOf(arg)) |ty| lua_typename(L, api.typeCode(ty)) else "no value";
-    _ = lua_pushfstring(L, "bad argument #%d (string expected, got %s)", arg, actual);
-    lua_error(L);
+    // PUC tag_error(L, arg, LUA_TSTRING): luaL_typeerror → luaL_argerror —
+    // the common argument error (function name, method/self, where-prefix).
+    // luaL_typeerror always raises through lua_error (noreturn) for a
+    // non-null state, which `s` above already proved.
+    _ = luaL_typeerror(L, arg, "string");
+    unreachable;
 }
 
 pub export fn luaL_setfuncs(L: ?*lua_State, reg: [*]const luaL_Reg, nup: c_int) void {
@@ -2856,16 +2858,10 @@ pub export fn luaL_optlstring(L: ?*lua_State, arg: c_int, def: ?[*:0]const u8, l
         }
         return def orelse "";
     }
-    // PUC: else luaL_checklstring — numbers convert in place; a
-    // non-convertible value raises the argerror (never a silent "").
-    const bytes = s.checklstring(arg) catch |e| cThrowOn(s.vm, L.?, e);
-    if (bytes) |b| {
-        if (l) |p| p.* = b.len;
-        return @ptrCast(@constCast(b.ptr));
-    }
-    const actual = if (ty) |t| lua_typename(L, api.typeCode(t)) else "no value";
-    _ = lua_pushfstring(L, "bad argument #%d (string expected, got %s)", arg, actual);
-    lua_error(L);
+    // PUC lauxlib.c:415-423: absent/nil → def; everything else is
+    // luaL_checklstring (numbers convert in place through the unified
+    // resolver; a non-convertible value raises the common argument error).
+    return luaL_checklstring(L, arg, l);
 }
 
 pub export fn luaL_checkoption(L: ?*lua_State, arg: c_int, def: ?[*:0]const u8, lst: [*]const ?[*:0]const u8) c_int {
@@ -2883,8 +2879,14 @@ pub export fn luaL_checkoption(L: ?*lua_State, arg: c_int, def: ?[*:0]const u8, 
     while (lst[i] != null) : (i += 1) {
         if (std.mem.eql(u8, bytes, std.mem.span(lst[i].?))) return @intCast(i);
     }
-    _ = lua_pushfstring(L, "bad argument #%d (invalid option '%s')", arg, bytes.ptr);
-    lua_error(L);
+    // PUC lauxlib.c:374-375: the invalid option goes through the common
+    // argument error. luaL_argerror always raises through lua_error
+    // (noreturn) for a non-null state; both luaL_optlstring and
+    // luaL_checklstring above returned a real string for `bytes`, so the
+    // state is live here.
+    const msg = lua_pushfstring(L, "invalid option '%s'", bytes.ptr);
+    _ = luaL_argerror(L, arg, msg);
+    unreachable;
 }
 
 /// PUC `luaL_where` (lauxlib.c:luaL_where): push a "source:line: " prefix
@@ -2934,23 +2936,80 @@ pub export fn luaL_where(L: ?*lua_State, lvl: c_int) void {
 }
 
 pub export fn luaL_typeerror(L: ?*lua_State, arg: c_int, tname: [*:0]const u8) c_int {
-    var s = api.State.fromHandle(L orelse return 0);
-    const ty = if (s.typeOf(arg)) |t| typeCode(t) else @as(c_int, -1);
-    _ = lua_pushfstring(L, "bad argument #%d (%s expected, got %s)", arg, tname, lua_typename(L, ty));
-    lua_error(L);
+    // PUC lauxlib.c:197-208: the "T expected, got X" extra message names
+    // the ARGUMENT's type — the __name metafield when it is a string, the
+    // special "light userdata" spelling, or the type name ("no value" for
+    // a missing argument) — and raises through the common luaL_argerror.
+    var typearg: ?[*:0]const u8 = null;
+    if (luaL_getmetafield(L, arg, "__name") == api.typeCode(.string)) {
+        typearg = lua_tolstring(L, -1, null);
+    }
+    if (typearg == null) {
+        if (lua_type(L, arg) == api.typeCode(.lightuserdata)) {
+            typearg = "light userdata";
+        } else {
+            typearg = lua_typename(L, lua_type(L, arg));
+        }
+    }
+    const msg = lua_pushfstring(L, "%s expected, got %s", tname, typearg);
+    return luaL_argerror(L, arg, msg);
 }
 
 pub export fn luaL_argerror(L: ?*lua_State, arg: c_int, extramsg: ?[*:0]const u8) c_int {
-    // PUC lauxlib.c:174-196: the where-prefix comes from level 1 (the
-    // Lua caller of this C function); level 0 is this C frame itself.
-    luaL_where(L, 1);
-    if (extramsg) |msg| {
-        _ = lua_pushfstring(L, "bad argument #%d (%s)", arg, msg);
-    } else {
-        _ = lua_pushfstring(L, "bad argument #%d", arg);
+    // PUC lauxlib.c:171-194: the message names the level-0 frame (this C
+    // function) — getinfo "n" reads the caller's call site; a method call
+    // shifts the numbering past the implicit self ("calling 'name' on bad
+    // self" when the self itself is the bad argument); an unnamed function
+    // falls back to pushglobalfuncname (the registry _LOADED search) or
+    // '?'. luaL_error prepends the where-prefix of the Lua caller (level
+    // 1). No level-0 frame at all: the bare "bad argument #n (msg)" form.
+    //
+    // PUC 5.5 also renumbers arguments behind a __call chain (ar.extraargs,
+    // the CIST_CCMT count read by getinfo 't'); luazig does not persist
+    // that count per frame, so a C function reached through a __call chain
+    // reports the chain's self arguments as regular arguments (documented
+    // boundary — see the correction report).
+    var ar: lua_Debug = .{};
+    if (lua_getstack(L, 0, &ar) == 0) {
+        return luaL_error(L, "bad argument #%d (%s)", arg, extramsg);
     }
-    lua_concat(L, 2);
-    lua_error(L);
+    _ = lua_getinfo(L, "n", &ar);
+    var argnum = arg;
+    if (ar.namewhat) |nw| {
+        if (std.mem.eql(u8, std.mem.span(nw), "method")) {
+            argnum -= 1;
+            if (argnum == 0) {
+                return luaL_error(L, "calling '%s' on bad self (%s)", ar.name, extramsg);
+            }
+        }
+    }
+    var name: [*:0]const u8 = "?";
+    if (ar.name) |n| {
+        name = n;
+    } else if (L) |h| {
+        // PUC pushglobalfuncname: search registry._LOADED for the level-0
+        // frame's function ("lib.field"; the "_G" module covers globals,
+        // printed unqualified). The name bytes are copied into buf — no
+        // rooting window needed on this cold error path.
+        const vm = h.vm;
+        const th = vm.current_thread orelse vm.main_thread orelse {
+            return luaL_error(L, "bad argument #%d to '%s' (%s)", argnum, name, extramsg);
+        };
+        const ci_raw = if (ar.i_ci) |ci| @intFromPtr(ci) else 0;
+        if (ci_raw != 0 and ci_raw - 1 < th.call_frames.len()) {
+            const fr = th.call_frames.getConstPtr(ci_raw - 1);
+            if (fr.func_slot < th.stack.len) {
+                var name_buf: [128]u8 = undefined;
+                if (vm.pushGlobalFuncName(&name_buf, th.stack[fr.func_slot])) |found| {
+                    // found.len < name_buf.len (pushGlobalFuncName bounds
+                    // it); NUL-terminate the copy for the %s argument.
+                    name_buf[found.len] = 0;
+                    name = @ptrCast(&name_buf);
+                }
+            }
+        }
+    }
+    return luaL_error(L, "bad argument #%d to '%s' (%s)", argnum, name, extramsg);
 }
 
 pub export fn luaL_error(L: ?*lua_State, fmt: [*:0]const u8, ...) c_int {

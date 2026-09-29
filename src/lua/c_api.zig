@@ -1531,8 +1531,10 @@ pub export fn lua_remove(L: ?*lua_State, idx: c_int) void {
 
 pub export fn lua_absindex(L: ?*lua_State, idx: c_int) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    // (c): pure index arithmetic, InvalidIndex-only → lenient 0.
-    return @intCast(s.absindex(idx) catch 0);
+    // PUC lua_absindex (lapi.c:166-170): pure arithmetic, no validation —
+    // pseudo/positive passthrough (even beyond top), 0 → count+1, negative
+    // window arithmetic (possibly negative). Infallible.
+    return s.absindex(idx);
 }
 
 pub export fn lua_checkstack(L: ?*lua_State, n: c_int) c_int {
@@ -2694,9 +2696,20 @@ pub export fn luaL_checklstring(L: ?*lua_State, arg: c_int, l: ?*usize) [*:0]con
         if (l) |p| p.* = 0;
         return "";
     });
-    const bytes = s.checklstring(arg);
-    if (l) |p| p.* = bytes.len;
-    return @ptrCast(@constCast(bytes.ptr));
+    // PUC luaL_checklstring (lauxlib.c:408-412): lua_tolstring (numbers
+    // convert IN PLACE through the unified resolver — stack slots, upvalue
+    // cells, the registry slot) + tag_error on NULL: a raise, never a
+    // silent "" (the old lenient "" misreported "missing string" as an
+    // empty one). OOM inside the conversion is LUA_ERRMEM.
+    const bytes = s.checklstring(arg) catch |e| cThrowOn(s.vm, L.?, e);
+    if (bytes) |b| {
+        if (l) |p| p.* = b.len;
+        return @ptrCast(@constCast(b.ptr));
+    }
+    // PUC tag_error: "bad argument #n (string expected, got <type>)".
+    const actual = if (s.typeOf(arg)) |ty| lua_typename(L, api.typeCode(ty)) else "no value";
+    _ = lua_pushfstring(L, "bad argument #%d (string expected, got %s)", arg, actual);
+    lua_error(L);
 }
 
 pub export fn luaL_setfuncs(L: ?*lua_State, reg: [*]const luaL_Reg, nup: c_int) void {
@@ -2843,27 +2856,34 @@ pub export fn luaL_optlstring(L: ?*lua_State, arg: c_int, def: ?[*:0]const u8, l
         }
         return def orelse "";
     }
-    const bytes = s.checklstring(arg);
-    if (l) |p| p.* = bytes.len;
-    return @ptrCast(@constCast(bytes.ptr));
+    // PUC: else luaL_checklstring — numbers convert in place; a
+    // non-convertible value raises the argerror (never a silent "").
+    const bytes = s.checklstring(arg) catch |e| cThrowOn(s.vm, L.?, e);
+    if (bytes) |b| {
+        if (l) |p| p.* = b.len;
+        return @ptrCast(@constCast(b.ptr));
+    }
+    const actual = if (ty) |t| lua_typename(L, api.typeCode(t)) else "no value";
+    _ = lua_pushfstring(L, "bad argument #%d (string expected, got %s)", arg, actual);
+    lua_error(L);
 }
 
 pub export fn luaL_checkoption(L: ?*lua_State, arg: c_int, def: ?[*:0]const u8, lst: [*]const ?[*:0]const u8) c_int {
-    var s = api.State.fromHandle(L orelse return -1);
-    var bytes: []const u8 = undefined;
-    if (s.tostring(arg)) |str| {
-        bytes = str;
-    } else if (def) |d| {
-        bytes = std.mem.span(d);
+    // PUC luaL_checkoption (lauxlib.c:366-377): the option name comes from
+    // luaL_optstring/luaL_checkstring — both lua_tolstring-based, so a
+    // NUMBER argument converts IN PLACE through the unified resolver
+    // (upvalue cells and the registry slot mutate like stack slots).
+    var bytes: [:0]const u8 = undefined;
+    if (def) |d| {
+        bytes = std.mem.span(luaL_optlstring(L, arg, d, null));
     } else {
-        _ = lua_pushfstring(L, "bad argument #%d (string expected)", arg);
-        lua_error(L);
+        bytes = std.mem.span(luaL_checklstring(L, arg, null));
     }
     var i: usize = 0;
     while (lst[i] != null) : (i += 1) {
         if (std.mem.eql(u8, bytes, std.mem.span(lst[i].?))) return @intCast(i);
     }
-    _ = lua_pushfstring(L, "bad argument #%d (invalid option)", arg);
+    _ = lua_pushfstring(L, "bad argument #%d (invalid option '%s')", arg, bytes.ptr);
     lua_error(L);
 }
 
@@ -3009,36 +3029,65 @@ pub export fn luaL_traceback(L: ?*lua_State, L1: ?*lua_State, msg: ?[*:0]const u
     buf.deinit(vm.alloc);
 }
 
+/// PUC `luaL_tolstring` (lauxlib.c:866-889): convert any value to a string,
+/// ALWAYS pushing the result (every branch pushes exactly one value) and
+/// returning the pushed string's bytes. Shape:
+///   - absindex FIRST (the __tostring call and the branch pushes move the
+///     stack — a relative idx must be pinned; pseudo indices pass through);
+///   - `__tostring` metamethod through luaL_callmeta (its result must be a
+///     string — a raise, never a silent coercion);
+///   - number: formatted COPY pushed (lua_numbertocstring + pushstring —
+///     NO in-place mutation of the target, unlike lua_tolstring);
+///   - string: pushvalue; boolean: "true"/"false"; nil: "nil";
+///   - default: `__name` metafield (or the type name) + "%s: %p" (pointer
+///     text — not byte-comparable across runtimes; excluded from the
+///     differential suite).
+/// Returns `lua_tolstring(L, -1, len)` — the pushed value's bytes.
 pub export fn luaL_tolstring(L: ?*lua_State, idx: c_int, l: ?*usize) [*:0]const u8 {
     var s = api.State.fromHandle(L orelse {
         if (l) |p| p.* = 0;
         return "";
     });
-    // PUC luaL_tolstring: lua_tolstring (number → luaS_new: OOM throws)
-    // then lua_pushfstring for type names (OOM throws) — never a silent
-    // "" (P16.50-review-5 B2).
-    if (s.tolstring(idx) catch |e| cThrowOn(s.vm, L.?, e)) |bytes| {
-        if (l) |p| p.* = bytes.len;
-        return @ptrCast(@constCast(bytes.ptr));
+    const abs = s.absindex(idx);
+    if (luaL_callmeta(L, abs, "__tostring") != 0) {
+        // __tostring ran: its result is on top and must be a string (PUC
+        // luaL_error — OOM inside the raise path is LUA_ERRMEM).
+        if (lua_isstring(L, -1) == 0) {
+            _ = lua_pushfstring(L, "'__tostring' must return a string");
+            lua_error(L);
+        }
+    } else {
+        switch (lua_type(L, abs)) {
+            3 => { // LUA_TNUMBER: formatted copy — NO in-place mutation
+                var buff: [64]u8 = undefined; // LUA_N2SBUFFSZ
+                const n = lua_numbertocstring(L, abs, &buff);
+                if (n > 0) {
+                    lua_pushlstring(L, &buff, @intCast(n - 1));
+                } else {
+                    // lua_type reported a number: unreachable (defensive).
+                    lua_pushnil(L);
+                }
+            },
+            4 => _ = lua_pushvalue(L, abs), // LUA_TSTRING
+            1 => lua_pushstring(L, if (lua_toboolean(L, abs) != 0) "true" else "false"),
+            0 => lua_pushstring(L, "nil"), // LUA_TNIL
+            else => {
+                // default: __name metafield or the type name + "%s: %p".
+                const tt = luaL_getmetafield(L, abs, "__name");
+                const ty = lua_type(L, abs);
+                const kind: [*:0]const u8 = if (tt == 4)
+                    (lua_tolstring(L, -1, null) orelse lua_typename(L, ty))
+                else
+                    lua_typename(L, ty);
+                _ = lua_pushfstring(L, "%s: %p", kind, lua_topointer(L, abs));
+                if (tt != 0) lua_remove(L, -2); // remove '__name'
+            },
+        }
     }
-    if (s.typeOf(idx)) |t| {
-        const name = switch (t) {
-            .nil => "nil",
-            .boolean => "true",
-            .table => "table: 0x0",
-            .function => "function: 0x0",
-            .userdata => "userdata: 0x0",
-            .thread => "thread: 0x0",
-            .lightuserdata => "lightuserdata: 0x0",
-            .number, .string => "value",
-        };
-        const ls = s.vm.internStr(name) catch |e| cThrowOn(s.vm, L.?, e);
-        s.push(.{ .String = ls }) catch |e| cThrowOn(s.vm, L.?, e);
-        if (l) |p| p.* = name.len;
-        return @ptrCast(@constCast(ls.bytes().ptr));
-    }
-    if (l) |p| p.* = 0;
-    return "";
+    // PUC: every branch pushed exactly one value; a string is on top
+    // (lua_assert(lua_isstring(L, -1)) there). The `orelse ""` is the
+    // defensive arm of that assert — unreachable by construction.
+    return lua_tolstring(L, -1, l) orelse "";
 }
 
 pub export fn luaL_len(L: ?*lua_State, idx: c_int) i64 {
@@ -3087,11 +3136,11 @@ pub export fn luaL_gsub(L: ?*lua_State, s_str: [*:0]const u8, p: [*:0]const u8, 
 
 pub export fn luaL_getmetafield(L: ?*lua_State, obj: c_int, event: [*:0]const u8) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    const abs = s.slot(obj) orelse return 0;
     // PUC lauxlib.c:884-897: lua_getmetatable covers EVERY value kind —
     // including the type-level slots (G(L)->mt[ttype(o)]) — not just
-    // table/userdata. No metatable → LUA_TNIL, stack unchanged.
-    const mt: *vm_mod.Table = s.vm.valueMetatable(s.curThread().stack[abs]) orelse return 0;
+    // table/userdata. index2value resolution: a pseudo obj addresses the
+    // value it resolves to. No metatable → LUA_TNIL, stack unchanged.
+    const mt: *vm_mod.Table = s.vm.valueMetatable(s.index2value(obj)) orelse return 0;
     // lua_pushstring + lua_rawget on the metatable — OOM is LUA_ERRMEM
     // (P16.50-review-5 B2 — the old `catch return 0` misreported "no
     // metamethod").
@@ -3107,15 +3156,24 @@ pub export fn luaL_getmetafield(L: ?*lua_State, obj: c_int, event: [*:0]const u8
 }
 
 pub export fn luaL_callmeta(L: ?*lua_State, obj: c_int, event: [*:0]const u8) c_int {
-    if (luaL_getmetafield(L, obj, event) == 0) return 0;
+    // PUC luaL_callmeta (lauxlib.c:900-906): absindex FIRST — a relative
+    // obj index must be pinned BEFORE luaL_getmetafield pushes the
+    // metafield (pushing obj after the push would push the METAFIELD, not
+    // the object). Pseudo indices pass through unchanged. No metafield →
+    // 0; otherwise lua_call (errors RAISE — no status return) and 1.
+    const abs = lua_absindex(L, obj);
+    if (luaL_getmetafield(L, abs, event) == 0) return 0;
     var s = api.State.fromHandle(L orelse return 0);
-    // PUC luaL_callmeta: lua_pushvalue → api_incr_top: OOM throws;
-    // InvalidIndex is api_check — lenient 0 (P16.50-review-5 B2).
-    s.pushvalue(obj) catch |e| switch (e) {
+    // PUC lua_pushvalue → api_incr_top: OOM throws; InvalidIndex is
+    // api_check — lenient 0 (P16.50-review-5 B2).
+    s.pushvalue(abs) catch |e| switch (e) {
         error.OutOfMemory => cThrowOn(s.vm, L.?, e),
         else => return 0,
     };
-    return lua_pcallk(L, 1, 1, 0, 0, null);
+    // PUC lua_call: a metamethod error propagates by raising (the old
+    // pcallk-status return misreported success as 0 — PUC returns 1).
+    lua_call(L, 1, 1);
+    return 1;
 }
 
 pub export fn luaL_requiref(L: ?*lua_State, modname: [*:0]const u8, openf: ?*const fn (?*lua_State) callconv(.c) c_int, glb: c_int) void {
@@ -3611,8 +3669,11 @@ const AuxUpvalue = struct {
 };
 
 fn auxUpvalue(s: *api.State, funcindex: c_int, n: c_int) ?AuxUpvalue {
-    const abs = s.slot(funcindex) orelse return null;
-    const cl = switch (s.curThread().stack[abs]) {
+    // PUC 5.5 aux_upvalue (lapi.c:1372-1391): index2value(L, funcindex) —
+    // a PSEUDO funcindex resolves through the unified resolver (an upvalue
+    // of the running C closure holding a closure addresses THAT closure's
+    // upvalues); a non-closure (nilvalue included) → NULL, no error.
+    const cl = switch (s.index2value(funcindex)) {
         .Closure => |c| c,
         // PUC aux_upvalue default arm: not a closure → NULL (no error).
         else => return null,
@@ -3688,12 +3749,12 @@ pub export fn lua_setupvalue(L: ?*lua_State, funcindex: c_int, n: c_int) ?[*:0]c
 
 pub export fn lua_upvalueid(L: ?*lua_State, fidx: c_int, n: c_int) ?*anyopaque {
     const s = api.State.fromHandle(L orelse return null);
-    const abs = s.slot(fidx) orelse return null;
-    const cl = switch (s.curThread().stack[abs]) {
+    // PUC 5.5 lua_upvalueid (lapi.c:1441-1459) via getupvalref:
+    // index2value(L, fidx) — a pseudo fidx resolves through the unified
+    // resolver; light C functions (LUA_VLCF) and non-functions → NULL (the
+    // api_check in the default arm is a release no-op).
+    const cl = switch (s.index2value(fidx)) {
         .Closure => |c| c,
-        // PUC lua_upvalueid (lapi.c:1441-1459): light C functions
-        // (LUA_VLCF) and non-functions → NULL (the api_check in the
-        // default arm is a release no-op).
         else => return null,
     };
     // PUC: LCL out-of-range → NULL (getupvalref's nullup); CCL out-of-range
@@ -3711,18 +3772,19 @@ pub export fn lua_upvalueid(L: ?*lua_State, fidx: c_int, n: c_int) ?*anyopaque {
 
 pub export fn lua_upvaluejoin(L: ?*lua_State, fidx1: c_int, n1: c_int, fidx2: c_int, n2: c_int) void {
     const s = api.State.fromHandle(L orelse return);
-    const abs1 = s.slot(fidx1) orelse return;
-    const abs2 = s.slot(fidx2) orelse return;
-    // PUC lua_upvaluejoin (lapi.c:1463-1470) via getupvalref: ONLY Lua
-    // closures participate (api_check ttisLclosure — a release no-op; the
-    // manual documents non-Lua-closure input as undefined behavior). We
-    // fail soft: a silent no-op for any non-Lua-closure or out-of-range
-    // index, keeping the C-API contract non-raising (P16.50-review-7 B1).
-    const cl1 = switch (s.curThread().stack[abs1]) {
+    // PUC 5.5 lua_upvaluejoin (lapi.c:1463-1470) via getupvalref:
+    // index2value on BOTH funcindices — pseudo indices resolve through
+    // the unified resolver.
+    // PUC lua_upvaluejoin via getupvalref: ONLY Lua closures participate
+    // (api_check ttisLclosure — a release no-op; the manual documents
+    // non-Lua-closure input as undefined behavior). We fail soft: a
+    // silent no-op for any non-Lua-closure or out-of-range index, keeping
+    // the C-API contract non-raising (P16.50-review-7 B1).
+    const cl1 = switch (s.index2value(fidx1)) {
         .Closure => |c| c,
         else => return,
     };
-    const cl2 = switch (s.curThread().stack[abs2]) {
+    const cl2 = switch (s.index2value(fidx2)) {
         .Closure => |c| c,
         else => return,
     };

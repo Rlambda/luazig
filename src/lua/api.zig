@@ -96,14 +96,6 @@ pub const State = struct {
         return vm_mod.Vm.cWindowSlot(self.curThread(), idx);
     }
 
-    /// The value at `idx` as a COPY. Callers may run nested execution (which
-    /// can grow — and therefore move — `th.stack`): a pointer into the stack
-    /// would dangle across growth, a copy cannot.
-    pub fn valueAt(self: *const State, idx: i32) ?vm_mod.Value {
-        const s = self.slot(idx) orelse return null;
-        return self.curThread().stack[s];
-    }
-
     /// PUC `LUA_REGISTRYINDEX` (lua.h:43): the registry pseudo-index.
     /// PUC 5.5 defines it as -(INT_MAX/2 + 1000); upvalue pseudo-indices are
     /// `LUA_REGISTRYINDEX - n` for n = 1, 2, ...
@@ -298,15 +290,18 @@ pub const State = struct {
         try self.popN(n);
     }
 
-    pub fn absindex(self: *State, idx: i32) ApiError!i32 {
-        if (idx == 0) return error.InvalidIndex;
-        const c = self.count();
-        if (idx > 0) {
-            if (normalizeIndex(idx, c) == null) return error.InvalidIndex;
-            return idx;
-        }
-        if (normalizeIndex(idx, c) == null) return error.InvalidIndex;
-        return @intCast(@as(i64, @intCast(c)) + @as(i64, idx) + 1);
+    /// PUC `lua_absindex` (lapi.c:166-170): pure index arithmetic with NO
+    /// validation — positive indices and pseudo-indices (registry and
+    /// upvalues, `ispseudo(i) == (i) <= LUA_REGISTRYINDEX`) pass through
+    /// unchanged, every other index (0 and the negative window) maps to
+    /// `(top - func) + idx` = count + 1 + idx. 0 yields count+1; a positive
+    /// index beyond top passes through as-is; a negative index below the
+    /// window can yield a negative result — PUC release does exactly this
+    /// arithmetic (the acceptable-index bound is api_check-only).
+    pub fn absindex(self: *State, idx: i32) i32 {
+        if (idx > 0 or idx <= LUA_REGISTRYINDEX) return idx;
+        const c: i64 = @intCast(self.count());
+        return @intCast(c + 1 + @as(i64, idx));
     }
 
     /// PUC `lua_checkstack` (lapi.c:lua_checkstack): ensure at least `n`
@@ -621,11 +616,25 @@ pub const State = struct {
     // Conversions (PUC lapi.c:lua_to*)
     // -----------------------------------------------------------------------
 
-    /// PUC `lua_tolstring` (lapi.c:lua_tolstring): convert value to string,
-    /// returning its bytes. For strings, returns the bytes directly. For
-    /// numbers (Int/Num), converts to a string representation IN PLACE on the
-    /// stack (replacing the original value), matching PUC's `tonumnsstr` +
-    /// `setobj2s` behavior. Returns null for non-convertible types.
+    /// PUC `lua_tolstring` (lapi.c:415-429): convert the resolved target to
+    /// a string IN PLACE — every writable target kind mutates (stack slot,
+    /// upvalue cell `upvals[n-1]->v.p`, registry `&G->l_registry`); PUC
+    /// re-resolves `o = index2value(L, idx)` after `luaC_checkGC` ("the
+    /// previous call may reallocate the stack"). Strings return their bytes
+    /// directly; non-convertible targets (and `.none`) return null.
+    ///
+    /// Realloc window: in luazig the conversion (`valueToInternedStr` →
+    /// `internStr`) never steps the GC (only `gcNoteAlloc`; the condGC
+    /// sites are `condGcFromDispatch`/`allocTable`/...), so the stack
+    /// cannot move inside the conversion — the re-resolve is kept as the
+    /// FORM (slot re-index, never a held raw pointer), and test 34's
+    /// GC-pressure section guards it. The upvalue arm runs the standard
+    /// prepare/`Cell.set`/commit barrier contract (as `lua_copy`'s upvalue
+    /// arm): PUC's `luaO_tostring` writes through the cell with NO barrier
+    /// — safe there only for OPEN cells (PUC keeps open upvalues gray,
+    /// lgc.c:350) and a release hazard for closed cells of a black owner
+    /// mid-cycle; the barrier is unobservable except by making the store
+    /// survive, which is PUC's own intent.
     ///
     /// The returned bytes are NUL-terminated in luazig's string storage
     /// (see `createLuaString`: `body[raw.len] = 0`), so the C shim can safely
@@ -641,28 +650,52 @@ pub const State = struct {
                 switch (th.stack[s]) {
                     .String => |st| return st.bytes(),
                     .Int, .Num => {
-                        // PUC lua_tolstring: convert number to string in place on stack.
+                        // PUC lua_tolstring: convert number to string in place.
                         // valueToInternedStr uses the same formatting as PUC's
                         // luaO_tostringbuff (%.14g equivalent + ".0" for integer floats).
                         const ls = self.vm.valueToInternedStr(th.stack[s]) catch |e| return mapDispatchError(e);
                         th.stack[s] = .{ .String = ls };
+                        // PUC re-resolves after luaC_checkGC; here the slot
+                        // re-index (no GC step inside the conversion — see
+                        // the doc comment) keeps the form.
                         return th.stack[s].String.bytes();
                     },
                     else => return null,
                 }
             },
-            // Read-only arms: a number-to-string in-place mutation of an
-            // upvalue cell or the registry slot writes through the target
-            // (PUC lapi.c re-resolves and setobj's it) — a writable-target
-            // concern; here strings return their bytes, everything else is
-            // not string-convertible.
-            .upvalue_cell => |c| return switch (c.get(self.vm)) {
-                .String => |st| st.bytes(),
-                else => null,
+            .upvalue_cell => |c| {
+                switch (c.get(self.vm)) {
+                    .String => |st| return st.bytes(),
+                    .Int, .Num => {
+                        // PUC mutates the upvalue cell in place
+                        // (luaO_tostring writes through upvals[n-1]->v.p).
+                        // Barrier contract as lua_copy's upvalue arm:
+                        // reserve BEFORE the observable store, commit after
+                        // (a prepare OOM leaves the cell untouched).
+                        const ls = self.vm.valueToInternedStr(c.get(self.vm)) catch |e| return mapDispatchError(e);
+                        const stored: vm_mod.Value = .{ .String = ls };
+                        const plan = self.vm.gcPrepareWriteBarrierCell(c, stored) catch |e| return mapVmError(e);
+                        c.set(self.vm, stored);
+                        self.vm.gcCommitWriteBarrierCell(c, stored, plan);
+                        return ls.bytes();
+                    },
+                    else => return null,
+                }
             },
-            .registry_slot => |p| return switch (p.*) {
-                .String => |st| st.bytes(),
-                else => null,
+            .registry_slot => |p| {
+                switch (p.*) {
+                    .String => |st| return st.bytes(),
+                    .Int, .Num => {
+                        // PUC mutates &G->l_registry in place (setobj into
+                        // the registry TValue) — plain store, NO barrier
+                        // (the atomic re-mark keeps a mid-cycle store alive,
+                        // PUC lgc.c:1553 parity, as lua_copy's registry arm).
+                        const ls = self.vm.valueToInternedStr(p.*) catch |e| return mapDispatchError(e);
+                        p.* = .{ .String = ls };
+                        return ls.bytes();
+                    },
+                    else => return null,
+                }
             },
             .none => return null,
         }
@@ -1194,7 +1227,13 @@ pub const State = struct {
     }
 
     pub fn getupvalue(self: *State, func_idx: i32, n: usize) ApiError!?[]const u8 {
-        const fv = self.valueAt(func_idx) orelse return error.InvalidIndex;
+        // PUC 5.5 aux_upvalue resolves funcindex through index2value — a
+        // pseudo funcindex addresses the value it resolves to (an upvalue
+        // of the running C closure holding a closure addresses THAT
+        // closure's upvalues). This debug-library path keeps its
+        // "function expected" raise for non-closures; the C API's
+        // aux_upvalue contract (NULL, no error) lives in c_api.zig.
+        const fv = self.index2value(func_idx);
         const dbg = try self.requireDebugModule();
         const f = self.vm.apiGetTable(dbg, .{ .String = try self.vm.internStr("getupvalue") }) catch |e| return mapVmError(e);
         var args = [_]vm_mod.Value{ fv, .{ .Int = @intCast(n) } };
@@ -1209,7 +1248,7 @@ pub const State = struct {
     pub fn setupvalue(self: *State, func_idx: i32, n: usize) ApiError!?[]const u8 {
         const th = self.curThread();
         if (self.count() == 0) return error.InvalidState;
-        const fv = self.valueAt(func_idx) orelse return error.InvalidIndex;
+        const fv = self.index2value(func_idx);
         const set_val = th.stack[th.top - 1];
         const dbg = try self.requireDebugModule();
         const f = self.vm.apiGetTable(dbg, .{ .String = try self.vm.internStr("setupvalue") }) catch |e| return mapVmError(e);
@@ -1448,13 +1487,14 @@ pub const State = struct {
         func: ?*const fn (?*vm_mod.lua_State) callconv(.c) c_int,
     };
 
-    /// Return the bytes of the string at `arg`, or "" on type mismatch.
-    pub fn checklstring(self: *State, arg: i32) []const u8 {
-        const v = self.valueAt(arg) orelse return "";
-        return switch (v) {
-            .String => |s| s.bytes(),
-            else => "",
-        };
+    /// PUC `luaL_checklstring` basis (lauxlib.c:408-412): `lua_tolstring` —
+    /// numbers convert IN PLACE through the unified resolver (stack slots,
+    /// upvalue cells, the registry slot all mutate like PUC's single
+    /// `luaO_tostring` write through the resolved TValue*). Returns null
+    /// for non-convertible targets; the C shim raises the PUC argerror
+    /// (`tag_error`) there. OOM is LUA_ERRMEM (the conversion allocates).
+    pub fn checklstring(self: *State, arg: i32) ApiError!?[]const u8 {
+        return self.tolstring(arg);
     }
 
     /// Store the top value in table `t` under a fresh integer key and return
@@ -1574,8 +1614,11 @@ pub const State = struct {
     }
 
     /// Check if value at `ud` is a userdata with metatable `tname`.
+    /// PUC luaL_testudata: `lua_fulluserdata` through the unified resolver
+    /// (a pseudo-index addresses the value it resolves to); `.none` reads
+    /// as nil → null.
     pub fn testudata(self: *State, ud: i32, tname: []const u8) ?*anyopaque {
-        const v = self.valueAt(ud) orelse return null;
+        const v = self.index2value(ud);
         if (v != .Userdata) return null;
         const reg = self.vm.registryTable() orelse return null;
         const key = self.vm.internStr(tname) catch return null;
@@ -1591,9 +1634,12 @@ pub const State = struct {
         return self.testudata(ud, tname);
     }
 
-    /// Return integer at `arg` or error.
+    /// Return integer at `arg` or error. PUC luaL_checkinteger basis:
+    /// `lua_tointegerx` through the unified resolver — a `.none` target
+    /// reads as nil and lands in the type error (PUC tag_error "number
+    /// expected, got no value").
     pub fn checkinteger(self: *State, arg: i32) ApiError!i64 {
-        const v = self.valueAt(arg) orelse return error.InvalidIndex;
+        const v = self.index2value(arg);
         return switch (v) {
             .Int => |i| i,
             .Num => |n| if (std.math.floor(n) == n and n >= -9.2233720368548e18 and n <= 9.2233720368548e18)
@@ -1604,9 +1650,10 @@ pub const State = struct {
         };
     }
 
-    /// Return integer at `arg` or `def` if nil/absent.
+    /// Return integer at `arg` or `def` if nil/absent. PUC luaL_optinteger:
+    /// `lua_isnoneornil` (a `.none` target reads as nil) → def.
     pub fn optinteger(self: *State, arg: i32, def: i64) ApiError!i64 {
-        const v = self.valueAt(arg) orelse return def;
+        const v = self.index2value(arg);
         return switch (v) {
             .Int => |i| i,
             else => def,
@@ -1898,7 +1945,7 @@ test "api stack reorder primitives" {
     try st.pushinteger(10);
     try st.pushinteger(20);
     try st.pushinteger(30);
-    try std.testing.expectEqual(@as(i32, 3), try st.absindex(-1));
+    try std.testing.expectEqual(@as(i32, 3), st.absindex(-1));
 
     try st.copy(1, 3);
     try std.testing.expectEqual(@as(i64, 10), st.tointeger(3).?);

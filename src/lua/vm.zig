@@ -5476,13 +5476,6 @@ pub const Vm = struct {
     /// Teardown restores the backing allocator before destroying it.
     c_alloc_bridge: ?*CAllocBridge = null,
 
-    /// Monotonic counter backing `luaL_ref` (PUC lauxlib's `t->alref`).
-    /// Each successful ref allocates the next integer key in the registry
-    /// table, mirroring PUC's scheme where freed refs are recycled via a
-    /// free-list. We use a plain growing counter for now; correctness of the
-    /// ref→value mapping does not depend on recycling.
-    c_ref_counter: i64 = 0,
-
     /// PUC `CLIBS` (loadlib.c:54): cache of opened C shared-library handles.
     /// Maps absolute or relative path → dlopen handle. PUC stores this in the
     /// registry under `"_CLIBS"`; we store it directly on the Vm for

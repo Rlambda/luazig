@@ -2678,12 +2678,13 @@ pub export fn lua_setiuservalue(L: ?*lua_State, idx: c_int, n: c_int) c_int {
 
 pub export fn lua_getiuservalue(L: ?*lua_State, idx: c_int, n: c_int) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    return typeCode(s.getiuservalue(idx, @intCast(@max(n, 0))) catch |e| switch (e) {
-        // OOM (result push) → LUA_ERRMEM; Type/InvalidIndex are PUC
-        // api_check — lenient LUA_TNONE-ish 0 (P16.50-review-5 B2).
+    // PUC lapi.c: n outside [1, nuvalue] or a non-userdata target pushes
+    // nil and returns LUA_TNONE (-1); OOM (the push) is LUA_ERRMEM.
+    const t = s.getiuservalue(idx, @intCast(@max(n, 0))) catch |e| switch (e) {
         error.OutOfMemory => cThrowOn(s.vm, L.?, e),
         else => return 0,
-    });
+    };
+    return if (t) |tt| typeCode(tt) else -1; // LUA_TNONE
 }
 
 // --- lauxlib ---
@@ -2710,12 +2711,16 @@ pub export fn luaL_newlib(L: ?*lua_State, reg: [*]const luaL_Reg) void {
 
 pub export fn luaL_ref(L: ?*lua_State, t: c_int) c_int {
     var s = api.State.fromHandle(L orelse return LUA_NOREF);
-    return s.ref(t);
+    // PUC luaL_ref: OOM inside the rawseti pair is luaM_error →
+    // LUA_ERRMEM, never a silent LUA_NOREF.
+    return s.ref(t) catch |e| cThrowOn(s.vm, L.?, e);
 }
 
 pub export fn luaL_unref(L: ?*lua_State, t: c_int, ref: c_int) void {
     var s = api.State.fromHandle(L orelse return);
-    s.unref(t, ref);
+    // PUC luaL_unref: OOM inside the rawseti pair is luaM_error →
+    // LUA_ERRMEM (the old swallow could leave a half-recycled freelist).
+    s.unref(t, ref) catch |e| cThrowOn(s.vm, L.?, e);
 }
 
 pub export fn luaL_newmetatable(L: ?*lua_State, tname: [*:0]const u8) c_int {

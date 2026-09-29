@@ -859,9 +859,12 @@ pub const State = struct {
     pub fn gettable(self: *State, idx: i32) ApiError!Type {
         const th = self.curThread();
         if (self.count() == 0) return error.InvalidState;
-        const s = self.slot(idx) orelse return error.InvalidIndex;
         const key = th.stack[th.top - 1];
-        const object = th.stack[s];
+        // PUC lua_gettable: t = index2value(L, idx) — every resolved form
+        // (stack slot, registry, upvalue cell, .none→nilvalue) flows into
+        // luaV_finishget; a non-table target raises the standard index
+        // error ("attempt to index a X value").
+        const object = self.index2value(idx);
         const out = self.vm.apiGetTable(object, key) catch |e| return mapVmError(e);
         th.top -= 1; // PUC lua_gettable: plain pop of the key
         try self.push(out);
@@ -871,22 +874,19 @@ pub const State = struct {
     pub fn settable(self: *State, idx: i32) ApiError!void {
         const th = self.curThread();
         if (self.count() < 2) return error.InvalidState;
-        const s = self.slot(idx) orelse return error.InvalidIndex;
         const value = th.stack[th.top - 1];
         const key = th.stack[th.top - 2];
-        const object = th.stack[s];
+        const object = self.index2value(idx);
         self.vm.apiSetTable(object, key, value) catch |e| return mapVmError(e);
         th.top -= 2; // PUC lua_settable: plain pop of value and key
     }
 
     pub fn getfield(self: *State, idx: i32, key: []const u8) ApiError!Type {
-        // PUC index2value(LUA_REGISTRYINDEX) = &G->l_registry: the slot
-        // VALUE itself, whatever it holds — a non-table slot flows into
-        // luaV_finishget and raises the standard index error.
-        const object: vm_mod.Value = if (idx == LUA_REGISTRYINDEX)
-            self.vm.l_registry
-        else
-            self.valueAt(idx) orelse return error.InvalidIndex;
+        // PUC auxgetstr: t = index2value(L, idx) — the registry slot and
+        // upvalue cells resolve through the same unified path; a non-table
+        // target (a .none target reads as nil) raises the standard index
+        // error through luaV_finishget.
+        const object = self.index2value(idx);
         const out = self.vm.apiGetTable(object, .{ .String = try self.vm.internStr(key) }) catch |e| return mapVmError(e);
         try self.push(out);
         return valueType(out);
@@ -895,19 +895,14 @@ pub const State = struct {
     pub fn setfield(self: *State, idx: i32, key: []const u8) ApiError!void {
         const th = self.curThread();
         if (self.count() == 0) return error.InvalidState;
-        const object: vm_mod.Value = if (idx == LUA_REGISTRYINDEX)
-            self.vm.l_registry
-        else blk: {
-            const s = self.slot(idx) orelse return error.InvalidIndex;
-            break :blk th.stack[s];
-        };
+        const object = self.index2value(idx);
         const value = th.stack[th.top - 1];
         self.vm.apiSetTable(object, .{ .String = try self.vm.internStr(key) }, value) catch |e| return mapVmError(e);
         th.top -= 1; // PUC auxsetstr: plain pop of the value
     }
 
     pub fn geti(self: *State, idx: i32, n: i64) ApiError!Type {
-        const object = self.valueAt(idx) orelse return error.InvalidIndex;
+        const object = self.index2value(idx);
         const out = self.vm.apiGetTable(object, .{ .Int = n }) catch |e| return mapVmError(e);
         try self.push(out);
         return valueType(out);
@@ -916,8 +911,7 @@ pub const State = struct {
     pub fn seti(self: *State, idx: i32, n: i64) ApiError!void {
         const th = self.curThread();
         if (self.count() == 0) return error.InvalidState;
-        const s = self.slot(idx) orelse return error.InvalidIndex;
-        const object = th.stack[s];
+        const object = self.index2value(idx);
         const value = th.stack[th.top - 1];
         self.vm.apiSetTable(object, .{ .Int = n }, value) catch |e| return mapVmError(e);
         th.top -= 1; // PUC lua_seti: plain pop of the value
@@ -926,13 +920,16 @@ pub const State = struct {
     pub fn rawget(self: *State, idx: i32) ApiError!Type {
         const th = self.curThread();
         if (self.count() == 0) return error.InvalidState;
-        const s = self.slot(idx) orelse return error.InvalidIndex;
-        const tbl = switch (th.stack[s]) {
-            .Table => |t| t,
-            else => return error.Type,
-        };
         const key = th.stack[th.top - 1];
-        const out = self.vm.apiRawGet(tbl, key);
+        // PUC lua_rawget: t = index2value(L, idx) with api_check "table
+        // expected" — release PUC dereferences a non-table target (a
+        // .none target reads as nil) as a Table (UB). Documented graceful
+        // deviation: the PUC success stack shape with a nil result (pop
+        // the key, push nil, return LUA_TNIL).
+        const out: vm_mod.Value = switch (self.index2value(idx)) {
+            .Table => |t| self.vm.apiRawGet(t, key),
+            else => .Nil,
+        };
         th.top -= 1; // PUC lua_rawget: plain pop of the key
         try self.push(out);
         return valueType(out);
@@ -941,27 +938,26 @@ pub const State = struct {
     pub fn rawset(self: *State, idx: i32) ApiError!void {
         const th = self.curThread();
         if (self.count() < 2) return error.InvalidState;
-        const s = self.slot(idx) orelse return error.InvalidIndex;
-        const tbl = switch (th.stack[s]) {
-            .Table => |t| t,
-            else => return error.Type,
-        };
         const value = th.stack[th.top - 1];
         const key = th.stack[th.top - 2];
-        self.vm.apiRawSet(tbl, key, value) catch |e| return mapVmError(e);
-        th.top -= 2; // PUC lua_rawset: plain pop of index and value
+        // PUC lua_rawset: api_check "table expected" — release PUC is UB
+        // on a non-table target. Documented graceful deviation: the PUC
+        // success stack shape (pop key and value) without the store.
+        switch (self.index2value(idx)) {
+            .Table => |t| self.vm.apiRawSet(t, key, value) catch |e| return mapVmError(e),
+            else => {},
+        }
+        th.top -= 2; // PUC lua_rawset: plain pop of key and value
     }
 
     pub fn rawgeti(self: *State, idx: i32, n: i64) ApiError!Type {
-        const object = if (idx == LUA_REGISTRYINDEX)
-            self.vm.l_registry
-        else
-            self.valueAt(idx) orelse return error.InvalidIndex;
-        const tbl = switch (object) {
-            .Table => |t| t,
-            else => return error.Type,
+        // PUC lua_rawgeti: t = index2value(L, idx) with api_check "table
+        // expected" — same documented graceful deviation as rawget (push
+        // nil, return LUA_TNIL for a non-table target).
+        const out: vm_mod.Value = switch (self.index2value(idx)) {
+            .Table => |t| self.vm.apiRawGet(t, .{ .Int = n }),
+            else => .Nil,
         };
-        const out = self.vm.apiRawGet(tbl, .{ .Int = n });
         try self.push(out);
         return valueType(out);
     }
@@ -969,17 +965,13 @@ pub const State = struct {
     pub fn rawseti(self: *State, idx: i32, n: i64) ApiError!void {
         const th = self.curThread();
         if (self.count() == 0) return error.InvalidState;
-        const tbl = if (idx == LUA_REGISTRYINDEX) blk: {
-            break :blk self.vm.registryTable() orelse return error.Type;
-        } else blk: {
-            const s = self.slot(idx) orelse return error.InvalidIndex;
-            break :blk switch (th.stack[s]) {
-                .Table => |t| t,
-                else => return error.Type,
-            };
-        };
         const value = th.stack[th.top - 1];
-        self.vm.apiRawSet(tbl, .{ .Int = n }, value) catch |e| return mapVmError(e);
+        // PUC lua_rawseti: api_check "table expected" — same documented
+        // graceful deviation as rawset (pop the value, no store).
+        switch (self.index2value(idx)) {
+            .Table => |t| self.vm.apiRawSet(t, .{ .Int = n }, value) catch |e| return mapVmError(e),
+            else => {},
+        }
         th.top -= 1; // PUC lua_rawseti: plain pop of the value
     }
 
@@ -990,13 +982,13 @@ pub const State = struct {
     /// `error.InvalidIndex` — a justified deviation since no real C code uses
     /// NULL pointer keys.
     pub fn rawgetp(self: *State, idx: i32, p: ?*anyopaque) ApiError!Type {
-        const object = self.valueAt(idx) orelse return error.InvalidIndex;
-        const tbl = switch (object) {
-            .Table => |t| t,
-            else => return error.Type,
-        };
         const key: *anyopaque = p orelse return error.InvalidIndex;
-        const out = self.vm.apiRawGet(tbl, .{ .LightUserdata = key });
+        // PUC lua_rawgetp: api_check "table expected" — same documented
+        // graceful deviation as rawget (push nil, return LUA_TNIL).
+        const out: vm_mod.Value = switch (self.index2value(idx)) {
+            .Table => |t| self.vm.apiRawGet(t, .{ .LightUserdata = key }),
+            else => .Nil,
+        };
         try self.push(out);
         return valueType(out);
     }
@@ -1007,14 +999,14 @@ pub const State = struct {
     pub fn rawsetp(self: *State, idx: i32, p: ?*anyopaque) ApiError!void {
         const th = self.curThread();
         if (self.count() == 0) return error.InvalidState;
-        const s = self.slot(idx) orelse return error.InvalidIndex;
-        const tbl = switch (th.stack[s]) {
-            .Table => |t| t,
-            else => return error.Type,
-        };
         const key: *anyopaque = p orelse return error.InvalidIndex;
         const value = th.stack[th.top - 1];
-        self.vm.apiRawSet(tbl, .{ .LightUserdata = key }, value) catch |e| return mapVmError(e);
+        // PUC lua_rawsetp: api_check "table expected" — same documented
+        // graceful deviation as rawset (pop the value, no store).
+        switch (self.index2value(idx)) {
+            .Table => |t| self.vm.apiRawSet(t, .{ .LightUserdata = key }, value) catch |e| return mapVmError(e),
+            else => {},
+        }
         th.top -= 1; // PUC lua_rawsetp: plain pop of the value
     }
 
@@ -1365,8 +1357,10 @@ pub const State = struct {
         // keeping the stack shape PUC has after the unconditional pop.
         switch (self.index2value(idx)) {
             .Userdata => |ud| {
-                const n_idx = n - 1;
-                if (n_idx >= ud.uservalues.len) {
+                // PUC lua_setiuservalue (lapi.c): n outside
+                // [1, nuvalue] → res = 0 with the unconditional pop (the
+                // uservalues stay untouched).
+                if (n < 1 or n > ud.uservalues.len) {
                     th.top -= 1; // PUC lua_setiuservalue: plain pop of the value
                     return false;
                 }
@@ -1383,7 +1377,7 @@ pub const State = struct {
                 // the observable store; prepare failure (OOM) leaves the
                 // uservalue unwritten.
                 const barrier = try self.vm.gcPrepareUserdataBarrierBack(ud, val);
-                ud.uservalues[n_idx] = val;
+                ud.uservalues[n - 1] = val;
                 self.vm.gcCommitUserdataBarrierBack(ud, barrier);
                 th.top -= 1; // PUC lua_setiuservalue: plain pop of the value
                 return true;
@@ -1395,21 +1389,28 @@ pub const State = struct {
         }
     }
 
-    /// Push the n-th uservalue from the userdata at `idx`.
-    pub fn getiuservalue(self: *State, idx: i32, n: usize) ApiError!Type {
+    /// Push the n-th uservalue from the userdata at `idx`. Returns null for
+    /// the LUA_TNONE forms (PUC lapi.c: n outside [1, nuvalue], or a
+    /// non-userdata target — the api_check class); the push still happens
+    /// (nil).
+    pub fn getiuservalue(self: *State, idx: i32, n: usize) ApiError!?Type {
         // PUC lua_getiuservalue resolves through index2value; a .none target
-        // reads as nil and takes the not-a-userdata arm (push nil).
+        // reads as nil and takes the not-a-userdata arm (push nil, LUA_TNONE).
         const v = self.index2value(idx);
         switch (v) {
             .Userdata => |ud| {
-                const n_idx = n - 1;
-                const val = if (n_idx < ud.uservalues.len) ud.uservalues[n_idx] else .Nil;
-                try self.push(val);
-                return valueType(val);
+                if (n >= 1 and n <= ud.uservalues.len) {
+                    const val = ud.uservalues[n - 1];
+                    try self.push(val);
+                    return valueType(val);
+                }
+                // PUC lapi.c:838-841: out-of-range n → push nil, LUA_TNONE.
+                try self.push(.Nil);
+                return null;
             },
             else => {
                 try self.push(.Nil);
-                return .nil;
+                return null;
             },
         }
     }
@@ -1457,8 +1458,11 @@ pub const State = struct {
     }
 
     /// Store the top value in table `t` under a fresh integer key and return
-    /// that key. Returns -1 (LUA_REFNIL) for nil, -2 (LUA_NOREF) on error.
-    pub fn ref(self: *State, t: i32) i32 {
+    /// that key (PUC 5.5 luaL_ref, lauxlib.c:707-727). Returns -1
+    /// (LUA_REFNIL) for nil, -2 (LUA_NOREF) for the api_check/UB class
+    /// (empty window, non-table `t`). OOM throws (PUC luaM_error →
+    /// LUA_ERRMEM).
+    pub fn ref(self: *State, t: i32) ApiError!i32 {
         const th = self.curThread();
         const top = self.count();
         if (top == 0) return -2;
@@ -1468,40 +1472,73 @@ pub const State = struct {
             return -1;
         }
 
-        const tbl = if (t == LUA_REGISTRYINDEX) blk: {
-            // The registry table from the slot; a non-table slot cannot
-            // hold refs (PUC would UB on hvalue — here a lenient -2).
-            break :blk self.vm.registryTable() orelse return -2;
-        } else blk: {
-            const s = self.slot(t) orelse return -2;
-            break :blk switch (th.stack[s]) {
-                .Table => |tt| tt,
-                else => return -2,
-            };
+        // PUC resolves t ONCE through lua_absindex before any stack
+        // movement; here the unified resolver (registry slot, upvalue
+        // cell, stack slot). A non-table target is the api_check/UB class
+        // (PUC release hvalues it) — lenient -2.
+        const tbl = switch (self.index2value(t)) {
+            .Table => |tt| tt,
+            else => return -2,
         };
-        const ref_key: i64 = self.vm.c_ref_counter;
-        self.vm.c_ref_counter += 1;
+
+        // The freed references form a linked list: t[1] is the head,
+        // t[t[1]] the second element, 0 the end (lauxlib.c:683-688).
+        // First access (t[1] nil/false — the registry ships t[1]=false)
+        // initializes t[1] = 0. A NUMBER t[1] that does not convert to a
+        // usable i32 (non-integral float, out-of-range integer — freelist
+        // corruption, PUC release UB) reads as 0: the empty-list path
+        // WITHOUT the init (PUC's number branch with lua_tointeger == 0).
+        var first_access = false;
+        var ref_id: i32 = switch (self.vm.apiRawGet(tbl, .{ .Int = 1 })) {
+            .Int => |i| if (i >= std.math.minInt(i32) and i <= std.math.maxInt(i32)) @intCast(i) else 0,
+            .Num => |f| if (f >= -2147483648.0 and f <= 2147483647.0 and @floor(f) == f)
+                @as(i32, @intFromFloat(f))
+            else
+                0,
+            else => blk: {
+                first_access = true;
+                break :blk 0;
+            },
+        };
+        if (first_access) {
+            self.vm.apiRawSet(tbl, .{ .Int = 1 }, .{ .Int = 0 }) catch |e| return mapVmError(e);
+            // PUC: ref = rawlen(t) + 1 — AFTER the t[1] init (the init
+            // itself bumps the border, so the first ref on a fresh table
+            // is 2).
+            ref_id = @intCast(self.vm.tableBorderLen(tbl) + 1);
+        } else if (ref_id == 0) {
+            // Empty freelist (t[1] == 0): a fresh reference.
+            ref_id = @intCast(self.vm.tableBorderLen(tbl) + 1);
+        } else {
+            // Recycle: t[1] = t[ref] (the popped slot's successor becomes
+            // the head).
+            const successor = self.vm.apiRawGet(tbl, .{ .Int = ref_id });
+            self.vm.apiRawSet(tbl, .{ .Int = 1 }, successor) catch |e| return mapVmError(e);
+        }
         // PUC luaL_ref: lua_rawseti pops the value (plain) after the store —
         // the value stays rooted on the window across the fallible store.
-        self.vm.apiRawSet(tbl, .{ .Int = ref_key }, val) catch return -2;
+        self.vm.apiRawSet(tbl, .{ .Int = ref_id }, val) catch |e| return mapVmError(e);
         th.top -= 1;
-        return @intCast(ref_key);
+        return ref_id;
     }
 
-    /// Release reference `ref` from table at `t` (PUC free-list recycling).
-    pub fn unref(self: *State, t: i32, ref_id: i32) void {
-        const tbl = if (t == LUA_REGISTRYINDEX) blk: {
-            break :blk self.vm.registryTable() orelse return;
-        } else blk: {
-            const v = self.valueAt(t) orelse return;
-            break :blk switch (v) {
-                .Table => |tt| tt,
-                else => return,
-            };
+    /// Release reference `ref` from table at `t` (PUC 5.5 luaL_unref,
+    /// lauxlib.c:730-737: freelist recycling at t[1]; negative refs are
+    /// no-ops). OOM throws (PUC luaM_error → LUA_ERRMEM).
+    pub fn unref(self: *State, t: i32, ref_id: i32) ApiError!void {
+        if (ref_id < 0) return; // PUC: `if (ref >= 0)` — negatives are no-ops
+        // PUC resolves t once through lua_absindex; a non-table target is
+        // the api_check/UB class (release hvalues it) — lenient no-op.
+        const tbl = switch (self.index2value(t)) {
+            .Table => |tt| tt,
+            else => return,
         };
-        const freelist = self.vm.apiRawGet(tbl, .{ .Int = 0 });
-        self.vm.apiRawSet(tbl, .{ .Int = @intCast(ref_id) }, freelist) catch {};
-        self.vm.apiRawSet(tbl, .{ .Int = 0 }, .{ .Int = @intCast(ref_id) }) catch {};
+        // t[ref] = t[1] (the head moves into the freed slot; the head
+        // value stays table-rooted until the t[1] overwrite below).
+        const head = self.vm.apiRawGet(tbl, .{ .Int = 1 });
+        self.vm.apiRawSet(tbl, .{ .Int = ref_id }, head) catch |e| return mapVmError(e);
+        // t[1] = ref (the freed slot becomes the head).
+        self.vm.apiRawSet(tbl, .{ .Int = 1 }, .{ .Int = ref_id }) catch |e| return mapVmError(e);
     }
 
     /// Create a table, store it in the registry under key `tname`, push it.

@@ -62,6 +62,30 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   дополнительно ошибочно отражает vararg-count. Сначала bounded research
   всех call/continuation/hook entry и ABI-перехода; не закрывать общей
   фразой про пройденные 28 контекстов. Open-count 25→26.
+  A1.next-ccmt research (read-only, /tmp/opencode/ccmt_report.md):
+  PUC-контракт сверен полностью (вкл. открытую PUC-квирку:
+  luaD_pretailcall Lua-ветка выбрасывает новый счётчик и переиспользует
+  stale-биты кадра — F7a: 2, F7b/F5c: 0; C-ветка коммитит в свежий
+  C-кадр F7c). Negative-before 23 формы / 17 расходятся: решающий
+  расхват + off-by-one предел (PUC 15 звеньев, zig 16 — оба пути),
+  чужой overflow-текст на resolveCallable-пути, vararg-count под именем
+  extraargs (3 vs 0), потеря счётчика на C-кадрах, после yieldk,
+  stale-preserve. Дизайн: владелец — уже объявленные мёртвые биты 8-11
+  callstatus (0 новых байт, CallFrame 88 ≤ 104); писатели — 3
+  choke-точки активации (stageFixedCall 17723, pushStagedBytecodeExec
+  Frame 17942, initBuiltinCFrame 9307); tailcall-reuse — НЕ писать =
+  PUC-parity; grep-полный inventory (2 резолюции-хелпера, 15
+  resolveCallable call-сайтов + 3 bytecode-цикла). Cut-план: Cut 1
+  frame-контракт + Lua getinfo 't' + предел/текст (гейт: Lua-формы
+  byte-exact); Cut 2 lua_Debug.extraargs ABI (sizeof 136→144,
+  extraargs@63 — измерено; header не менялся) + luaL_argerror
+  renumbering + пересборка tracked ELF. Perf: +2 ALU-опа на активацию
+  (без branch); обязательное измерение lua_calls + perf_compare.
+  Дополнительные findings: MEDIUM where-attribution runtime-ошибок при
+  текущем C-кадре (PUC без prefix, zig с — F4n17/F8n17, переживает
+  CCMT-фикс, ORDINARY-BACKLOG); UNCONFIRMED re-push C-кадра при
+  suspend (решающий эксперимент = F9-гейт Cut 1). Готов к
+  implementation после решения владельца.
 
 - [x] **C API lauxlib argument-error parity после cidx (BLOCKER,
   FIX-NOW).** В изменённом `luaL_checklstring`/`luaL_optlstring` путь

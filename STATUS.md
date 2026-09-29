@@ -45,6 +45,24 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
+- [ ] **PUC `CIST_CCMT` / `lua_Debug.extraargs` при `__call`-цепочке
+  (BLOCKER, ARCHITECTURAL-BACKLOG; cidx-corr review).** Коррекция
+  `8ac6808` исправила обычные lauxlib argument errors, но её явное
+  stop condition для `extraargs` не выполнено: per-frame count отсутствует,
+  `luaL_argerror` вызывает `lua_getinfo("n")` вместо PUC `"nt"`, а C API
+  `lua_Debug` не содержит поле `extraargs`. Независимый валидный C/Lua
+  differential `/tmp/review_clx_ccmt.c` (`t` имеет `__call=check`,
+  `check` вызывает `luaL_checklstring(L,1)`): PUC 5.5 возвращает
+  `bad extra argument #1 to 't' (string expected, got table)`, luazig —
+  `bad argument #1 to 't' (string expected, got table)` при одинаковом
+  error status. PUC `ldo.c:518–536` накапливает число `__call` в
+  `CIST_CCMT`, `ldebug.c:356–364` публикует его в `ar.extraargs`,
+  `lauxlib.c:171–195` применяет к слову и номеру аргумента. В luazig
+  `chain_depth` остаётся локальным, а `debug.getinfo("t").extraargs`
+  дополнительно ошибочно отражает vararg-count. Сначала bounded research
+  всех call/continuation/hook entry и ABI-перехода; не закрывать общей
+  фразой про пройденные 28 контекстов. Open-count 25→26.
+
 - [x] **C API lauxlib argument-error parity после cidx (BLOCKER,
   FIX-NOW).** В изменённом `luaL_checklstring`/`luaL_optlstring` путь
   non-string теперь бросает ошибку, но вручную формирует другой error

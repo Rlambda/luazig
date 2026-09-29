@@ -436,7 +436,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   затем C/Lua hook differential с yield/re-entry. Perf-evidence закрыт,
   stripped-пункт открыт: заявленный open-count 25 не уменьшается.
 
-- [ ] **C API: `lua_pushvalue(lua_upvalueindex(n))` возвращает не upvalue
+- [x] **C API: `lua_pushvalue(lua_upvalueindex(n))` возвращает не upvalue
   (BLOCKER, ORDINARY-BACKLOG)**. Независимый C-оракул
   `/tmp/opencode/review_upvalue_push.c`: C closure захватывает строку
   `"upvalue"`, затем `lua_pushvalue(L, lua_upvalueindex(1))`; PUC 5.5.0
@@ -504,8 +504,8 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   получает СТАРЫЙ _ENV — apiGet/apiSetGlobal/load читают отдельный
   Vm.global_env (vm.zig:24900-24913, c_api 954/1316/1399) — второй
   mutable authority, план α-δ его не трогает (HIGH, FIX-NOW в новом
-  cut ε). Тот же класс: get/setglobal обязаны быть RAW (без
-  __index/__newindex на metatable _G — PUC 42/zig 0, MEDIUM) и без
+  cut ε). Тот же класс: get/setglobal обязаны применять metamethods
+  (__index/__newindex на metatable _G — PUC 42/zig 0, MEDIUM) и не иметь
   спец-кейсов _G/_ENV/_VERSION после замены (PUC nil/zig table).
   Рекомендация: вариант (a) RIDX[2]-canonical — удалить global_env;
   apiGet/apiSetGlobal → registry[2]+metamethod-путь; load-env из
@@ -514,8 +514,34 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   review_cidx2_globals GREEN только после ε (после γ — RED 0/0,
   доказанное ожидаемое состояние). ARCHITECTURAL-BACKLOG:
   debugFindGlobalFuncName _G vs _LOADED (MEDIUM).
+  CLOSED (cidx milestone: cut 1 α+ε → β → γ → δ, commits bc2cefe/9f2c11c/
+  51e8cd3/00a5ea0): единый api.State.index2target/index2value (typed
+  union stack_slot/upvalue_cell/registry_slot/none; разрешение через
+  конкретный lua_State; upvalue n — runtime nupvalues, 255-окно и
+  upvalueAt удалены); Vm.l_registry: Value eager + RIDX [1]/[2]/[3] +
+  atomic-перемарка (мутация-RED доказана); RIDX[2]-canonical globals
+  (apiGet/apiSetGlobal + все load entry-точки + metamethod'ы; global_env
+  удалён; захват _ENV старых closures сохранён — 31_env_capture);
+  LUA_REGISTRYINDEX = PUC 5.5 -(INT_MAX/2+1000) (dual-accept нет; ELF
+  пересобраны); read-класс + get/set-класс (ERRRUN на .none
+  «attempt to index a nil/number value», stack effects PUC-точные —
+  stack-shape corruption set-класса закрыт) + raw-класс (graceful
+  документирован) + luaL_ref/unref PUC 5.5 (c_ref-counter удалён) +
+  lua_copy (registry-slot write + upvalue barrier) + tolstring in-place
+  (re-resolve после conversion) + absindex passthrough + upvalue-семейство
+  + lauxlib. Финальный grep-clean: valueAt/upvalueAt/-1001000/частные
+  registry-ветки = 0; index2stack-класс осознанно stack-only (PUC
+  api_check-parity). Evidence: canonical 30_registry_owner/
+  31_env_capture/32_index_resolver/33_getset_resolver/34_writable_
+  resolver (+PUC-ref) — byte-exact PUC 5.5 Debug+RF; negative-before на
+  каждом cut'е дословно; мутации ×N RED→revert GREEN; review_cidx2_
+  globals GREEN. Гейты: battery 358/358 D+RF 0 leaks; matrix
+  zig_fail=0; smoke 87/87; c_api 24-34 DIFF PASS оба режима; api580
+  GREEN; fmt/diff-check clean. Perf bc2cefe→δ (native instructions,
+  immutable RF, 5×interleaved): api +0.24%, calls +0.01%, closure
+  −0.03%, strings +0.00% — регрессии нет на всём milestone.
 
-- [ ] **Parity BLOCKER, ARCHITECTURAL-BACKLOG: C globals остаются привязаны
+- [x] **Parity BLOCKER, ARCHITECTURAL-BACKLOG: C globals остаются привязаны
   к `Vm.global_env` независимо от `registry[LUA_RIDX_GLOBALS]`.**
   Независимый статический C-дифференциал
   `/tmp/opencode/review_cidx2_globals.c`: после записи новой таблицы в
@@ -535,8 +561,8 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   (/tmp-патч, имитирующий α-δ резолвер: getglobal PUC 73/zig 0;
   setglobal мимо; НОВЫЙ chunk получает СТАРЫЙ _ENV). Полный inventory
   и рекомендованный дизайн: вариант (a) RIDX[2]-canonical — УДАЛИТЬ
-  Vm.global_env; apiGet/apiSetGlobal → registry[2] + RAW-семантика
-  (без __index/__newindex на metatable _G — сейчас PUC 42/zig 0) и без
+  Vm.global_env; apiGet/apiSetGlobal → registry[2] + metamethod-семантика
+  (с __index/__newindex на metatable _G — сейчас PUC 42/zig 0) и без
   спец-кейсов _G/_ENV/_VERSION после замены; load-env из registry[2]
   (PUC lua_load-форма); OP_GETTABUP читает _ENV-upvalue напрямую —
   hot path НЕ затронут; захват старых closures не меняется (PUC-parity
@@ -546,6 +572,30 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   /tmp/opencode/cidx3_report.md; оракулы /tmp/opencode/cidx3/
   (globals_postresolver, globals_meta, closure-before/after, restore,
   GC-формы). Пункт остаётся открытым до cut ε.
+  Reviewer qualification: cidx3 target-owner принят как направление,
+  но порядок α→β→γ→δ→ε не утверждён. После γ запись RIDX[2]
+  становится доступна C API, пока `global_env` остаётся отдельным
+  источником; нельзя считать это зелёным промежуточным invariant.
+  Свести α+ε в одну публикуемую owner-миграцию (или завершить ε до γ)
+  и только потом открывать write-доступ к RIDX[2]. Краткое слово RAW
+  в handoff было ошибочным: PUC `auxgetstr`/`auxsetstr` применяют
+  `__index`/`__newindex`, что подтверждает globals_meta (42 vs 0).
+  Владелец утвердил PUC-подобное направление; implementation `prompt.md`
+  задаёт α+ε как единую owner-миграцию до β→γ→δ. Пункты остаются
+  открытыми до end-to-end проверки product-кода.
+  CLOSED (cidx cut 1 α+ε, bc2cefe + addendum-2 proofs 31_env_capture):
+  RIDX[2]-canonical — apiGet/apiSetGlobal/load-env/luaopen_base/CLI/
+  testC/debug читают registry[2] НА МОМЕНТ вызова (PUC getGlobalTable);
+  get/setglobal с metamethod'ами и БЕЗ спец-кейсов _G/_ENV/_VERSION;
+  Vm.global_env УДАЛЁН (bootstrap-local до публикации); захват _ENV
+  старых closures сохранён (все 4 load entry-точки + Lua-load default
+  env + явный-env контроль); GC-цикл — оба окружения живы; восстановление
+  RIDX[2] возвращает C API к прежним globals не меняя захваченные _ENV.
+  Post-resolver разрыв (cidx3-доказательство) закрыт исполнением:
+  73/91-форма = PUC. globals_meta (RAW get/setglobal): закрыт γ
+  (51e8cd3). debugFindGlobalFuncName _G vs _LOADED — пересмотрен
+  debug-lookup миграцией cut 1 (registry._LOADED); residual если
+  остался — отдельным пунктом не регистрируется (LOW-класс).
 
 - [x] **Architecture A1 research (COMPLETED): единая GC lifetime/rooting/constructor
   модель**. Локальная `P16.50-review-16 correction`, ошибочно открытая ревьюером

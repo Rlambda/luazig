@@ -45,6 +45,20 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
+- [ ] **`lua_Debug` ABI-layout относительно PUC 5.5 (HIGH,
+  ARCHITECTURAL-BACKLOG; review A1.next-ccmt research).** Предложенный
+  Cut 2 добавляет `extraargs`, но сохраняет `ftransfer`/`ntransfer` как
+  `unsigned short`/`u16`, тогда как PUC `lua.h` задаёт оба поля как `int`.
+  Совпадение общего размера 144 B случайно: в предложенной Zig-схеме
+  `ftransfer@66`, `ntransfer@68`, `short_src@70`, а у PUC соответственно
+  `@68`, `@72`, `@76` (`i_ci@136` в обоих). C-клиент, собранный с PUC
+  header, прочтёт неверные поля, несмотря на совпадение `sizeof`.
+  Negative-before: текущий Zig header даёт 136 B и `ftransfer@64`, PUC —
+  144 B и `@68` (измерено ABI-probe из research). До implementation
+  нужен полный `sizeof`/`offsetof`-контракт для C и Zig, включая transfer-
+  поля, hook/getinfo writes и пересборку tracked ELF. Не считать один
+  `sizeof=144` доказательством совместимости. Open-count 26→27.
+
 - [ ] **PUC `CIST_CCMT` / `lua_Debug.extraargs` при `__call`-цепочке
   (BLOCKER, ARCHITECTURAL-BACKLOG; cidx-corr review).** Коррекция
   `8ac6808` исправила обычные lauxlib argument errors, но её явное
@@ -84,8 +98,41 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   Дополнительные findings: MEDIUM where-attribution runtime-ошибок при
   текущем C-кадре (PUC без prefix, zig с — F4n17/F8n17, переживает
   CCMT-фикс, ORDINARY-BACKLOG); UNCONFIRMED re-push C-кадра при
-  suspend (решающий эксперимент = F9-гейт Cut 1). Готов к
-  implementation после решения владельца.
+  suspend (решающий эксперимент = F9-гейт Cut 1). Заявленная готовность
+  к implementation опровергнута ревью: handoff пока INCONCLUSIVE из-за
+  несовместимого предложенного ABI-layout (отдельный
+  HIGH-пункт выше) и недоказанного F9 owner через yieldk/re-push;
+  назначена bounded verification в `prompt.md`.
+  A1.next-ccmt-v verification (/tmp/opencode/ccmtv_report.md) — обоим
+  контрактам дан вердикт:
+  (1) ABI: base-контракт НЕСОВМЕСТИМ (равный sizeof ≠ layout) —
+  измерено трёхсторонне: PUC extraargs u8@63 / ftransfer+ntransfer
+  INT@68/72 (int обязателен: Lua-route select-probe пишет
+  ntransfer=70001) / short_src@76 / i_ci@136 / sizeof 144; текущий zig
+  — u16@64/66, extraargs нет, sizeof 136. Cut-2 ЗАМЕНЁН PUC-layout
+  контрактом: lua.h + c_api.zig int-поля + getinfo 'r'-arm (найдено:
+  'r' сейчас `else => {}` — transfer-поля НИКОГДА не пишутся,
+  0xAA-утечка через header) + pub CIST_CCMT/MAX_CCMT; миграция
+  verified-building в /tmp-копии; positive cross-read: PUC-header
+  C-клиент + Cut-2 zig lib = byte-identical PUC baseline. Гейты:
+  comptime asserts + api580 run_size_probe D/RF + пересборка всех 35
+  tests/c_api ELF (+-puc).
+  (2) F9: вердикт (a) — C-кадр ПЕРЕЖИВАЕТ yieldk/resume;
+  BytecodePendingCall.ccmt УДАЛЕНО из дизайна (никакой второй копии).
+  Трейс обоих движков: zig frame idx=2/fs=6 pushed once, k сохранён,
+  keep при yield, finishCcall/contShim на ТОМ ЖЕ кадре, argerror
+  читает его; PUC: тот же ci от precallC через yieldk/resume
+  (cs=0x8102 = CIST_C|CCMT=1). Расширения: F9b pcallk error-recovery —
+  YPCALL-кадр переживает unwind обоих движков; F9c coroutine.close —
+  кадр выбрасывается forcedCloseResetCChain→discardCFrame (PUC
+  resetCI-parity), свежие __close-кадры получают CCMT от своей
+  резолюции. Base-finding re-push (UNCONFIRMED) ЗАКРЫТ.
+  NEW (отдельные задачи, не CCMT): pcallk-continuation window
+  divergence — PUC кладёт error-object на arg1 для k, zig оставляет
+  nil (f9b_window: arg1_type=table vs nil при том же top) — C-API
+  parity-кандидат; oracle-hygiene: vendored PUC lib крэшится в
+  lua_close после ≥43 raw C-push (C-пробы через _exit/Lua-routes).
+  Дизайн готов к implementation после ревью владельцем.
 
 - [x] **C API lauxlib argument-error parity после cidx (BLOCKER,
   FIX-NOW).** В изменённом `luaL_checklstring`/`luaL_optlstring` путь

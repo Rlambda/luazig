@@ -2965,10 +2965,11 @@ pub export fn luaL_argerror(L: ?*lua_State, arg: c_int, extramsg: ?[*:0]const u8
     // 1). No level-0 frame at all: the bare "bad argument #n (msg)" form.
     //
     // PUC 5.5 also renumbers arguments behind a __call chain (ar.extraargs,
-    // the CIST_CCMT count read by getinfo 't'); luazig does not persist
-    // that count per frame, so a C function reached through a __call chain
-    // reports the chain's self arguments as regular arguments (documented
-    // boundary — see the correction report).
+    // the CIST_CCMT count read by getinfo 't'); the count is persisted per
+    // frame (callstatus bits 8-11, vm.zig), but the C-side lua_Debug has no
+    // extraargs field yet and this renumbering branch is not implemented —
+    // a C function reached through a __call chain reports the chain's self
+    // arguments as regular arguments (known boundary).
     var ar: lua_Debug = .{};
     if (lua_getstack(L, 0, &ar) == 0) {
         return luaL_error(L, "bad argument #%d (%s)", arg, extramsg);

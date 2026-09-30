@@ -1473,9 +1473,19 @@ const MAXRESULTS: i32 = 250;
 
 /// PUC callstatus flag bits (`lstate.h:222-254`).
 /// Low 8 bits are CIST_NRESULTS (nresults+1). Upper bits are flags.
-/// Bits 8-11: CIST_CCMT — __call metamethod count.
+/// Bits 8-11: CIST_CCMT — __call metamethod count. SINGLE persistent
+/// owner: written ONLY at frame activation (pushStagedFast /
+/// pushStagedBytecodeExecFrame / initBuiltinCFrame) from the resolution
+/// site's local counter (PUC ldo.c tryfuncTM accumulates into `status`,
+/// prepCallInfo commits it once into the callee's callstatus). Tailcall
+/// frame reuse never rewrites it (PUC luaD_pretailcall keeps the Lua
+/// frame's stale bits); read by debug.getinfo 't' (extraargs).
 const CIST_CCMT: u32 = 8; // shift count, not mask
 const MAX_CCMT: u32 = 0xf << CIST_CCMT;
+/// PUC MAX_CCMT semantics: at most 15 committed __call links per
+/// activation; the 16th link is rejected with "'__call' chain too long"
+/// (checked AFTER a successful __call lookup, ldo.c tryfuncTM).
+const MAX_CCMT_LINKS: u32 = MAX_CCMT >> CIST_CCMT;
 /// Bits 12-14: CIST_RECST — recover status (error during pcallk).
 const CIST_RECST: u32 = 12; // shift count
 /// Bit 15: CIST_C — C function frame (discriminator).
@@ -7365,7 +7375,7 @@ pub const Vm = struct {
                 // its caller — an owned slice (T.testC) is returned directly
                 // (freeing the unused window); a window result is trimmed to
                 // the produced count as before.
-                const bres = try exposeDispatchResult(BuiltinResult, self.callBuiltin(id, resolved.args, outs, .host));
+                const bres = try exposeDispatchResult(BuiltinResult, self.callBuiltin(id, resolved.args, outs, .host, resolved.ccmt));
                 switch (bres) {
                     .owned => |vals| {
                         self.alloc.free(outs);
@@ -7388,7 +7398,7 @@ pub const Vm = struct {
                     },
                 }
             },
-            .Closure => |cl| return exposeDispatchResult([]Value, self.runClosure(cl, resolved.args)),
+            .Closure => |cl| return exposeDispatchResult([]Value, self.runClosure(cl, resolved.args, resolved.ccmt)),
             else => unreachable,
         }
     }
@@ -9251,7 +9261,7 @@ pub const Vm = struct {
     /// for caller-held stack slices on the synchronous callBuiltin path
     /// (callers re-derive their slices only when true; PUC's C stack never
     /// moves, so PUC re-derives nothing).
-    fn pushBuiltinCFrame(self: *Vm, callee: Value) std.mem.Allocator.Error!bool {
+    fn pushBuiltinCFrame(self: *Vm, callee: Value, ccmt: u4) std.mem.Allocator.Error!bool {
         const th = self.activeBytecodeThread();
         // Place callee on the thread's bytecode stack (PUC: ci->func points
         // into L->stack).
@@ -9282,7 +9292,7 @@ pub const Vm = struct {
             th.top = func_slot;
             return err;
         };
-        self.initBuiltinCFrame(th, slot, func_slot);
+        self.initBuiltinCFrame(th, slot, func_slot, ccmt);
         // P16.41 Cut 1: builtin C-frames are REAL and VISIBLE, exactly like
         // PUC CallInfos for C functions. Every builtin call site in PUC Lua
         // pushes a CallInfo (luaD_precall C branch); debug.getinfo levels,
@@ -9304,7 +9314,7 @@ pub const Vm = struct {
     /// its func_slot points. The staged push additionally writes the
     /// callee at a fresh top slot; the view push points func_slot at the
     /// caller's existing callee slot and sets CIST_VIEW.
-    fn initBuiltinCFrame(self: *Vm, th: *Thread, slot: *CallFrame, func_slot: usize) void {
+    fn initBuiltinCFrame(self: *Vm, th: *Thread, slot: *CallFrame, func_slot: usize, ccmt: u4) void {
         _ = self;
         slot.* = .{
             .func_slot = func_slot, // base derived: func_slot + 1
@@ -9338,6 +9348,10 @@ pub const Vm = struct {
         // has no proto (no bytecode), so the CIST_C bit is the explicit
         // discriminator — mirroring PUC `prepCallInfo` for C functions.
         slot.setC();
+        // CIST_CCMT commit point for C activations (PUC prepCallInfo):
+        // `ccmt` is the __call-chain length resolved by the caller
+        // (0 for every non-chain invocation).
+        slot.callstatus |= @as(u32, ccmt) << CIST_CCMT;
     }
 
     /// P16.41 Cut 3 Variant A — push a VIEW C-frame over the caller's
@@ -9367,10 +9381,10 @@ pub const Vm = struct {
     /// — view frames are pushed ONLY from bytecode dispatch, never above
     /// another C frame. The restore sites rely on this to derive the view
     /// frame's stack top as below.windowTop().
-    fn pushBuiltinCFrameAt(self: *Vm, func_slot: usize) std.mem.Allocator.Error!void {
+    fn pushBuiltinCFrameAt(self: *Vm, func_slot: usize, ccmt: u4) std.mem.Allocator.Error!void {
         const th = self.activeBytecodeThread();
         const slot = try th.call_frames.addOne(self.alloc);
-        self.initBuiltinCFrame(th, slot, func_slot);
+        self.initBuiltinCFrame(th, slot, func_slot, ccmt);
         slot.setView();
         // P16.41 Cut 1: view frames are REAL and VISIBLE like every builtin
         // C-frame (see pushBuiltinCFrame). P16.27 T0.1: increment only after
@@ -9388,7 +9402,7 @@ pub const Vm = struct {
     /// (they run through runClosure → runBytecodeInternal), matching PUC
     /// where a coroutine's base_ci has no pmain below it.
     pub fn pushHostEntryCFrame(self: *Vm) std.mem.Allocator.Error!void {
-        _ = try self.pushBuiltinCFrame(.{ .Builtin = .host_entry });
+        _ = try self.pushBuiltinCFrame(.{ .Builtin = .host_entry }, 0);
     }
 
     /// Pop the host entry C-frame pushed by pushHostEntryCFrame. Must be
@@ -12138,6 +12152,7 @@ pub const Vm = struct {
                     staged.func_slot,
                     staged.nargs,
                     0,
+                    resolved.ccmt,
                 ) catch |push_err| {
                     self.rollbackBytecodeCloseChild(exec_frames, parent_index, state);
                     return push_err;
@@ -12458,6 +12473,7 @@ pub const Vm = struct {
             .pending => PendingPayload,
             .simple_result => SimpleResultPayload,
         },
+        ccmt: u4,
     ) DispatchError!void {
         // P16.37: the value stack is Thread-owned; metamethod/continuation
         // activations run on the active thread's frames (a coroutine switch
@@ -12553,6 +12569,7 @@ pub const Vm = struct {
                 staged.func_slot,
                 staged.nargs,
                 cont_nresults,
+                ccmt,
             );
             // The debug name must be recorded BEFORE the CALL hook fires:
             // PUC's hook-time getinfo('n') resolves the metamethod name
@@ -12593,6 +12610,7 @@ pub const Vm = struct {
                     staged.func_slot,
                     staged.nargs,
                     -1,
+                    ccmt,
                 )) == null) {
                     try self.pushStagedBytecodeExecFrame(
                         th,
@@ -12601,6 +12619,7 @@ pub const Vm = struct {
                         staged.func_slot,
                         staged.nargs,
                         -1,
+                        ccmt,
                     );
                 }
             } else {
@@ -12617,6 +12636,7 @@ pub const Vm = struct {
                     staged.func_slot,
                     staged.nargs,
                     -1,
+                    ccmt,
                 );
             }
             // No setDebugName — debug name is derived from simple_result_event
@@ -12657,7 +12677,7 @@ pub const Vm = struct {
             .completion = completion,
             .debug_namewhat = debug_namewhat,
             .debug_name = debug_name,
-        });
+        }, resolved.ccmt);
         return true;
     }
 
@@ -12723,6 +12743,7 @@ pub const Vm = struct {
                 .debug_namewhat = "metamethod",
                 .debug_name = tag_method.opname(event),
             },
+            0,
         );
         return true;
     }
@@ -12888,6 +12909,7 @@ pub const Vm = struct {
                     metamethod.Closure,
                     .{ p1, p2 },
                     .{ .event = event, .completion = completion },
+                    0,
                 );
                 return .pushed;
             }
@@ -12940,6 +12962,7 @@ pub const Vm = struct {
                     cl,
                     resolved.args,
                     .{ .event = event, .completion = completion },
+                    resolved.ccmt,
                 );
                 return .pushed;
             },
@@ -12974,12 +12997,12 @@ pub const Vm = struct {
         return switch (resolved.callee) {
             .Builtin => |id| blk: {
                 var out: [1]Value = .{.Nil};
-                const bres = try self.callBuiltin(id, resolved.args, out[0..], .host);
+                const bres = try self.callBuiltin(id, resolved.args, out[0..], .host, resolved.ccmt);
                 _ = self.consumeBuiltinResult(bres, out[0..]);
                 break :blk out[0];
             },
             .Closure => |cl| blk: {
-                const ret = try self.runClosure(cl, resolved.args);
+                const ret = try self.runClosure(cl, resolved.args, resolved.ccmt);
                 defer self.alloc.free(ret);
                 break :blk if (ret.len > 0) ret[0] else .Nil;
             },
@@ -13192,7 +13215,7 @@ pub const Vm = struct {
             self.cancelPendingHookCall(exec_frames, parent_index);
             return err;
         };
-        self.pushStagedBytecodeExecFrame(th, exec_frames, proto, staged_hook.func_slot, staged_hook.nargs, -1) catch |err| {
+        self.pushStagedBytecodeExecFrame(th, exec_frames, proto, staged_hook.func_slot, staged_hook.nargs, -1, 0) catch |err| {
             self.cancelPendingHookCall(exec_frames, parent_index);
             return err;
         };
@@ -13845,12 +13868,12 @@ pub const Vm = struct {
             acc = switch (resolved.callee) {
                 .Builtin => |id| blk: {
                     var out: [1]Value = .{.Nil};
-                    const bres = try self.callBuiltin(id, resolved.args, out[0..], .host);
+                    const bres = try self.callBuiltin(id, resolved.args, out[0..], .host, resolved.ccmt);
                     _ = self.consumeBuiltinResult(bres, out[0..]);
                     break :blk out[0];
                 },
                 .Closure => |cl| blk: {
-                    const ret = try self.runClosure(cl, resolved.args);
+                    const ret = try self.runClosure(cl, resolved.args, resolved.ccmt);
                     defer self.alloc.free(ret);
                     break :blk if (ret.len > 0) ret[0] else .Nil;
                 },
@@ -16087,6 +16110,7 @@ pub const Vm = struct {
         initial: *Thread,
         initial_closure: *Closure,
         initial_args: []const Value,
+        ccmt: u4,
     ) DispatchError!BytecodeCoroutineStep {
         std.debug.assert(!self.bytecode_coroutine_trampoline_active);
         std.debug.assert(self.current_thread == initial);
@@ -16320,7 +16344,7 @@ pub const Vm = struct {
                     self.bytecode_trampoline_drive_thread = active;
 
                     const ret_opt: ?[]Value = retblk: {
-                        const values = self.runClosure(closure, args) catch |run_err| switch (run_err) {
+                        const values = self.runClosure(closure, args, ccmt) catch |run_err| switch (run_err) {
                             error.ThreadSwitch => {
                                 const request = self.bytecode_coroutine_switch_request orelse unreachable;
                                 self.bytecode_coroutine_switch_request = null;
@@ -16663,6 +16687,9 @@ pub const Vm = struct {
         defer if (child_owned_args) |owned| self.alloc.free(owned);
         var child_args: []const Value = resolved.args;
         var child_debug_pairs = false;
+        // ccmt of the child's own __call resolution (the __pairs mm when
+        // child_debug_pairs, else the protected target itself).
+        var mm_ccmt: u4 = 0;
         const cl = child: switch (resolved.callee) {
             .Closure => |closure| break :child closure,
             .Builtin => |builtin_id| {
@@ -16673,6 +16700,7 @@ pub const Vm = struct {
                 child_owned_args = mm_resolved.owned_args;
                 child_args = mm_resolved.args;
                 child_debug_pairs = true;
+                mm_ccmt = mm_resolved.ccmt;
                 break :child switch (mm_resolved.callee) {
                     .Closure => |closure| closure,
                     else => return false,
@@ -16804,7 +16832,11 @@ pub const Vm = struct {
         // PUC luaB_pcall: the target + args are staged on the stack, then
         // activated (luaD_pcall → luaD_precall).
         const staged_target = try self.stageBytecodeCall(th, th.top, cl, child_args);
-        try self.pushStagedBytecodeExecFrame(th, exec_frames, proto, staged_target.func_slot, staged_target.nargs, -1);
+        // child_ccmt: the __pairs metamethod's own chain (mm_resolved) or
+        // the protected target's (resolved) — the fresh activation's count,
+        // exactly what luaD_pcall's nested precall would commit.
+        const child_ccmt: u4 = if (child_debug_pairs) mm_ccmt else resolved.ccmt;
+        try self.pushStagedBytecodeExecFrame(th, exec_frames, proto, staged_target.func_slot, staged_target.nargs, -1, child_ccmt);
         // The pcall/xpcall target gets its CALL event here (PUC: pcall runs
         // the target via luaD_call → luaD_precall → luaG_tracecall).
         if (child_debug_pairs) {
@@ -17637,6 +17669,7 @@ pub const Vm = struct {
         func_slot_in: usize,
         nargs: usize,
         nresults: i32,
+        ccmt: u4,
     ) DispatchError!?usize {
         if (!proto.flags.is_vararg and nargs == proto.numparams) {
             const frame_cap32: u32 = @intCast(proto.maxstacksize + EXTRA_MARGIN);
@@ -17720,7 +17753,10 @@ pub const Vm = struct {
                 // window extent is func_slot + limit (PUC ci->top).
                 ef_slot.limit = frame_cap32 + 1;
                 ef_slot.func_slot = func_slot_in; // base = func_slot + 1
-                ef_slot.callstatus = encodeNresults(nresults);
+                // CIST_CCMT commit point (PUC prepCallInfo): `ccmt` is the
+                // __call-chain length resolved by the caller; the masked
+                // full write clears every other flag bit.
+                ef_slot.callstatus = encodeNresults(nresults) | (@as(u32, ccmt) << CIST_CCMT);
                 // No reg_top init write: every B==0 reader is
                 // preceded by a multret producer publication; the debug
                 // temp bound is structural (see debugTempScanTop).
@@ -17754,11 +17790,12 @@ pub const Vm = struct {
         func_slot_in: usize,
         nargs: usize,
         nresults: i32,
+        ccmt: u4,
     ) DispatchError!void {
         // P16.29: shared inline fast path first (single source of truth
         // with the dispatch OP_CALL handler). On success the activation is
         // complete; on null fall through to the general body below.
-        if ((try self.pushStagedFast(th, exec_frames, proto, func_slot_in, nargs, nresults)) != null) return;
+        if ((try self.pushStagedFast(th, exec_frames, proto, func_slot_in, nargs, nresults, ccmt)) != null) return;
 
         if (self.stats.enabled) self.stats.calls_lua_frames += 1; // P16.0b: ALL Lua activations
         // Slow path: varargs / VAHID / missing args / growth / overflow /
@@ -17939,7 +17976,9 @@ pub const Vm = struct {
         // clearTailCall/clearHookYield/clearHidden/clearDebugHook calls and
         // the isDebugHook block that were here were all dead — they operated
         // on bits already guaranteed zero by this mask.
-        ef_slot.callstatus = encodeNresults(nresults);
+        // CIST_CCMT commit point (PUC prepCallInfo): `ccmt` is the
+        // __call-chain length resolved by the caller.
+        ef_slot.callstatus = encodeNresults(nresults) | (@as(u32, ccmt) << CIST_CCMT);
         // P16.21 T3: resume_pc NOT initialized here — every production read
         // is gated by isHookYield() (CIST_HOOKYIELD), and every site that
         // sets that bit writes resume_pc first/at the same transition
@@ -18613,7 +18652,7 @@ pub const Vm = struct {
         // resume, so no close runs for them.
         const boundary_th = self.current_thread orelse self.main_thread.?;
         const tbc_base = boundary_th.c_tbc_chain.items.len;
-        return exposeDispatchResult([]Value, self.runBytecodeInternal(proto_in, upvalues_in, args, callee_cl)) catch |e| {
+        return exposeDispatchResult([]Value, self.runBytecodeInternal(proto_in, upvalues_in, args, callee_cl, 0)) catch |e| {
             if (e == error.RuntimeError or e == error.OutOfMemory) {
                 self.apiCloseConventionalPcallBoundary(boundary_th, tbc_base);
             }
@@ -18621,7 +18660,7 @@ pub const Vm = struct {
         };
     }
 
-    fn runBytecodeInternal(self: *Vm, proto_in: *const bc.Proto, upvalues_in: []const *Cell, args: []const Value, callee_cl: ?*Closure) DispatchError![]Value {
+    fn runBytecodeInternal(self: *Vm, proto_in: *const bc.Proto, upvalues_in: []const *Cell, args: []const Value, callee_cl: ?*Closure, ccmt: u4) DispatchError![]Value {
         // A directly executed chunk is still a first-class Lua function.
         // Materialize its closure so debug.getinfo(level, "f") and
         // debug.getupvalue can expose the running main function just like PUC
@@ -18688,7 +18727,7 @@ pub const Vm = struct {
             // value stack before docall — mirror it: stage at top
             // (L->top), then activate.
             const staged_entry = try self.stageBytecodeCall(exec_thread, exec_thread.top, effective_callee, args);
-            try self.pushStagedBytecodeExecFrame(exec_thread, exec_frames, proto_in, staged_entry.func_slot, staged_entry.nargs, -1);
+            try self.pushStagedBytecodeExecFrame(exec_thread, exec_frames, proto_in, staged_entry.func_slot, staged_entry.nargs, -1, ccmt);
             // PUC luaG_tracecall (ldebug.c:903-921): when a fresh activation
             // starts executing, the CALL hook fires with the NEW ci — the
             // main chunk of a lua_pcall/dostring, a C-API-called function,
@@ -21284,6 +21323,7 @@ pub const Vm = struct {
                                     ctx.base + inst.a,
                                     nargs,
                                     nresults,
+                                    0,
                                 )) |child_index| {
                                     // P16.29 T2: park the caller's pc AT this
                                     // CALL before the child starts executing.
@@ -22619,12 +22659,11 @@ pub const Vm = struct {
         // (A+7 here); tryCallMetamethodInPlace raises it as the chain
         // shifts (PUC's shift + top++).
         ctx.th.top = ctx.base + a + 5 + effective_nargs;
-        var chain_depth: usize = 0;
+        var chain_depth: u4 = 0;
         while (true) {
             switch (ctx.regs[a + 4]) {
                 .Closure, .Builtin => break,
                 else => {
-                    if (chain_depth >= 16) return self.fail("'__call' chain too long", .{});
                     const current_callee = ctx.regs[a + 4];
                     self.tryCallMetamethodInPlace(
                         ctx.base,
@@ -22686,7 +22725,7 @@ pub const Vm = struct {
                 // Call from R[A+4] — above the close value at R[A+3].
                 // Staged-ABI activation: iterator at R[A+4], args at
                 // R[A+5..] already in place (zero-copy).
-                try self.pushStagedBytecodeExecFrame(ctx.th, ctx.exec_frames, child_proto, ctx.base + a + 4, effective_nargs, @intCast(nresults));
+                try self.pushStagedBytecodeExecFrame(ctx.th, ctx.exec_frames, child_proto, ctx.base + a + 4, effective_nargs, @intCast(nresults), chain_depth);
                 // PUC OP_TFORCALL (lvm.c): the iterator is invoked via
                 // luaD_call → luaG_tracecall → LUA_HOOKCALL with
                 // name="for iterator" (ldebug.c funcnamefromcode).
@@ -22721,7 +22760,7 @@ pub const Vm = struct {
                 // real contract when the C-frame path runs.
                 var tfc_bres: BuiltinResult = .{ .window = out_len };
                 if (builtinNeedsCFrame(id)) {
-                    try self.pushBuiltinCFrameAt(ctx.base + a + 4);
+                    try self.pushBuiltinCFrameAt(ctx.base + a + 4, chain_depth);
                     const cf_idx = self.activeBytecodeThread().call_frames.len() - 1;
                     // P16.39 Cut 3: re-derive the args slice only when the
                     // stack base moved — the view push cannot move it; only
@@ -22739,7 +22778,7 @@ pub const Vm = struct {
                     // Region end = args end (iterator
                     // args window; outs is the local outs_small/outs_heap
                     // buffer — never a th.stack window).
-                    tfc_bres = try self.callBuiltin(id, rargs_builtin_fresh, outs, .{ .bytecode_window = ctx.base + a + 5 + effective_nargs });
+                    tfc_bres = try self.callBuiltin(id, rargs_builtin_fresh, outs, .{ .bytecode_window = ctx.base + a + 5 + effective_nargs }, chain_depth);
                 }
                 // Owned results (T.testC as a for-iterator): the exact-count
                 // slice IS the transport — the `defer self.alloc.free(ret)`
@@ -22769,7 +22808,7 @@ pub const Vm = struct {
                         .nresults = @intCast(nresults),
                     } },
                 });
-                const values = self.runClosure(cl, rargs_builtin) catch |call_err| switch (call_err) {
+                const values = self.runClosure(cl, rargs_builtin, chain_depth) catch |call_err| switch (call_err) {
                     error.Yield => {
                         // Outermost-dispatch test — 1 with the base
                         // frame, 0 only on hand-made test threads.
@@ -23096,12 +23135,11 @@ pub const Vm = struct {
 
         // ── PUC luaD_precall: inline callee type resolution ──
         var effective_nargs = nargs;
-        var chain_depth: usize = 0;
+        var chain_depth: u4 = 0;
         while (true) {
             switch (ctx.regs[a]) {
                 .Closure, .Builtin => break,
                 else => {
-                    if (chain_depth >= 16) return self.fail("'__call' chain too long", .{});
                     const current_callee = ctx.regs[a];
                     // As in bytecodeIndexValue: the "attempt to call"
                     // annotation is an internal message re-composition —
@@ -23248,8 +23286,13 @@ pub const Vm = struct {
                 .propagate_error => .propagate_error,
             };
         }
+        // Chain-resolved builtins keep the REAL C activation: the diverts
+        // below (and the coroutine fast path further down) replace it with
+        // frames that have no place to commit CIST_CCMT — divert only when
+        // no __call chain was traversed (see the OP_CALL site).
         if (callee_val == .Builtin and
             callee_val.Builtin == .pairs and
+            chain_depth == 0 and
             try self.tryPushBytecodePairsMetamethod(
                 ctx.exec_frames,
                 ctx.frame_index,
@@ -23265,6 +23308,7 @@ pub const Vm = struct {
         // no layered guards).
         if (callee_val == .Builtin and
             (callee_val.Builtin == .pcall or callee_val.Builtin == .xpcall) and
+            chain_depth == 0 and
             try self.tryPushBytecodeProtectedCall(
                 ctx.exec_frames,
                 ctx.frame_index,
@@ -23279,6 +23323,7 @@ pub const Vm = struct {
         }
         if (callee_val == .Builtin and
             self.bytecode_coroutine_trampoline_active and
+            chain_depth == 0 and
             try self.tryRequestBytecodeCoroutineSwitch(
                 ctx.exec_frames,
                 ctx.frame_index,
@@ -23472,6 +23517,7 @@ pub const Vm = struct {
                 // pushBuiltinCFrame/callBuiltin dispatch (same guards as
                 // OP_CALL's fast path).
                 const co_fast_path = (id == .coroutine_resume or id == .coroutine_yield) and
+                    chain_depth == 0 and
                     !deferred_builtin_call_hook and
                     !deferred_tail_hook and
                     ctx.exec_frames.getPtr(ctx.frame_index).pending_call_index == INVALID_PENDING and
@@ -23506,7 +23552,7 @@ pub const Vm = struct {
                 // builtin, not just the hook path.
                 // P16.5b: Skip the C-frame push on the coroutine fast path.
                 if (!co_fast_path and builtinNeedsCFrame(id)) {
-                    try self.pushBuiltinCFrameAt(ctx.base + a);
+                    try self.pushBuiltinCFrameAt(ctx.base + a, chain_depth);
                     const cf_idx = self.activeBytecodeThread().call_frames.len() - 1;
                     if (deferred_builtin_call_hook) {
                         // P16.39 Cut 3: re-derive call_args only when the
@@ -23575,7 +23621,7 @@ pub const Vm = struct {
                     // th.stack window).
                     const tc_cframe_origin: BuiltinCallOrigin =
                         if (builtinNeedsCFrame(id)) .{ .bytecode_window = ctx.base + a + 1 + effective_nargs } else .host;
-                    tc_bres = self.callBuiltin(id, call_args, outs, tc_cframe_origin) catch |call_err| switch (call_err) {
+                    tc_bres = self.callBuiltin(id, call_args, outs, tc_cframe_origin, chain_depth) catch |call_err| switch (call_err) {
                         error.Yield => {
                             if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
                                 const th = self.current_thread.?;
@@ -23637,7 +23683,7 @@ pub const Vm = struct {
                         .tail_return = true,
                     } },
                 });
-                const values = self.runClosure(cl, call_args) catch |call_err| switch (call_err) {
+                const values = self.runClosure(cl, call_args, chain_depth) catch |call_err| switch (call_err) {
                     error.Yield => {
                         // Outermost-dispatch test — 1 with the base
                         // frame, 0 only on hand-made test threads.
@@ -23821,12 +23867,11 @@ pub const Vm = struct {
 
         // ── PUC luaD_precall: inline callee type resolution ──
         var effective_nargs = nargs;
-        var chain_depth: usize = 0;
+        var chain_depth: u4 = 0;
         while (true) {
             switch (ctx.regs[a]) {
                 .Closure, .Builtin => break,
                 else => {
-                    if (chain_depth >= 16) return self.fail("'__call' chain too long", .{});
                     const current_callee = ctx.regs[a];
                     // As in bytecodeIndexValue: the "attempt to call"
                     // annotation is an internal message re-composition —
@@ -23974,7 +24019,11 @@ pub const Vm = struct {
         const callee_val = resolved_callee;
         switch (callee_val) {
             .Builtin => |id| {
-                if (id == .pairs and try self.tryPushBytecodePairsMetamethod(
+                // Chain-resolved builtins keep the REAL C activation (the
+                // continuation diverts below replace it with frames that
+                // have no place to commit CIST_CCMT) — divert only when no
+                // __call chain was traversed.
+                if (id == .pairs and chain_depth == 0 and try self.tryPushBytecodePairsMetamethod(
                     ctx.exec_frames,
                     ctx.frame_index,
                     rargs,
@@ -23988,7 +24037,7 @@ pub const Vm = struct {
                 // must skip the decline-chain (incl. the ArrayListUnmanaged
                 // init + defer deinit) entirely. The id-class gate is
                 // generic (protected family), not per-builtin.
-                if ((id == .pcall or id == .xpcall) and
+                if ((id == .pcall or id == .xpcall) and chain_depth == 0 and
                     try self.tryPushBytecodeProtectedCall(
                         ctx.exec_frames,
                         ctx.frame_index,
@@ -24007,7 +24056,7 @@ pub const Vm = struct {
                 // while a nested bytecode coroutine switch is pending).
                 // One load+test here replaces the out-of-line call for
                 // every non-trampoline builtin OP_CALL.
-                if (self.bytecode_coroutine_trampoline_active and
+                if (self.bytecode_coroutine_trampoline_active and chain_depth == 0 and
                     try self.tryRequestBytecodeCoroutineSwitch(
                         ctx.exec_frames,
                         ctx.frame_index,
@@ -24018,7 +24067,7 @@ pub const Vm = struct {
                         false,
                         ctx.boundary_depth,
                     )) return error.ThreadSwitch;
-                if (id == .string_gsub) {
+                if (id == .string_gsub and chain_depth == 0) {
                     switch (try self.tryStartBytecodeGsub(
                         ctx.exec_frames,
                         ctx.frame_index,
@@ -24085,6 +24134,7 @@ pub const Vm = struct {
                 // continuations, no close mode, no wrap eager, etc.).
                 // See coroutineBuiltinFastPathEligible for the full guard list.
                 const co_fast_path = (id == .coroutine_resume or id == .coroutine_yield) and
+                    chain_depth == 0 and
                     !deferred_builtin_call_hook and
                     !deferred_call_hook and
                     ctx.exec_frames.getPtr(ctx.frame_index).pending_call_index == INVALID_PENDING and
@@ -24137,7 +24187,7 @@ pub const Vm = struct {
                 // P16.5b: Skip the C-frame push entirely on the coroutine
                 // fast path — guards guarantee no hooks need it.
                 if (!co_fast_path and builtinNeedsCFrame(id)) {
-                    try self.pushBuiltinCFrameAt(ctx.base + a);
+                    try self.pushBuiltinCFrameAt(ctx.base + a, chain_depth);
                     const cf_idx = self.activeBytecodeThread().call_frames.len() - 1;
                     if (deferred_builtin_call_hook) {
                         // P16.39 Cut 3: re-derive the caller-window slices
@@ -24220,7 +24270,7 @@ pub const Vm = struct {
                     // windows; outs_end >= args_end always (out_len >= 0).
                     const cframe_origin: BuiltinCallOrigin =
                         if (builtinNeedsCFrame(id)) .{ .bytecode_window = ctx.base + outs_start + out_len } else .host;
-                    bres = self.callBuiltin(id, rargs_fresh, outs, cframe_origin) catch |call_err| switch (call_err) {
+                    bres = self.callBuiltin(id, rargs_fresh, outs, cframe_origin, chain_depth) catch |call_err| switch (call_err) {
                         error.Yield => {
                             if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
                                 const th = self.current_thread.?;
@@ -24486,7 +24536,7 @@ pub const Vm = struct {
                     // pending_call needed for ordinary Lua CALL.
                     // Staged-ABI activation: callee at R[A] (possibly the
                     // __call-resolved value), args at R[A+1..] in place.
-                    try self.pushStagedBytecodeExecFrame(ctx.th, ctx.exec_frames, proto2, ctx.base + a, effective_nargs, nresults);
+                    try self.pushStagedBytecodeExecFrame(ctx.th, ctx.exec_frames, proto2, ctx.base + a, effective_nargs, nresults, chain_depth);
                     // CALL hook on the callee activation (PUC luaD_hookcall:
                     // the new ci exists, then the hook fires). rargs may be
                     // stale after the push (stack realloc) — the helper
@@ -24533,7 +24583,7 @@ pub const Vm = struct {
                         .nresults = nresults,
                     } },
                 });
-                const ret = self.runClosure(cl, rargs) catch |call_err| switch (call_err) {
+                const ret = self.runClosure(cl, rargs, chain_depth) catch |call_err| switch (call_err) {
                     error.Yield => {
                         // Outermost-dispatch test — 1 with the base
                         // frame, 0 only on hand-made test threads.
@@ -25176,7 +25226,7 @@ pub const Vm = struct {
         span: ResumeSpan,
     };
 
-    fn callBuiltin(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value, origin: BuiltinCallOrigin) DispatchError!BuiltinResult {
+    fn callBuiltin(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value, origin: BuiltinCallOrigin, ccmt: u4) DispatchError!BuiltinResult {
         if (self.stats.enabled) self.stats.calls_builtin += 1; // P16.0b
         // P16.39 Cut 3: snapshot the stack slice BEFORE the C-frame
         // push. The push may realloc it; the snapshot is the base for
@@ -25209,7 +25259,7 @@ pub const Vm = struct {
         var grew = false;
         var staged_args = false;
         if (origin == .host and cframe_pushed) {
-            grew = try self.pushBuiltinCFrame(callee_val);
+            grew = try self.pushBuiltinCFrame(callee_val, ccmt);
             // PUC luaD_precallC leaves the call args on the
             // stack above ci->func (L->top = func + 1 + nargs) — the C
             // frame's window IS its args. Host-origin dispatch sites pass
@@ -26234,7 +26284,7 @@ pub const Vm = struct {
         const cl = try self.createBytecodeChunkClosure(proto);
         proto.tree.?.releaseTree(self.alloc);
         try self.applyLoadEnv(cl, self.registryGlobalsValue(), false);
-        const ret = try self.runClosure(cl, &.{});
+        const ret = try self.runClosure(cl, &.{}, 0);
         self.alloc.free(ret);
 
         // PUC statcodes are string literals pushed via lua_pushstring
@@ -27163,7 +27213,7 @@ pub const Vm = struct {
                 }
                 defer if (tmp_heap) self.infraAlloc().free(tmp);
 
-                const pcall_bres = self.callBuiltin(id, resolved.args, tmp, .host) catch |e| switch (e) {
+                const pcall_bres = self.callBuiltin(id, resolved.args, tmp, .host, resolved.ccmt) catch |e| switch (e) {
                     error.Yield => return e,
                     error.OutOfMemory => {
                         self.setOutOfMemoryError();
@@ -27232,7 +27282,7 @@ pub const Vm = struct {
                 const th_pcall = self.activeBytecodeThread();
                 const saved_top = th_pcall.top;
                 const saved_frame_count = th_pcall.call_frames.len();
-                const ret = self.runClosure(cl, resolved.args) catch |e| switch (e) {
+                const ret = self.runClosure(cl, resolved.args, resolved.ccmt) catch |e| switch (e) {
                     error.Yield => return e,
                     error.OutOfMemory => {
                         self.setOutOfMemoryError();
@@ -27464,7 +27514,7 @@ pub const Vm = struct {
                 }
                 defer if (tmp_heap) self.infraAlloc().free(tmp);
 
-                const xpcall_bres = self.callBuiltin(id, resolved.args, tmp, .host) catch |e| switch (e) {
+                const xpcall_bres = self.callBuiltin(id, resolved.args, tmp, .host, resolved.ccmt) catch |e| switch (e) {
                     error.Yield => return e,
                     else => {
                         // P16.31 Cut 3: xpcall recovery-boundary close (PUC
@@ -27501,7 +27551,7 @@ pub const Vm = struct {
                 const th_xpcall = self.activeBytecodeThread();
                 const saved_top = th_xpcall.top;
                 const saved_frame_count = th_xpcall.call_frames.len();
-                const ret = self.runClosure(cl, resolved.args) catch |e| switch (e) {
+                const ret = self.runClosure(cl, resolved.args, resolved.ccmt) catch |e| switch (e) {
                     error.Yield => return e,
                     else => {
                         // P16.31 Cut 3: xpcall recovery-boundary close —
@@ -29065,7 +29115,7 @@ pub const Vm = struct {
                 th.bytecode_inplace_suspended = true;
                 th.bytecode_resume_boundary = bytecodeOuterBoundary(&th.call_frames);
                 const top_cl = th.stack[top_fr.func_slot].Closure;
-                const ret = self.runClosure(top_cl, &.{}) catch |e| switch (e) {
+                const ret = self.runClosure(top_cl, &.{}, 0) catch |e| switch (e) {
                     error.Yield => {
                         // Values are in th.yielded — the common tail
                         // (yield path) consumes them.
@@ -29213,7 +29263,7 @@ pub const Vm = struct {
                     // P16.50-review-6 BLOCKER 1: capture the result contract.
                     // The catch arms set flags and fall through to the common
                     // tails, which never read the payload on those paths.
-                    if (self.callBuiltin(id, resolved.args, payload, .host)) |co_bres| {
+                    if (self.callBuiltin(id, resolved.args, payload, .host, resolved.ccmt)) |co_bres| {
                         switch (co_bres) {
                             // Owned results (a T.testC coroutine body) carry
                             // the EXACT count — replace the staging payload
@@ -29265,7 +29315,7 @@ pub const Vm = struct {
                 },
                 .Closure => |cl| {
                     if (cl.proto != null and !self.bytecode_coroutine_trampoline_active) {
-                        const step = try self.driveBytecodeCoroutineTrampoline(th, cl, resolved.args);
+                        const step = try self.driveBytecodeCoroutineTrampoline(th, cl, resolved.args, resolved.ccmt);
                         switch (step) {
                             .returned => |ret| {
                                 payload = ret;
@@ -29289,7 +29339,7 @@ pub const Vm = struct {
                         }
                     } else {
                         const ret_opt: ?[]Value = retblk: {
-                            const r = self.runClosure(cl, resolved.args) catch |e| switch (e) {
+                            const r = self.runClosure(cl, resolved.args, resolved.ccmt) catch |e| switch (e) {
                                 error.Yield => {
                                     yielded = true;
                                     break :retblk null;
@@ -34503,7 +34553,7 @@ pub const Vm = struct {
         }
 
         const cl = entry_cl.?;
-        const ret = self.runClosure(cl, &.{}) catch |e| switch (e) {
+        const ret = self.runClosure(cl, &.{}, 0) catch |e| switch (e) {
             error.Yield => return error.Yield,
             else => return error.RuntimeError,
         };
@@ -35346,7 +35396,7 @@ pub const Vm = struct {
                     switch (resolved.callee) {
                         .Builtin => |id| {
                             var out1 = [_]Value{.Nil};
-                            const bres = self.callBuiltin(id, resolved.args, out1[0..], .host) catch {
+                            const bres = self.callBuiltin(id, resolved.args, out1[0..], .host, resolved.ccmt) catch {
                                 outs[0] = .Nil;
                                 if (outs.len > 1) {
                                     const istr2 = try self.internStr(self.errorString());
@@ -35358,7 +35408,7 @@ pub const Vm = struct {
                             piece = out1[0];
                         },
                         .Closure => |cl| {
-                            const ret = self.runClosure(cl, resolved.args) catch {
+                            const ret = self.runClosure(cl, resolved.args, resolved.ccmt) catch {
                                 outs[0] = .Nil;
                                 if (outs.len > 1) {
                                     const istr3 = try self.internStr(self.errorString());
@@ -35571,7 +35621,7 @@ pub const Vm = struct {
                 .Builtin => |id| {
                     var loader_args = [_]Value{ .{ .String = name_str }, .{ .String = preload_str } };
                     var loader_out: [2]Value = .{ .Nil, .Nil };
-                    const loader_bres = try self.callBuiltin(id, loader_args[0..], loader_out[0..], .host);
+                    const loader_bres = try self.callBuiltin(id, loader_args[0..], loader_out[0..], .host, 0);
                     _ = self.consumeBuiltinResult(loader_bres, loader_out[0..]);
                     const v: Value = if (loader_out[0] != .Nil) loader_out[0] else .{ .Bool = true };
                     try self.setField(loaded_tbl, name, v);
@@ -35586,7 +35636,7 @@ pub const Vm = struct {
                 },
                 .Closure => |cl| {
                     var loader_args = [_]Value{ .{ .String = name_str }, .{ .String = preload_str } };
-                    const ret = try self.runClosure(cl, loader_args[0..]);
+                    const ret = try self.runClosure(cl, loader_args[0..], 0);
                     defer self.alloc.free(ret);
                     // PUC ll_require: if loader returned non-nil, set loaded.
                     // Then re-read loaded[name]; if nil, default to true.
@@ -35659,7 +35709,7 @@ pub const Vm = struct {
             _ = scope.protectValueAssumeCapacity(tmp[0]);
 
             const run_args = [_]Value{ .{ .String = try self.internStr(name) }, .{ .String = try self.internStr(file_path) } };
-            const ret = try self.runClosure(cl, run_args[0..]);
+            const ret = try self.runClosure(cl, run_args[0..], 0);
             defer self.alloc.free(ret);
             // PUC ll_require (loadlib.c:666-674): if the loader returned a
             // non-nil value, set loaded[name] = that value. Otherwise leave
@@ -35817,7 +35867,7 @@ pub const Vm = struct {
             .{ .String = try self.internStr(modname) },
             .{ .String = try self.internStr(file_path) },
         };
-        const ret = try self.runClosure(loadlib_outs[0].Closure, call_args[0..]);
+        const ret = try self.runClosure(loadlib_outs[0].Closure, call_args[0..], 0);
         defer self.alloc.free(ret);
 
         // PUC ll_require: if loader returned non-nil, set loaded[name].
@@ -36800,7 +36850,9 @@ pub const Vm = struct {
                                 self.activeDebugHookEventTailcall()
                             else
                                 fr.isTailCall();
-                            const extraargs: i64 = if (fr.isVararg()) @intCast(self.frameVarargs(fr, th).len) else 0;
+                            // PUC auxgetinfo 't': the frame's CIST_CCMT count
+                            // (NOT the vararg count — 'u'/isvararg reports that).
+                            const extraargs: i64 = @intCast((fr.callstatus & MAX_CCMT) >> CIST_CCMT);
                             try self.setField(t, "istailcall", .{ .Bool = is_tail });
                             try self.setField(t, "extraargs", .{ .Int = extraargs });
                         }
@@ -37952,11 +38004,11 @@ pub const Vm = struct {
                 // P16.50-review-6: 0-window — hook results are discarded;
                 // free any owned results (T.testC as a hook).
                 var outs: [0]Value = .{};
-                const bres = try self.callBuiltin(id, argv_buf[0..argc], outs[0..], .host);
+                const bres = try self.callBuiltin(id, argv_buf[0..argc], outs[0..], .host, 0);
                 _ = self.consumeBuiltinResult(bres, outs[0..]);
             },
             .Closure => |cl| {
-                const ret = try self.runClosure(cl, argv_buf[0..argc]);
+                const ret = try self.runClosure(cl, argv_buf[0..argc], 0);
                 self.alloc.free(ret);
             },
             else => {},
@@ -38288,7 +38340,7 @@ pub const Vm = struct {
             // it (C frame → no position), exactly like PUC.
             defer self.shrinkBcStack();
 
-            const ret = self.runClosure(cl, &.{}) catch |e| switch (e) {
+            const ret = self.runClosure(cl, &.{}, 0) catch |e| switch (e) {
                 error.Yield => return error.Yield,
                 else => {
                     // Error: print the error message + newline to stderr,
@@ -38635,7 +38687,7 @@ pub const Vm = struct {
             defer if (resolved.owned_args) |owned| self.alloc.free(owned);
             switch (resolved.callee) {
                 .Builtin => |id| {
-                    const pairs_bres = try self.callBuiltin(id, resolved.args, outs, .host);
+                    const pairs_bres = try self.callBuiltin(id, resolved.args, outs, .host, resolved.ccmt);
                     // P16.39 Cut 3 (correctness): the nested callBuiltin's
                     // C-frame push may have reallocated stack — re-derive
                     // the outs window before consuming/nil-filling.
@@ -38648,7 +38700,7 @@ pub const Vm = struct {
                     while (i < outw.len) : (i += 1) outw[i] = .Nil;
                 },
                 .Closure => |cl| {
-                    const ret = try self.runClosure(cl, resolved.args);
+                    const ret = try self.runClosure(cl, resolved.args, resolved.ccmt);
                     defer self.alloc.free(ret);
                     // P16.39 Cut 3 (correctness): runClosure may have
                     // reallocated stack — re-derive before writing.
@@ -43965,7 +44017,7 @@ pub const Vm = struct {
                 const outs = try self.alloc.alloc(Value, out_len);
                 defer self.alloc.free(outs);
                 for (outs) |*o| o.* = .Nil;
-                const gsub_bres = try self.callBuiltin(id, resolved.args, outs, .host);
+                const gsub_bres = try self.callBuiltin(id, resolved.args, outs, .host, resolved.ccmt);
                 // P16.50-review-6 BLOCKER 1: actual count first (owned results
                 // copy into the window), then take the first value.
                 const used = self.consumeBuiltinResult(gsub_bres, outs);
@@ -43973,7 +44025,7 @@ pub const Vm = struct {
                 break :blk outs[0];
             },
             .Closure => |cl| blk: {
-                const ret = try self.runClosure(cl, resolved.args);
+                const ret = try self.runClosure(cl, resolved.args, resolved.ccmt);
                 defer self.alloc.free(ret);
                 if (ret.len == 0) break :blk .Nil;
                 break :blk ret[0];
@@ -45166,13 +45218,13 @@ pub const Vm = struct {
                 .Builtin => |id| {
                     var outs1 = [_]Value{.Nil};
                     const call_args = [_]Value{ a, b };
-                    const bres = try self.callBuiltin(id, call_args[0..], outs1[0..], .host);
+                    const bres = try self.callBuiltin(id, call_args[0..], outs1[0..], .host, 0);
                     _ = self.consumeBuiltinResult(bres, outs1[0..]);
                     outv = outs1[0];
                 },
                 .Closure => |cl| {
                     const call_args = [_]Value{ a, b };
-                    const ret = try self.runClosure(cl, call_args[0..]);
+                    const ret = try self.runClosure(cl, call_args[0..], 0);
                     defer self.alloc.free(ret);
                     outv = if (ret.len > 0) ret[0] else .Nil;
                 },
@@ -45183,12 +45235,12 @@ pub const Vm = struct {
                     switch (resolved.callee) {
                         .Builtin => |id| {
                             var outs1 = [_]Value{.Nil};
-                            const bres = try self.callBuiltin(id, resolved.args, outs1[0..], .host);
+                            const bres = try self.callBuiltin(id, resolved.args, outs1[0..], .host, resolved.ccmt);
                             _ = self.consumeBuiltinResult(bres, outs1[0..]);
                             outv = outs1[0];
                         },
                         .Closure => |cl| {
-                            const ret = try self.runClosure(cl, resolved.args);
+                            const ret = try self.runClosure(cl, resolved.args, resolved.ccmt);
                             defer self.alloc.free(ret);
                             outv = if (ret.len > 0) ret[0] else .Nil;
                         },
@@ -45884,13 +45936,13 @@ pub const Vm = struct {
             .Builtin => |id| blk: {
                 var call_args = [_]Value{ .{ .Table = tbl }, key };
                 var out: [1]Value = .{.Nil};
-                const bres = try self.callBuiltin(id, call_args[0..], out[0..], .host);
+                const bres = try self.callBuiltin(id, call_args[0..], out[0..], .host, 0);
                 _ = self.consumeBuiltinResult(bres, out[0..]);
                 break :blk out[0];
             },
             .Closure => |cl| blk: {
                 var call_args = [_]Value{ .{ .Table = tbl }, key };
-                const ret = try self.runClosure(cl, call_args[0..]);
+                const ret = try self.runClosure(cl, call_args[0..], 0);
                 defer self.alloc.free(ret);
                 break :blk if (ret.len > 0) ret[0] else Value.Nil;
             },
@@ -45950,13 +46002,13 @@ pub const Vm = struct {
             .Builtin => |id| blk: {
                 var call_args = [_]Value{ object, key };
                 var out: [1]Value = .{.Nil};
-                const bres = try self.callBuiltin(id, call_args[0..], out[0..], .host);
+                const bres = try self.callBuiltin(id, call_args[0..], out[0..], .host, 0);
                 _ = self.consumeBuiltinResult(bres, out[0..]);
                 break :blk out[0];
             },
             .Closure => |cl| blk: {
                 var call_args = [_]Value{ object, key };
-                const ret = try self.runClosure(cl, call_args[0..]);
+                const ret = try self.runClosure(cl, call_args[0..], 0);
                 defer self.alloc.free(ret);
                 break :blk if (ret.len > 0) ret[0] else Value.Nil;
             },
@@ -45986,13 +46038,13 @@ pub const Vm = struct {
                     var out: [1]Value = .{.Nil};
                     // P16.50-review-6: __newindex discards results — consume
                     // (copies owned into the window, frees the owned slice).
-                    const bres = try self.callBuiltin(id, call_args[0..], out[0..], .host);
+                    const bres = try self.callBuiltin(id, call_args[0..], out[0..], .host, 0);
                     _ = self.consumeBuiltinResult(bres, out[0..]);
                     return;
                 },
                 .Closure => |cl| {
                     var call_args = [_]Value{ object, key, val };
-                    const ret = try self.runClosure(cl, call_args[0..]);
+                    const ret = try self.runClosure(cl, call_args[0..], 0);
                     defer self.alloc.free(ret);
                     return;
                 },
@@ -46011,13 +46063,13 @@ pub const Vm = struct {
                 var out: [1]Value = .{.Nil};
                 // P16.50-review-6: __newindex discards results — consume
                 // (copies owned into the window, frees the owned slice).
-                const bres = try self.callBuiltin(id, call_args[0..], out[0..], .host);
+                const bres = try self.callBuiltin(id, call_args[0..], out[0..], .host, 0);
                 _ = self.consumeBuiltinResult(bres, out[0..]);
                 return;
             },
             .Closure => |cl| {
                 var call_args = [_]Value{ object, key, val };
-                const ret = try self.runClosure(cl, call_args[0..]);
+                const ret = try self.runClosure(cl, call_args[0..], 0);
                 defer self.alloc.free(ret);
                 return;
             },
@@ -46276,12 +46328,12 @@ pub const Vm = struct {
         return switch (resolved.callee) {
             .Builtin => |id| blk: {
                 var out: [1]Value = .{.Nil};
-                const bres = try self.callBuiltin(id, resolved.args, out[0..], .host);
+                const bres = try self.callBuiltin(id, resolved.args, out[0..], .host, resolved.ccmt);
                 _ = self.consumeBuiltinResult(bres, out[0..]);
                 break :blk out[0];
             },
             .Closure => |cl| blk: {
-                const ret = try self.runClosure(cl, resolved.args);
+                const ret = try self.runClosure(cl, resolved.args, resolved.ccmt);
                 defer self.alloc.free(ret);
                 break :blk if (ret.len > 0) ret[0] else .Nil;
             },
@@ -46881,6 +46933,11 @@ pub const Vm = struct {
         callee: Value,
         args: []const Value,
         owned_args: ?[]Value = null,
+        /// __call-chain length traversed by this resolution (PUC CIST_CCMT
+        /// transport): the ACTIVATION of `callee` commits it into its
+        /// callstatus bits 8-11; callers pass it to their invocation
+        /// primitive (runClosure/callBuiltin/pushResolvedBytecodeClosure).
+        ccmt: u4 = 0,
     };
 
     const CallName = struct {
@@ -46893,13 +46950,15 @@ pub const Vm = struct {
         var callee = initial_callee;
         var args: []const Value = initial_args;
         var owned: ?[]Value = null;
-        var depth: usize = 0;
+        var depth: u4 = 0;
 
         while (true) {
             switch (callee) {
-                .Builtin, .Closure => return .{ .callee = callee, .args = args, .owned_args = owned },
+                .Builtin, .Closure => return .{ .callee = callee, .args = args, .owned_args = owned, .ccmt = depth },
                 else => {
-                    if (depth >= 16) return self.fail("attempt to call a value (chain too long)", .{});
+                    // PUC tryfuncTM order: look up __call FIRST (a value
+                    // without __call is a plain call error even at the
+                    // limit), and only then reject the 16th link.
                     const mm = self.getTmByObj(callee, .call);
                     if (mm == null) {
                         if (call_name) |cn| {
@@ -46909,6 +46968,7 @@ pub const Vm = struct {
                         }
                         return self.fail("attempt to call a {s} value", .{callee.typeName()});
                     }
+                    if (depth == MAX_CCMT_LINKS) return self.fail("'__call' chain too long", .{});
 
                     const new_args = try self.alloc.alloc(Value, args.len + 1);
                     new_args[0] = callee;
@@ -46953,9 +47013,12 @@ pub const Vm = struct {
     /// realloc `stack` — the caller's `regs`/`boxed` slices are updated
     /// in place through the pointer parameters.
     ///
-    /// **Chain depth:** PUC limits `__call` chains to 16 (counted in
-    /// `callstatus` bits `CIST_CCMT`). We track this in `chain_depth`,
-    /// checked by the caller before calling this method.
+    /// **Chain depth:** PUC tryfuncTM (ldo.c:523-536) counts committed
+    /// __call links in `chain_depth`; the 16th link (counter already at
+    /// MAX_CCMT_LINKS) is rejected with "'__call' chain too long" AFTER a
+    /// successful __call lookup. The counter is TRANSPORT ONLY: the caller
+    /// passes it into the callee's activation, which commits it once into
+    /// callstatus bits 8-11 (see initBuiltinCFrame / pushStagedFast).
     fn tryCallMetamethodInPlace(
         self: *Vm,
         base: usize,
@@ -46963,16 +47026,18 @@ pub const Vm = struct {
         nargs: *usize,
         frame_cap: *u32,
         regs: *[]Value,
-        chain_depth: *usize,
+        chain_depth: *u4,
     ) DispatchError!void {
-        // Defense-in-depth: PUC checks chain depth inside tryfuncTM (ldo.c:533).
-        // Callers also check before calling, but this catches forgotten checks.
-        std.debug.assert(chain_depth.* < 16);
         const current_callee = regs.*[a];
         // Look up __call metamethod on the current (non-callable) value.
+        // PUC order: the "attempt to call" error is raised even at the
+        // chain limit when the value has no __call at all.
         const mm = self.getTmByObj(current_callee, .call);
         if (mm == null) {
             return self.fail("attempt to call a {s} value", .{current_callee.typeName()});
+        }
+        if (chain_depth.* == MAX_CCMT_LINKS) {
+            return self.fail("'__call' chain too long", .{});
         }
 
         // Ensure the frame has space for one extra slot (the shift target).
@@ -47032,7 +47097,7 @@ pub const Vm = struct {
     /// here, so handling `c_func` centrally — rather than scattering checks at
     /// each site — mirrors PUC's single `luaD_precall` dispatch and keeps the
     /// invariant that every callable closure is invoked through one entry point.
-    fn runClosure(self: *Vm, cl: *Closure, args: []const Value) DispatchError![]Value {
+    fn runClosure(self: *Vm, cl: *Closure, args: []const Value, ccmt: u4) DispatchError![]Value {
         // PUC `luaD_precall` LUA_VCCL branch: a non-null c_func marks a C
         // closure. Dispatch to the C function via the unified window
         // boundary BEFORE touching `proto` (which is null for C closures;
@@ -47044,9 +47109,9 @@ pub const Vm = struct {
             // null) or a bytecode closure (proto set, c_func null). Both set
             // would be a registration bug; catch it loudly here.
             std.debug.assert(cl.proto == null);
-            return try self.callCFunction(cf, .{ .Closure = cl }, args);
+            return try self.callCFunction(cf, .{ .Closure = cl }, args, ccmt);
         }
-        return try self.runBytecodeInternal(cl.proto.?, cl.upvalues, args, cl);
+        return try self.runBytecodeInternal(cl.proto.?, cl.upvalues, args, cl, ccmt);
     }
 
     /// Invoke a C function closure, bridging the bytecode VM and the C API
@@ -47522,6 +47587,7 @@ pub const Vm = struct {
         cf: *const fn (?*lua_State) callconv(.c) c_int,
         callee: Value,
         args: []const Value,
+        ccmt: u4,
     ) DispatchError![]Value {
         if (self.stats.enabled) self.stats.calls_c += 1; // P16.0b
         // The C activation's window IS th.stack (PUC: the
@@ -47574,7 +47640,7 @@ pub const Vm = struct {
         // The callee value lands at the fresh top slot; the activation
         // ensure above already reserved 1 + args.len + MINSTACK slots, so
         // the push's growth branch is cold.
-        _ = try self.pushBuiltinCFrame(callee);
+        _ = try self.pushBuiltinCFrame(callee, ccmt);
         // P15.82c: Save the index of THIS C-frame. Later, during TBC close,
         // nested Lua/C frames may be pushed on top (e.g. __close metamethod,
         // coroutine.yield builtin C-frame). We must address OUR C-frame,
@@ -50333,7 +50399,7 @@ pub const Vm = struct {
                 };
 
                 if (!reuse_cframe) {
-                    _ = try self.pushBuiltinCFrame(callee);
+                    _ = try self.pushBuiltinCFrame(callee, 0);
                 }
                 const cframe = th.call_frames.getPtr(th.call_frames.len() - 1);
                 // P15.82e: remember the previous state (owned by an outer
@@ -51451,7 +51517,7 @@ pub const Vm = struct {
                 };
                 if (!reuse_cframe) {
                     // No C-frame at all (yieldk from a raw C context).
-                    _ = try self.pushBuiltinCFrame(.{ .Thread = th });
+                    _ = try self.pushBuiltinCFrame(.{ .Thread = th }, 0);
                 }
                 const cframe = th.call_frames.getPtr(th.call_frames.len() - 1);
                 // P15.82e: an old state (if any) is owned by the running
@@ -51843,7 +51909,7 @@ pub const Vm = struct {
                 // Reuse the existing C-frame (or push one only as a
                 // fallback when there is none at all).
                 if (!reuse_cframe) {
-                    _ = try self.pushBuiltinCFrame(callee);
+                    _ = try self.pushBuiltinCFrame(callee, 0);
                 }
                 const cframe = th.call_frames.getPtr(th.call_frames.len() - 1);
 
@@ -52274,12 +52340,12 @@ pub const Vm = struct {
         const retv: Value = switch (fnv) {
             .Builtin => |id| blk: {
                 var out: [1]Value = .{.Nil};
-                const bres = self.callBuiltin(id, &[_]Value{}, out[0..], .host) catch return 0.0;
+                const bres = self.callBuiltin(id, &[_]Value{}, out[0..], .host, 0) catch return 0.0;
                 _ = self.consumeBuiltinResult(bres, out[0..]);
                 break :blk out[0];
             },
             .Closure => |cl| blk: {
-                const ret = self.runClosure(cl, &[_]Value{}) catch return 0.0;
+                const ret = self.runClosure(cl, &[_]Value{}, 0) catch return 0.0;
                 defer self.alloc.free(ret);
                 break :blk if (ret.len > 0) ret[0] else .Nil;
             },
@@ -54522,7 +54588,7 @@ test "vm: P16.8a transactional simple_result setup — errdefer rollback on push
     // Stage the parent frame at slot 0 (PUC: lua_pcallk pushes func+args
     // onto the stack before docall) and activate.
     const staged_parent = try vm.stageBytecodeCall(th, 0, parent_cl, &.{});
-    try vm.pushStagedBytecodeExecFrame(th, exec_frames, parent_proto, staged_parent.func_slot, staged_parent.nargs, -1);
+    try vm.pushStagedBytecodeExecFrame(th, exec_frames, parent_proto, staged_parent.func_slot, staged_parent.nargs, -1, 0);
     const parent_index: usize = 0;
     const saved_frame_count = exec_frames.len();
     const saved_top = th.top;
@@ -54697,7 +54763,7 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
     const th = vm.activeBytecodeThread();
     const exec_frames = &th.call_frames;
     const staged_parent = try vm.stageBytecodeCall(th, 0, parent_cl, &.{});
-    try vm.pushStagedBytecodeExecFrame(th, exec_frames, parent_proto, staged_parent.func_slot, staged_parent.nargs, -1);
+    try vm.pushStagedBytecodeExecFrame(th, exec_frames, parent_proto, staged_parent.func_slot, staged_parent.nargs, -1, 0);
 
     // The activation's addOne allocates only after the inline frame array
     // (INLINE_FRAME_CAP) is full — frames below the cap come from the
@@ -54713,7 +54779,7 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
     while (exec_frames.len() < INLINE_FRAME_CAP) {
         const slot = th.stack.len - parent_window * (INLINE_FRAME_CAP - exec_frames.len());
         const staged = try vm.stageBytecodeCall(th, slot, parent_cl, &.{});
-        try vm.pushStagedBytecodeExecFrame(th, exec_frames, parent_proto, staged.func_slot, staged.nargs, -1);
+        try vm.pushStagedBytecodeExecFrame(th, exec_frames, parent_proto, staged.func_slot, staged.nargs, -1, 0);
     }
     // The metamethod's parent is the LAST pushed frame — the top of the
     // frame stack. The main thread's base frame (Vm.init's
@@ -59165,7 +59231,7 @@ test "P16.50-review-2 B3: callCFunction ERRMEM/ERRRUN status transport" {
         const saved = vm.alloc;
         vm.alloc = failing.allocator();
         defer vm.alloc = saved;
-        const r = vm.callCFunction(p50PushClosureCf, .Nil, &.{});
+        const r = vm.callCFunction(p50PushClosureCf, .Nil, &.{}, 0);
         try testing.expectEqual(error.OutOfMemory, r);
     }
     // BLOCKER 1: the C-frame is popped — NO manual repair.
@@ -59175,7 +59241,7 @@ test "P16.50-review-2 B3: callCFunction ERRMEM/ERRRUN status transport" {
 
     // ---- Part 1b: state genuinely usable afterward (same call succeeds) ----
     {
-        const result = try vm.callCFunction(p50PushClosureCf, .Nil, &.{});
+        const result = try vm.callCFunction(p50PushClosureCf, .Nil, &.{}, 0);
         defer vm.alloc.free(result);
         try testing.expectEqual(@as(usize, 1), result.len);
         const cl = result[0].Closure;
@@ -59186,7 +59252,7 @@ test "P16.50-review-2 B3: callCFunction ERRMEM/ERRRUN status transport" {
 
     // ---- Part 2: ERRRUN via lua_error keeps the original object ----
     {
-        const r = vm.callCFunction(p50LuaErrorCf, .Nil, &.{});
+        const r = vm.callCFunction(p50LuaErrorCf, .Nil, &.{}, 0);
         try testing.expectEqual(error.RuntimeError, r);
         const msg = vm.errThread().err_obj;
         try testing.expect(msg == .String);
@@ -59201,7 +59267,7 @@ test "P16.50-review-2 B3: callCFunction ERRMEM/ERRRUN status transport" {
             var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1, .resize_fail_index = 1 });
             const saved = vm.alloc;
             vm.alloc = failing.allocator();
-            const r = vm.callCFunction(p50PushClosureCf, .Nil, &.{});
+            const r = vm.callCFunction(p50PushClosureCf, .Nil, &.{}, 0);
             vm.alloc = saved;
             try testing.expectEqual(error.OutOfMemory, r);
             try testing.expectEqual(frames0, th.call_frames.len());
@@ -60028,7 +60094,7 @@ fn p50r5SweepTracked(
         var track = P50TrackAlloc{ .base = failing.allocator() };
         const saved = vm.alloc;
         vm.alloc = track.allocator();
-        const r = vm.callCFunction(cf, .Nil, &.{});
+        const r = vm.callCFunction(cf, .Nil, &.{}, 0);
         if (r) |result| {
             first_success = fail_idx;
             try testing.expectEqual(@as(usize, 1), result.len);
@@ -60168,7 +60234,7 @@ fn p50r3Sweep(
         });
         const saved = vm.alloc;
         vm.alloc = failing.allocator();
-        const r = vm.callCFunction(cf, .Nil, args);
+        const r = vm.callCFunction(cf, .Nil, args, 0);
         vm.alloc = saved;
 
         const census = p50r3CensusResidue(vm, snap.chain.len);
@@ -60503,7 +60569,7 @@ test "P16.50-review-3 R2: exported throwing APIs under callCFunction OOM sweeps"
 
             const saved = vm.alloc;
             vm.alloc = failing.allocator();
-            const r = vm.callCFunction(p50r3CfNewthread, .Nil, &.{});
+            const r = vm.callCFunction(p50r3CfNewthread, .Nil, &.{}, 0);
             vm.alloc = saved;
 
             if (r) |result| {
@@ -60589,7 +60655,7 @@ test "P16.50-review-3 R2: exported throwing APIs under callCFunction OOM sweeps"
         });
         const saved = vm.alloc;
         vm.alloc = failing.allocator();
-        const r = vm.callCFunction(p50r3CfCreatetable, .Nil, &.{});
+        const r = vm.callCFunction(p50r3CfCreatetable, .Nil, &.{}, 0);
         vm.alloc = saved;
 
         // P16.50-review-4 BLOCKER 3 fix: lua_createtable THROWS — the
@@ -60660,7 +60726,7 @@ test "P16.50-review-5 B2: C-ABI throw matrix" {
             });
             const saved = vm.alloc;
             vm.alloc = failing.allocator();
-            const r = vm.callCFunction(p50r5CfSetglobal, .Nil, &.{});
+            const r = vm.callCFunction(p50r5CfSetglobal, .Nil, &.{}, 0);
             vm.alloc = saved;
 
             const census = p50r3CensusResidue(vm, snap.chain.len);
@@ -60780,7 +60846,7 @@ test "P16.50-review-5 B2: C-ABI throw matrix" {
     {
         const snap = try P50Snapshot.take(vm, testing.allocator);
         defer snap.deinit(testing.allocator);
-        const r = try vm.callCFunction(p50r3CfPushcfunction, .Nil, &.{});
+        const r = try vm.callCFunction(p50r3CfPushcfunction, .Nil, &.{}, 0);
         defer vm.alloc.free(r);
         try testing.expectEqual(@as(usize, 1), r.len);
         try testing.expect(r[0] == .Closure);
@@ -60802,7 +60868,7 @@ test "P16.50-review-5 B2: C-ABI throw matrix" {
             });
             const saved = vm.alloc;
             vm.alloc = failing.allocator();
-            const r = vm.callCFunction(p50r5CfPushstring, .Nil, &.{});
+            const r = vm.callCFunction(p50r5CfPushstring, .Nil, &.{}, 0);
             vm.alloc = saved;
             try testing.expectEqual(error.OutOfMemory, r);
             try testing.expectEqual(frames0, th.call_frames.len());
@@ -61787,7 +61853,7 @@ test "A1.0c boundary 8b: real nested C→C boundaries — inner landing restores
 
     // The REAL production nesting: boundary A protects this call, and
     // the pcall inside drives the inner closure through boundary B.
-    const r = try vm.callCFunction(a10nOuterThrowCf, .Nil, &.{});
+    const r = try vm.callCFunction(a10nOuterThrowCf, .Nil, &.{}, 0);
     defer vm.alloc.free(r);
     try testing.expectEqual(@as(usize, 1), r.len);
     try testing.expect(std.meta.eql(r[0], .{ .Int = 55 }));
@@ -61833,7 +61899,7 @@ test "A1.0c boundary 8b: real nested C→C boundaries — inner landing restores
 
     // The state is usable: a repeat protected call through a fresh
     // boundary works and leaves the baseline exact.
-    const r2 = try vm.callCFunction(a10CleanCf, .Nil, &.{});
+    const r2 = try vm.callCFunction(a10CleanCf, .Nil, &.{}, 0);
     defer vm.alloc.free(r2);
     try testing.expectEqual(@as(usize, 1), r2.len);
     try testing.expectEqual(roots_v0, vm.gc_root_values.items.len);
@@ -62126,7 +62192,7 @@ test "A1.0c hook boundary 11: count-hook lua_error lands on the hook boundary �
     try testing.expectEqual(mark.cells_len, vm.gc_root_cells.items.len);
     try testing.expectEqual(mark.depth, vm.gc_root_depth);
 
-    const r2 = try vm.callCFunction(a10CleanCf, .Nil, &.{});
+    const r2 = try vm.callCFunction(a10CleanCf, .Nil, &.{}, 0);
     defer vm.alloc.free(r2);
     try testing.expectEqual(@as(usize, 1), r2.len);
 
@@ -63336,7 +63402,7 @@ test "A1.0 boundary 5: runtime-error jump drops the abandoned scope and keeps th
     const roots_c0 = vm.gc_root_cells.items.len;
     const depth0 = vm.gc_root_depth;
 
-    const r = vm.callCFunction(a10ThrowWithScopeCf, .Nil, &.{});
+    const r = vm.callCFunction(a10ThrowWithScopeCf, .Nil, &.{}, 0);
     try testing.expectEqual(error.RuntimeError, r);
     // The landing restored the boundary mark: the callback's abandoned
     // Value AND Cell roots are gone, and the depth is back.
@@ -63359,7 +63425,7 @@ test "A1.0 boundary 5: runtime-error jump drops the abandoned scope and keeps th
     try testing.expect(vm.testGcChainLen() < gc0);
 
     // A repeat API call through the same boundary works.
-    const r2 = try vm.callCFunction(a10CleanCf, .Nil, &.{});
+    const r2 = try vm.callCFunction(a10CleanCf, .Nil, &.{}, 0);
     defer vm.alloc.free(r2);
     try testing.expectEqual(@as(usize, 1), r2.len);
     try testing.expectEqual(frames0, th.call_frames.len());
@@ -63384,7 +63450,7 @@ test "A1.0 boundary 6: OOM jump drops the abandoned scope; fixed MEMERRMSG ident
     defer a10_oneshot = null;
     const saved_alloc = vm.alloc;
     vm.alloc = one_shot.allocator();
-    const r = vm.callCFunction(a10OomWithScopeCf, .Nil, &.{});
+    const r = vm.callCFunction(a10OomWithScopeCf, .Nil, &.{}, 0);
     vm.alloc = saved_alloc;
 
     try testing.expect(one_shot.failed); // the armed shot fired inside the callback
@@ -63402,7 +63468,7 @@ test "A1.0 boundary 6: OOM jump drops the abandoned scope; fixed MEMERRMSG ident
 
     // The state is genuinely usable after the OOM jump: a repeat API
     // call through the same boundary succeeds on the healthy allocator.
-    const r2 = try vm.callCFunction(a10CleanCf, .Nil, &.{});
+    const r2 = try vm.callCFunction(a10CleanCf, .Nil, &.{}, 0);
     defer vm.alloc.free(r2);
     try testing.expectEqual(@as(usize, 1), r2.len);
     try testing.expectEqual(frames0, th.call_frames.len());
@@ -63500,7 +63566,7 @@ test "A1.0 boundary 8: nested boundary drops only inner roots; outer handles and
     // ── Error variant: the inner protected callback opens its OWN scope
     // on top and throws — the inner landing must drop ONLY the inner
     // roots (a relative restore, never a truncate-to-zero). ──
-    const r = vm.callCFunction(a10ThrowWithScopeCf, .Nil, &.{});
+    const r = vm.callCFunction(a10ThrowWithScopeCf, .Nil, &.{}, 0);
     try testing.expectEqual(error.RuntimeError, r);
     try testing.expectEqual(mark_outer.values_len, vm.gc_root_values.items.len);
     try testing.expectEqual(mark_outer.cells_len, vm.gc_root_cells.items.len);
@@ -63580,7 +63646,7 @@ test "A1.0 boundary 9: normal-return leaked scope — Debug invariant discrimina
         // runs through callCFunction and finish's DEFENSIVE restore
         // brings the root state back to the boundary mark (no permanent
         // roots), with the call itself succeeding normally.
-        const r = try vm.callCFunction(a10LeakScopeCf, .Nil, &.{});
+        const r = try vm.callCFunction(a10LeakScopeCf, .Nil, &.{}, 0);
         defer vm.alloc.free(r);
         try testing.expectEqual(@as(usize, 1), r.len);
         try testing.expect(std.meta.eql(r[0], .{ .Int = 7 }));
@@ -63590,7 +63656,7 @@ test "A1.0 boundary 9: normal-return leaked scope — Debug invariant discrimina
     }
 
     // Both modes: a subsequent clean call passes the boundary unchanged.
-    const r2 = try vm.callCFunction(a10CleanCf, .Nil, &.{});
+    const r2 = try vm.callCFunction(a10CleanCf, .Nil, &.{}, 0);
     defer vm.alloc.free(r2);
     try testing.expectEqual(@as(usize, 1), r2.len);
     try testing.expectEqual(roots_v0, vm.gc_root_values.items.len);
@@ -64062,7 +64128,7 @@ test "P16.50-review-7 B3.1: protected-call pre-publish OOM edges roll back exact
     const th = vm.activeBytecodeThread();
     const exec_frames = &th.call_frames;
     const staged_parent = try vm.stageBytecodeCall(th, 0, parent_cl, &.{});
-    try vm.pushStagedBytecodeExecFrame(th, exec_frames, parent_proto, staged_parent.func_slot, staged_parent.nargs, -1);
+    try vm.pushStagedBytecodeExecFrame(th, exec_frames, parent_proto, staged_parent.func_slot, staged_parent.nargs, -1, 0);
     const parent_index: usize = 0;
 
     // Pre-warm the FrameStack capacity (push + pop a scratch target
@@ -64071,7 +64137,7 @@ test "P16.50-review-7 B3.1: protected-call pre-publish OOM edges roll back exact
     // capacity growth on the first target push.
     {
         const scratch = try vm.stageBytecodeCall(th, th.top, target_cl, &.{.{ .Int = 1 }});
-        try vm.pushStagedBytecodeExecFrame(th, exec_frames, target_proto, scratch.func_slot, scratch.nargs, -1);
+        try vm.pushStagedBytecodeExecFrame(th, exec_frames, target_proto, scratch.func_slot, scratch.nargs, -1, 0);
         vm.popBytecodeExecFrame(th, exec_frames);
     }
 
@@ -64248,7 +64314,7 @@ test "P16.50-review-7 B3.2: debug-hook pre-publish OOM edges roll back exactly" 
     const th = vm.activeBytecodeThread();
     const exec_frames = &th.call_frames;
     const staged_parent = try vm.stageBytecodeCall(th, 0, parent_cl, &.{});
-    try vm.pushStagedBytecodeExecFrame(th, exec_frames, parent_proto, staged_parent.func_slot, staged_parent.nargs, -1);
+    try vm.pushStagedBytecodeExecFrame(th, exec_frames, parent_proto, staged_parent.func_slot, staged_parent.nargs, -1, 0);
     const parent_index: usize = 0;
 
     // Pre-warm persistent structures so the per-iteration byte-exact
@@ -64260,7 +64326,7 @@ test "P16.50-review-7 B3.2: debug-hook pre-publish OOM edges roll back exactly" 
     // NOT be pre-warmed away).
     {
         const scratch = try vm.stageBytecodeCall(th, th.top, hook_cl, &.{});
-        try vm.pushStagedBytecodeExecFrame(th, exec_frames, hook_proto, scratch.func_slot, scratch.nargs, -1);
+        try vm.pushStagedBytecodeExecFrame(th, exec_frames, hook_proto, scratch.func_slot, scratch.nargs, -1, 0);
         vm.popBytecodeExecFrame(th, exec_frames);
         var warm_scope = try vm.openRootScope(1, 0);
         defer warm_scope.close();
@@ -64481,7 +64547,7 @@ test "P16.50-review-7 B3.4a: beginBytecodeClose pre-publish OOM edges roll back 
     const th = vm.activeBytecodeThread();
     const exec_frames = &th.call_frames;
     const staged_parent = try vm.stageBytecodeCall(th, 0, parent_cl, &.{});
-    try vm.pushStagedBytecodeExecFrame(th, exec_frames, parent_proto, staged_parent.func_slot, staged_parent.nargs, -1);
+    try vm.pushStagedBytecodeExecFrame(th, exec_frames, parent_proto, staged_parent.func_slot, staged_parent.nargs, -1, 0);
     const parent_index: usize = 0;
     const base_frames = exec_frames.len();
 

@@ -117,6 +117,16 @@ static int cb_yieldchk(lua_State *L) {
     return lua_yieldk(L, 0, 0, cont_chk);
 }
 
+/* CALL hook: print the hooked frame's chain count whenever nonzero —
+** proves the chained builtin activation is a real C frame whose callstatus
+** carries CIST_CCMT (read through the ar handed to the hook) */
+static void thook(lua_State *L, lua_Debug *ar) {
+    if (ar->event != LUA_HOOKCALL) return;
+    if (!lua_getinfo(L, "t", ar)) return;
+    if (ar->extraargs > 0)
+        printf("F7f ea=%d\n", (int)ar->extraargs);
+}
+
 /* --- harness --- */
 
 /* A chain table of `links` __call links ending at f: calling t(...) shifts
@@ -290,6 +300,36 @@ int main(void) {
         "local function f7() return t7(true) end\n"
         "local ok, err = pcall(f7)\n"
         "MSG = err");
+
+    /* --- non-tailcall chain reaching a C function (OP_CALL arm) --- */
+
+    push_chain(L, cb_check1, 15);
+    lua_setglobal(L, "c15chk");
+    run_chunk_msg(L, "F7d",
+        "local function f7d() local x = c15chk() return x end\n"
+        "local ok, err = pcall(f7d)\n"
+        "MSG = err");
+
+    /* --- a chain table as a direct for-iterator (TFORCALL arm) --- */
+
+    run_chunk_msg(L, "F7e",
+        "local ok, err = pcall(function() for x in c15chk do end end)\n"
+        "MSG = err");
+
+    /* --- C call-hook on chained builtin activations (sync lane): the
+    ** event's frame reports the chain count — host resolution (pcall) and
+    ** the bytecode OP_CALL path alike --- */
+
+    lua_sethook(L, thook, LUA_MASKCALL, 0);
+    run_chunk(L, "F7f",
+        "local cg = setmetatable({}, {__call = collectgarbage})\n"
+        "local sub = setmetatable({}, {__call = string.sub})\n"
+        "pcall(cg, 'count')\n"
+        "pcall(sub, 1, 2)\n"
+        "local t15 = setmetatable({}, {__call =\n"
+        "  setmetatable({}, {__call = collectgarbage})})\n"
+        "pcall(t15, 'count')");
+    lua_sethook(L, NULL, 0, 0);
 
     /* --- chain length boundary on the bytecode call path --- */
 

@@ -22759,6 +22759,16 @@ pub const Vm = struct {
         // precallC entry invariant for the C-iterator arm: the C-frame push
         // lands above the in-stack args source — no memcpy alias).
         ctx.th.top = ctx.base + a + 5 + effective_nargs;
+        // A __call chain raised th.top above the frame's published window
+        // (tryCallMetamethodInPlace grows ctx.cap without publishing); the
+        // iterator's C-frame below is pushed at this bound and popped back
+        // to it, so the caller's window must cover the transient call
+        // region — same sync as OP_CALL/OP_TAILCALL (shrink/GC read
+        // windowTop() for the live region).
+        {
+            const fr_pub = ctx.exec_frames.getPtr(ctx.frame_index);
+            if (!fr_pub.isC()) fr_pub.limit = ctx.cap + 1;
+        }
 
         // Bytecode iterators join the iterative dispatch stack (same as OP_CALL).
         if (callee_val == .Closure) {
@@ -22800,15 +22810,13 @@ pub const Vm = struct {
                 // the C CallInfo exists before LUA_HOOKCALL fires, and the
                 // name resolves to "for iterator" (getFuncNameForFrame's
                 // .tforcall branch reads this caller's instruction).
+                // PUC has no frameless iterator: EVERY builtin iterator
+                // activation is a real C activation, direct or chained.
                 // P16.41 Cut 3 Variant A: the C-frame is a VIEW at the
                 // EXISTING iterator slot R[A+4] (pushBuiltinCFrameAt — PUC
                 // precallC views the func slot in the caller's window).
-                // P16.50-review-6 BLOCKER 1: default to the full window (the
-                // frameless path — collectgarbage/string_sub — never calls
-                // callBuiltin here; pre-existing shape), overwrite with the
-                // real contract when the C-frame path runs.
-                var tfc_bres: BuiltinResult = .{ .window = out_len };
-                if (builtinNeedsCFrame(id)) {
+                var tfc_bres: BuiltinResult = undefined;
+                {
                     try self.pushBuiltinCFrameAt(ctx.base + a + 4, chain_depth);
                     const cf_idx = self.activeBytecodeThread().call_frames.len() - 1;
                     // P16.39 Cut 3: re-derive the args slice only when the
@@ -23239,6 +23247,18 @@ pub const Vm = struct {
         // precallC entry invariant for the C-function arm: the C-frame push
         // lands above the in-stack args source — no memcpy alias).
         ctx.th.top = ctx.base + a + 1 + effective_nargs;
+        // A __call chain raised th.top above the frame's published window
+        // (tryCallMetamethodInPlace grows ctx.cap without publishing). Every
+        // arm below runs the callee on/above this bound (the view/staged
+        // C-frame pushes and their pops restore to it), so the caller's
+        // window must cover the transient call region — same sync as
+        // OP_CALL's builtin arm (shrink/GC read windowTop() for the live
+        // region; the safepoint checker enforces containment at every
+        // c_push/c_pop).
+        {
+            const fr_pub = ctx.exec_frames.getPtr(ctx.frame_index);
+            if (!fr_pub.isC()) fr_pub.limit = ctx.cap + 1;
+        }
 
         const hook_args = switch (callee_val) {
             .Closure => |cl| debugCallTransferArgsForClosure(cl, call_args),
@@ -23282,11 +23302,14 @@ pub const Vm = struct {
         } else switch (callee_val) {
             .Builtin => |id| {
                 // P15.83r (PUC precallC via luaD_pretailcall): plain
-                // LUA_HOOKCALL on a FRESH C CallInfo. Divert-bound and
-                // frameless builtins keep the legacy caller-frame identity
-                // (see opCall's dispatch block); sync-bound builtins defer
-                // to the callBuiltin site below.
-                if (self.builtinCallMayDivert(id, hook_args) or id == .collectgarbage or id == .string_sub) {
+                // LUA_HOOKCALL on a FRESH C CallInfo. A chained activation
+                // (chain_depth > 0) always gets that C-frame below, and its
+                // event fires there — not here with the caller-frame
+                // identity. Divert-bound and frameless builtins keep the
+                // legacy caller-frame identity for DIRECT calls.
+                if (chain_depth == 0 and
+                    (self.builtinCallMayDivert(id, hook_args) or id == .collectgarbage or id == .string_sub))
+                {
                     try self.debugDispatchHookWithCalleeTransfer(
                         "call",
                         null,
@@ -23599,8 +23622,9 @@ pub const Vm = struct {
                 // pretailcall's C branch moves func to the caller's func
                 // slot and precallC views it). Pushed for every C-frame
                 // builtin, not just the hook path.
-                // P16.5b: Skip the C-frame push on the coroutine fast path.
-                if (!co_fast_path and builtinNeedsCFrame(id)) {
+                // P16.5b: Skip the C-frame push on the coroutine fast path
+                // (which itself requires chain_depth == 0).
+                if (!co_fast_path and builtinNeedsCFrame(id, chain_depth)) {
                     try self.pushBuiltinCFrameAt(ctx.base + a, chain_depth);
                     const cf_idx = self.activeBytecodeThread().call_frames.len() - 1;
                     if (deferred_builtin_call_hook) {
@@ -23662,14 +23686,15 @@ pub const Vm = struct {
                     } else .{ .window = 0 };
                 } else {
                     // P16.41 Cut 3: view frame pushed above for every
-                    // C-frame builtin; frameless builtins pass .host (the
-                    // staged-push arm is needsCFrame-gated — no frame
-                    // either way, see the opCall site for the rationale).
+                    // C-frame activation (needsCFrame incl. any __call
+                    // chain — PUC precallC always creates the CallInfo);
+                    // only a DIRECT frameless call passes .host (no frame
+                    // either way — same predicate as the push above).
                     // Region end = args end (outs here is
                     // the local outs_small/outs_heap buffer, never a
                     // th.stack window).
                     const tc_cframe_origin: BuiltinCallOrigin =
-                        if (builtinNeedsCFrame(id)) .{ .bytecode_window = ctx.base + a + 1 + effective_nargs } else .host;
+                        if (builtinNeedsCFrame(id, chain_depth)) .{ .bytecode_window = ctx.base + a + 1 + effective_nargs } else .host;
                     tc_bres = self.callBuiltin(id, call_args, outs, tc_cframe_origin, chain_depth) catch |call_err| switch (call_err) {
                         error.Yield => {
                             if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
@@ -24044,7 +24069,12 @@ pub const Vm = struct {
             deferred_call_hook = true;
         } else switch (resolved_callee) {
             .Builtin => |id| {
-                if (self.builtinCallMayDivert(id, rargs) or id == .collectgarbage or id == .string_sub) {
+                // A chained activation (chain_depth > 0) always runs on a
+                // real C-frame below (precallC), so its CALL event fires on
+                // that frame — not here with the caller-frame identity.
+                if (chain_depth == 0 and
+                    (self.builtinCallMayDivert(id, rargs) or id == .collectgarbage or id == .string_sub))
+                {
                     // Legacy caller-frame identity for divert-bound and
                     // frameless builtins.
                     try self.dispatchBytecodeHookWithCallee("call", resolved_callee, rargs);
@@ -24234,8 +24264,9 @@ pub const Vm = struct {
                 // C-frame builtin (not just the hook path), so callBuiltin
                 // (.bytecode_window) never pushes a staged frame here.
                 // P16.5b: Skip the C-frame push entirely on the coroutine
-                // fast path — guards guarantee no hooks need it.
-                if (!co_fast_path and builtinNeedsCFrame(id)) {
+                // fast path — guards guarantee no hooks need it (and the
+                // fast path itself requires chain_depth == 0).
+                if (!co_fast_path and builtinNeedsCFrame(id, chain_depth)) {
                     try self.pushBuiltinCFrameAt(ctx.base + a, chain_depth);
                     const cf_idx = self.activeBytecodeThread().call_frames.len() - 1;
                     if (deferred_builtin_call_hook) {
@@ -24309,16 +24340,17 @@ pub const Vm = struct {
                     } else .{ .window = 0 };
                 } else {
                     // P16.41 Cut 3: the view frame was pushed above for every
-                    // C-frame builtin; frameless builtins (collectgarbage/
-                    // string_sub) have no frame at all (Cut 1 documented
-                    // deviation) and pass .host — callBuiltin's staged-push
-                    // arm is gated by builtinNeedsCFrame, so nothing is
-                    // pushed or popped for them either way.
+                    // C-frame activation (needsCFrame incl. any __call chain
+                    // — PUC precallC always creates the CallInfo); only a
+                    // DIRECT frameless call (collectgarbage/string_sub,
+                    // chain_depth == 0) has no frame at all and passes .host
+                    // — callBuiltin's staged-push arm is gated by the same
+                    // predicate, so nothing is pushed or popped for it.
                     // Region end precomputed — args end
                     // (== outs_start base) and outs end are both ctx.regs
                     // windows; outs_end >= args_end always (out_len >= 0).
                     const cframe_origin: BuiltinCallOrigin =
-                        if (builtinNeedsCFrame(id)) .{ .bytecode_window = ctx.base + outs_start + out_len } else .host;
+                        if (builtinNeedsCFrame(id, chain_depth)) .{ .bytecode_window = ctx.base + outs_start + out_len } else .host;
                     bres = self.callBuiltin(id, rargs_fresh, outs, cframe_origin, chain_depth) catch |call_err| switch (call_err) {
                         error.Yield => {
                             if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
@@ -24625,6 +24657,15 @@ pub const Vm = struct {
                         cl,
                     )) return error.ThreadSwitch;
                 }
+                // A __call chain raised th.top above the frame's published
+                // window (tryCallMetamethodInPlace grows ctx.cap without
+                // publishing); callCFunction stages the C activation at the
+                // raised top, and its error unwind pops back to it — the
+                // caller's window must cover the whole transient call
+                // region (same sync as the .Builtin arm; shrink/GC read
+                // windowTop() to compute the live region).
+                const fr_cc = ctx.exec_frames.getPtr(ctx.frame_index);
+                if (!fr_cc.isC()) fr_cc.limit = ctx.cap + 1;
                 try self.setPendingCall(ctx.exec_frames.getPtr(ctx.frame_index), .{
                     .callee = callee_val,
                     .completion = .{ .results = .{
@@ -25297,10 +25338,12 @@ pub const Vm = struct {
         // view frame (before the CALL hook — PUC precallC ordering) and
         // callBuiltin reuses it — exactly one C-frame per builtin
         // invocation, whoever pushed it. `host`: callBuiltin owns the
-        // staged push, gated by builtinNeedsCFrame as before.
+        // staged push; a __call-chained activation (ccmt != 0) always gets
+        // the frame (PUC precallC) — only the direct frameless pair
+        // (ccmt == 0) keeps no frame.
         const cframe_pushed = switch (origin) {
             .bytecode_window => true,
-            .host => builtinNeedsCFrame(id),
+            .host => builtinNeedsCFrame(id, ccmt),
         };
         // P16.39 Cut 3: pushBuiltinCFrame reports whether it reallocated
         // stack. Only then can args/outs slices into the old allocation
@@ -25330,7 +25373,7 @@ pub const Vm = struct {
         // P15.79: re-derive args only when the push reallocated stack
         // AND args pointed into the old allocation (heap args from
         // resolveCallable's owned_args are safe).
-        const args_fresh: []const Value = if (grew) blk: {
+        var args_fresh: []const Value = if (grew) blk: {
             const args_ptr = @intFromPtr(args.ptr);
             const bc_start = @intFromPtr(old_stack.ptr);
             const bc_end = bc_start + old_stack.len * @sizeOf(Value);
@@ -25343,6 +25386,29 @@ pub const Vm = struct {
         if (staged_args) {
             @memcpy(th.stack[th.top..][0..args_fresh.len], args_fresh);
             th.top += args_fresh.len;
+        }
+        // PUC precallC ordering (ldo.c:642-656): the C CallInfo exists and
+        // its arguments are staged BEFORE the CALL hook fires. Host
+        // dispatch sites do not run activation hooks themselves, so a
+        // __call-chained builtin activation (ccmt != 0) — which owns a real
+        // C-frame here — fires its event on that frame, exactly like the
+        // bytecode dispatch sites and callCFunction. Direct host-origin
+        // builtin calls (ccmt == 0) keep the historical hookless fast
+        // path.
+        if (origin == .host and cframe_pushed and ccmt != 0) {
+            const hook_stack_base = th.stack.ptr;
+            const cf_idx = th.call_frames.len() - 1;
+            const hook_fs = th.call_frames.getConstPtr(cf_idx).func_slot;
+            self.dispatchCCalleeActivationHook(cf_idx, callee_val, th.stack[hook_fs + 1 .. th.top]) catch |hook_err| {
+                self.popBuiltinCFrame();
+                return hook_err;
+            };
+            if (th.stack.ptr != hook_stack_base) {
+                // The sync hook body's nested execution moved the stack;
+                // re-derive the staged-args slice by index (func_slot and
+                // top are indices and unaffected by the move).
+                args_fresh = th.stack[hook_fs + 1 .. hook_fs + 1 + args_fresh.len];
+            }
         }
 
         // P15.38i: register the outs window for refreshBuiltinOuts ONLY for
@@ -52438,10 +52504,11 @@ pub const Vm = struct {
     }
 
     /// P16.39 Cut 3: comptime table — builtins whose synchronous
-    /// callBuiltin path requires a C-frame (pushBuiltinCFrame). False only
-    /// for the frameless pair: collectgarbage and string_sub never re-enter
-    /// the VM in ways that need a C activation (hooks, continuations,
-    /// traceback, yield parking). Replaces the two-enum-compare idiom
+    /// callBuiltin path requires a C-frame (pushBuiltinCFrame) when called
+    /// DIRECTLY (ccmt == 0). False only for the frameless pair:
+    /// collectgarbage and string_sub never re-enter the VM in ways that
+    /// need a C activation (hooks, continuations, traceback, yield
+    /// parking). Replaces the two-enum-compare idiom
     /// (`id != .collectgarbage and id != .string_sub`) with one table load.
     const builtin_needs_cframe: [@typeInfo(BuiltinId).@"enum".fields.len]bool = blk: {
         var t = [_]bool{true} ** @typeInfo(BuiltinId).@"enum".fields.len;
@@ -52450,8 +52517,16 @@ pub const Vm = struct {
         break :blk t;
     };
 
-    inline fn builtinNeedsCFrame(id: BuiltinId) bool {
-        return builtin_needs_cframe[@intFromEnum(id)];
+    /// Does THIS builtin activation need a real C-frame? PUC luaD_precall
+    /// creates a CallInfo for every C-function activation (precallC),
+    /// carrying the __call-chain count in its callstatus — so an activation
+    /// reached through a __call chain (ccmt != 0) always has a C-frame,
+    /// whatever the builtin. The frameless fast path is a direct-call
+    /// optimization ONLY (ccmt == 0): through a chain, PUC goes
+    /// luaT_callTM → luaD_call → precallC, a full C activation with hooks
+    /// and per-frame extraargs.
+    inline fn builtinNeedsCFrame(id: BuiltinId, ccmt: u4) bool {
+        return ccmt != 0 or builtin_needs_cframe[@intFromEnum(id)];
     }
 
     /// P16.39 Cut 3: comptime table — builtins that re-enter the VM and

@@ -128,3 +128,65 @@ echo(coroutine.close(coc))                            -- true
 
 -- The function-value form of getinfo("t") stays 0/0 regardless of any chain.
 echo(debug.getinfo(body15, "t").extraargs, tostring(debug.getinfo(body15, "t").istailcall))
+
+-- A __call chain reaching a BUILTIN is a real C activation (PUC precallC
+-- creates a CallInfo for every C-function callee): from inside a call hook,
+-- getinfo(2,"ft") reports the activation's chain count as extraargs. The
+-- hook reads getinfo directly (no helper calls — a nested frame would shift
+-- the level), and only fields requested via "ft" are printed.
+local function hookrun(fn)
+  local log = {}
+  local function h(ev)
+    local i = debug.getinfo(2, "ft")
+    log[#log + 1] = ev .. "|" .. tostring(i and i.what) ..
+      "|" .. tostring(i and i.istailcall) .. "|" .. tostring(i and i.extraargs)
+  end
+  debug.sethook(h, "c")
+  local ok, r = fn()
+  debug.sethook()
+  local parts = {}
+  for k, v in ipairs(log) do parts[k] = tostring(v) end
+  echo(ok, tostring(r), #log, table.concat(parts, " "))
+end
+
+-- HB1: a builtin called through a __call chain from a host caller (pcall
+-- resolves the chain): the activation's event carries extraargs = links.
+hookrun(function()
+  local cg = setmetatable({}, { __call = collectgarbage })
+  local ok = pcall(cg, "count")
+  return ok                                                -- false, both engines
+end)                                                      -- HB1
+
+-- HB2: string.sub through a chain — same mechanism, frameless pair.
+hookrun(function()
+  local sub = setmetatable({}, { __call = string.sub })
+  local ok = pcall(sub, 1, 2)
+  return ok                                                -- false, both engines
+end)                                                      -- HB2
+
+-- HB3: a 15-link chain to a tolerant builtin succeeds and reports the full
+-- chain length on its activation.
+hookrun(function()
+  return (pcall(mkchain(15, type)))
+end)                                                     -- HB3: true, ea=15
+
+-- HB4: direct builtin calls as the fast-path control: no chain, no
+-- C-chain count on any event, results correct.
+hookrun(function()
+  collectgarbage("count")
+  return string.sub("wxyz", 2, 3)
+end)                                                     -- HB4
+
+-- HB5: after chained builtin activations the VM stays usable — the
+-- chained collectgarbage calls fail on their shifted first argument in
+-- BOTH engines (the frameless pair's argument validation), and the same
+-- state still runs a real GC pass and further builtin calls.
+do
+  local cg = setmetatable({}, { __call = collectgarbage })
+  local t = {}
+  for i = 1, 500 do t[i] = { k = i } end
+  local ok1 = (pcall(cg, "collect"))
+  local ok2, n = pcall(cg, "count")
+  echo(ok1, ok2, type(n) == "number", #t)
+  echo(collectgarbage("count") ~= 0, string.sub("wxyz", 2, 3)) -- reuse control
+end

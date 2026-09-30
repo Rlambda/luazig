@@ -21841,19 +21841,30 @@ pub const Vm = struct {
                         // hook observes the line of the instruction AFTER
                         // VARARGPREP — the frame's parked pc is 0 here.
                         if (self.hooks_active_cached) {
-                            const fr_hk = ctx.exec_frames.getPtr(ctx.frame_index);
+                            // Own the frame by INDEX: the frame may live in
+                            // FrameStack.heap, and the nested hook body below
+                            // can push frames past the heap capacity — the
+                            // ArrayList growth MOVES the buffer, so a raw
+                            // *CallFrame held across the dispatch dangles and
+                            // the cleanup store would write freed memory.
+                            // Re-lookup at cleanup keeps the pc's owner the
+                            // live frame; the reads above the window are
+                            // plain values copied before the dispatch.
+                            const fr_hk_idx = ctx.frame_index;
+                            const fr_hk = ctx.exec_frames.getPtr(fr_hk_idx);
                             const ev: []const u8 = if (fr_hk.isTailCall()) "tail call" else "call";
                             const callee_hk = ctx.th.stack[fr_hk.func_slot];
                             const nparams_hk = ctx.cur_proto.numparams;
+                            const transfer_base = fr_hk.frameBase();
                             fr_hk.u.lua.pc = 1;
-                            defer fr_hk.u.lua.pc = 0;
+                            defer ctx.exec_frames.getPtr(fr_hk_idx).u.lua.pc = 0;
                             try self.debugDispatchHookWithCalleeTransfer(
                                 ev,
                                 null,
                                 callee_hk,
-                                ctx.th.stack[fr_hk.frameBase() .. fr_hk.frameBase() + nparams_hk],
+                                ctx.th.stack[transfer_base .. transfer_base + nparams_hk],
                                 1,
-                                ctx.frame_index,
+                                fr_hk_idx,
                             );
                             // The nested hook body may have reallocated the
                             // value stack — this handler continues into the
@@ -23625,6 +23636,13 @@ pub const Vm = struct {
                         1,
                         ctx.frame_index,
                     );
+                    // The hook body's nested execution may have reallocated
+                    // the value stack. This handler returns into the INNER
+                    // instruction loop (continue_no_advance — no frame_loop
+                    // re-derivation), so refresh the cached window before the
+                    // reused frame executes its next instruction (same
+                    // contract as the VARARGPREP hook site).
+                    ctx.regs = ctx.th.stack[ctx.base .. ctx.base + ctx.cap];
                 }
                 return .continue_no_advance;
             },
@@ -36844,6 +36862,14 @@ pub const Vm = struct {
         } else "";
         try self.debugInfoValidateOpts(what);
 
+        // `args` is a view into the caller's stack window. allocTable below
+        // runs the PUC luaC_condGC step at the API-boundary position, and
+        // that step's atomic phase may shrink (realloc, MOVE) the value
+        // stack — read the level-or-function operand BY VALUE before the
+        // first MayGC allocation, exactly like PUC reads its arguments off
+        // L->top before lua_createtable.
+        const arg1 = args[i];
+
         // Temp roots: protect `t` across calls to debugFillInfoFromIrFunction
         // which internally allocates an activelines table (triggering GC).
         var scope = try self.openRootScope(1, 0);
@@ -36854,7 +36880,7 @@ pub const Vm = struct {
 
         try self.setField(t, "currentline", .{ .Int = 0 });
 
-        switch (args[i]) {
+        switch (arg1) {
             .Int => |level| {
                 // PUC lua_getstack: level is a 0-based depth from the top
                 // of the CallInfo chain — level 0 is the running C
@@ -38170,8 +38196,23 @@ pub const Vm = struct {
             true;
         if (!match) return;
 
+        // Root the interned event string for the whole dispatch window.
+        // argv_buf below is a C-stack local — NOT a GC root — and the
+        // transfer-copy allocation is MayGC (the allocator's OOM tryagain
+        // runs one emergency full GC, and string_intern is not a marking
+        // root), so an unrooted event string is swept the moment a memory
+        // limit fails an allocation inside this window. Reserve the scope
+        // FIRST (infraAlloc — NoGC reserve), then intern, then protect
+        // infallibly: no MayGC operation can run between the intern and the
+        // protect, and the scope stays open until the hook body has
+        // completed and the arguments were consumed.
+        var evt_scope = try self.openRootScope(1, 0);
+        defer evt_scope.close();
+        const event_str = try self.internStr(event);
+        _ = evt_scope.protectValueAssumeCapacity(.{ .String = event_str });
+
         var argv_buf: [2]Value = undefined;
-        argv_buf[0] = .{ .String = try self.internStr(event) };
+        argv_buf[0] = .{ .String = event_str };
         var argc: usize = 1;
         const hook_line = line;
         if (hook_line) |l| {

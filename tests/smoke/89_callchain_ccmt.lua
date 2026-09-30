@@ -288,28 +288,38 @@ hclog(function()
   return f()
 end)
 
--- HC8: a real GC step inside the hook body while a chained activation is
--- on the stack: the activation's identity stays correct and the callee's
--- arguments survive the collection (the transfer window is owned by the
--- dispatcher for the hook's duration).
-hclog(function()
-  local ob = setmetatable({}, { __call = function(_, s) return s .. "!" end })
-  local function f() local x = ob("arg") return x end
+-- HC8: a real GC step inside the hook body on the chained activation. The
+-- criterion is REACHABLE (i.func == the __call closure itself, captured in a
+-- local — the metatable's field is not directly readable from the object),
+-- so collectgarbage("step") really executes, and both the activation's
+-- identity and the callee's arguments survive the collection (the transfer
+-- window is owned by the dispatcher and the event string is rooted for the
+-- dispatch window).
+do
+  local callmm = function(_, s)
+    return s .. "!"
+  end
+  local ob = setmetatable({}, { __call = callmm })
+  local function f()
+    local x = ob("arg")
+    return x
+  end
   local log_seen
   local function h(ev)
     local i = debug.getinfo(2, "ft")
-    if i and i.func == ob.__call and i.extraargs == 1 then
+    if i and i.func == callmm and i.extraargs == 1 then
       log_seen = ev
       collectgarbage("step")
       local j = debug.getinfo(2, "ft")
-      log_seen = log_seen .. "|" .. tostring(j and j.extraargs)
+      log_seen = log_seen .. "|" .. tostring(j and j.extraargs) ..
+        "|" .. tostring(j and j.func == callmm)
     end
   end
   debug.sethook(h, "c")
   local r = f()
   debug.sethook()
-  return tostring(r) .. "/" .. tostring(log_seen)
-end)
+  echo("HC8", tostring(r), tostring(log_seen))
+end
 
 -- HC9: an error raised inside the hook on the chained activation
 -- propagates to the caller's pcall with the exact object (level 0 — no
@@ -326,36 +336,51 @@ hclog(function()
   return tostring(ok) .. "/" .. tostring(msg)
 end)
 
--- HC10: a call-event hook cannot yield (PUC hookf uses lua_call): the
--- yield attempt raises the C-call-boundary error, catchable inside the
--- hook, and the chained call still completes exactly once.
-hclog(function()
+-- HC10: a call-event hook cannot yield — PUC's debug.sethook wrapper (hookf,
+-- ldblib.c) invokes the hook through lua_call, so the yield attempt raises
+-- "attempt to yield across a C-call boundary". The denial is OBSERVED: the
+-- pcall inside the hook catches it (the result is stored in a local upvalue
+-- — a function value has no fields to assign), and the chained call still
+-- completes exactly once with its result intact.
+do
   local ob = setmetatable({}, { __call = type })
+  local denied = "unset"
   local co = coroutine.create(function()
     local function h(ev)
       local i = debug.getinfo(2, "ft")
-      if i and i.func == type then
+      if i and i.func == type and i.extraargs == 1 and denied == "unset" then
         local ok = pcall(coroutine.yield)
-        h.yield_denied = tostring(ok)
+        denied = tostring(ok)
       end
     end
     debug.sethook(h, "c")
     local r = ob("x")
     debug.sethook()
-    return r .. "/" .. tostring(h.yield_denied)
+    return r .. "/" .. denied
   end)
   local ok, res = coroutine.resume(co)
-  return tostring(ok) .. "/" .. tostring(res)
-end)
+  echo("HC10", tostring(ok), tostring(res))
+end
 
--- HC11: a line hook that yields across a chained call in a coroutine
--- body: on resume the callee runs to completion exactly once (no double
--- execution through the hook machinery).
+-- HC11: a LINE hook that yields across a chained call in a coroutine body.
+-- PUC forbids this yield too (hookf's lua_call boundary): the resume fails
+-- with the C-call-boundary error, the coroutine dies, and the chained callee
+-- NEVER executes — the call counter proves zero executions (no silent
+-- double-run and no silent single-run behind a fake success).
 do
-  local ob = setmetatable({}, { __call = function(_, s) return s end })
   local calls = 0
+  local ob = setmetatable({}, { __call = function(_, s)
+    calls = calls + 1
+    return s
+  end })
   local co = coroutine.create(function()
-    local function h() coroutine.yield("park") end
+    local parked = false
+    local function h()
+      if not parked then
+        parked = true
+        coroutine.yield("park")
+      end
+    end
     debug.sethook(h, "l")
     local r = ob("once")
     debug.sethook()
@@ -363,5 +388,5 @@ do
   end)
   local ok1, y = coroutine.resume(co)
   local ok2, r = coroutine.resume(co)
-  echo(ok1, tostring(y), ok2, tostring(r))
+  echo("HC11", tostring(ok1), tostring(y), tostring(ok2), tostring(r), calls)
 end

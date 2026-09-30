@@ -58,7 +58,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   CCMT-cut'а без отдельного исправления; F9b metadata/owner proof
   остаётся пригодным. Open-count 27→28.
 
-- [ ] **`lua_Debug` ABI-layout относительно PUC 5.5 (HIGH,
+- [x] **`lua_Debug` ABI-layout относительно PUC 5.5 (HIGH,
   ARCHITECTURAL-BACKLOG; review A1.next-ccmt research).** Предложенный
   Cut 2 добавляет `extraargs`, но сохраняет `ftransfer`/`ntransfer` как
   `unsigned short`/`u16`, тогда как PUC `lua.h` задаёт оба поля как `int`.
@@ -71,6 +71,13 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   нужен полный `sizeof`/`offsetof`-контракт для C и Zig, включая transfer-
   поля, hook/getinfo writes и пересборку tracked ELF. Не считать один
   `sizeof=144` доказательством совместимости. Open-count 26→27.
+  CLOSED (ccmt cut 2, 2718f09): PUC-layout внедрён полностью —
+  ftransfer/ntransfer int/c_int @68/72 (select-контроль ntransfer=
+  70001), extraargs u8@63, short_src@76, i_ci@136, sizeof 144, align 8;
+  19 C _Static_assert + comptime 18 offset-ассертов обеих сборок;
+  cross-read PUC-header→zig byte-identical; "r"-arm по ldebug.c:376-383
+  (прежде else-утечка); ВСЕ tracked ELF пересобраны; canonical
+  36_ccmt_abi 3-линии triple-identical sha256 0c7a7fb2.
 
 - [x] **PUC `CIST_CCMT` / `lua_Debug.extraargs` при `__call`-цепочке
   (BLOCKER, ARCHITECTURAL-BACKLOG; cidx-corr review).** Коррекция

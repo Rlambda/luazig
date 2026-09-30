@@ -101,13 +101,18 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
 F2 (`lua_settop`/`lua_closeslot` error transport) остаётся открытым bounded
 parity-дефектом; F3 (forced-close region ownership) закрыт `9b1bad7`.
 
-4. **t2 call-window top-publication — ВЫПОЛНЕНО (t2 implementation).**
+4. **t2 call-window top-publication — correction после review `fc42243`.**
    PUC-точная per-opcode публикация Thread.top перед MayGC (operand-end
    для OP_CALL/OP_TAILCALL/OP_CONCAT/OP_TFORCALL; frame-window для
    OP_CLOSURE/fixed-OP_SETLIST; opNewtable PUC-порядок) + класс 2
    (heap-ret RootScope-rooting в apply-путях). Canonical
-   tests/stress/t2_gc_bound_publication.lua; perf geomean 0.996
-   (нейтрально). Открытый пункт STATUS закрыт.
+   tests/stress/t2_gc_bound_publication.lua исправляет исходный t2.
+   Однако `pushResolvedBytecodeClosure` публикует `windowTop` с
+   `EXTRA_MARGIN`, а не точный PUC `ci->top`; weak-value differential
+   показывает наблюдаемое удержание мёртвого объекта. Для класса 2
+   RootScope реализован, но decisive emergency-root proof ещё нужен.
+   Заявленный perf A/B сделан до финальной product-правки и не является
+   измерением `fc42243`. Подробности и открытые пункты — `STATUS.md`.
 
 ## Embedding и stdlib ownership
 
@@ -122,6 +127,20 @@ parity-дефектом; F3 (forced-close region ownership) закрыт `9b1bad
    closure с независимым state. Decisive experiment: два чередующихся
    iterator, nested iterator и iterator across coroutine yield/GC. При
    подтверждении — per-closure/upvalue owner, не VM-global replay slot.
+3. **C API pseudo-index + registry/globals ownership — research подтверждён,
+   PUC-подобное направление утверждено владельцем.** Cidx/cidx2/cidx3
+   (`STATUS.md`, `/tmp/opencode/cidx{,2,3}_report.md`) доказали:
+   `LUA_REGISTRYINDEX` и upvalue-индексы требуют общего typed resolver;
+   PUC registry — writable `Value`-слот, который маркируется повторно в
+   atomic; `registry[LUA_RIDX_GLOBALS]` — источник C API get/setglobal и
+   `_ENV` новых chunks. Текущие `debug_registry: ?*Table` и
+   `global_env: *Table` не выражают этот owner, а `-1001000` не совпадает
+   с PUC 5.5 ABI. Рекомендация ревьювера: единая PUC-подобная миграция
+   registry + globals до открытия C API write-доступа к RIDX[2], затем
+   resolver/get-set/write классы. Implementation-задание — `prompt.md`:
+   α+ε как одна owner-миграция до β→γ→δ. Исходный α→β→γ→δ→ε
+   небезопасен как публикуемые зелёные cut'ы, поскольку γ делает
+   split-owner наблюдаемым до ε.
 
 ## Не-parity архитектурный backlog
 

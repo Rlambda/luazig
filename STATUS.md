@@ -45,6 +45,19 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
+- [ ] **`lua_pcallk` recovery: error object отсутствует в окне continuation
+  (BLOCKER, ORDINARY-BACKLOG; review `ad03a06`).** На pristine
+  `b6564bf` валидная C-проба `f9b_window.c` после ошибки в защищённом
+  вызове входит в `k` с тем же status=2 и top=3, но PUC 5.5 даёт
+  `lua_type(L,1)=table` (исходный error object), а luazig — `nil`.
+  Независимо повторены оба бинаря из `/tmp/opencode/ccmtv/`;
+  первая неверная граница — `finishpcallk`/публикация C-window перед `k`,
+  а не запись `CIST_CCMT`. Исправление — отдельный parity-cut с
+  проверкой identity/status/stack effects через `pcallk` и следующий
+  resume. Это расхождение нельзя включать в byte-exact F9b gate
+  CCMT-cut'а без отдельного исправления; F9b metadata/owner proof
+  остаётся пригодным. Open-count 27→28.
+
 - [ ] **`lua_Debug` ABI-layout относительно PUC 5.5 (HIGH,
   ARCHITECTURAL-BACKLOG; review A1.next-ccmt research).** Предложенный
   Cut 2 добавляет `extraargs`, но сохраняет `ftransfer`/`ntransfer` как
@@ -59,7 +72,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   поля, hook/getinfo writes и пересборку tracked ELF. Не считать один
   `sizeof=144` доказательством совместимости. Open-count 26→27.
 
-- [ ] **PUC `CIST_CCMT` / `lua_Debug.extraargs` при `__call`-цепочке
+- [x] **PUC `CIST_CCMT` / `lua_Debug.extraargs` при `__call`-цепочке
   (BLOCKER, ARCHITECTURAL-BACKLOG; cidx-corr review).** Коррекция
   `8ac6808` исправила обычные lauxlib argument errors, но её явное
   stop condition для `extraargs` не выполнено: per-frame count отсутствует,
@@ -114,7 +127,8 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   'r' сейчас `else => {}` — transfer-поля НИКОГДА не пишутся,
   0xAA-утечка через header) + pub CIST_CCMT/MAX_CCMT; миграция
   verified-building в /tmp-копии; positive cross-read: PUC-header
-  C-клиент + Cut-2 zig lib = byte-identical PUC baseline. Гейты:
+  C-клиент + Cut-2 zig lib совпал с PUC по публичным полям
+  (`i_ci` — непрозрачный указатель, его сырые байты различаются). Гейты:
   comptime asserts + api580 run_size_probe D/RF + пересборка всех 35
   tests/c_api ELF (+-puc).
   (2) F9: вердикт (a) — C-кадр ПЕРЕЖИВАЕТ yieldk/resume;
@@ -128,11 +142,47 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   resetCI-parity), свежие __close-кадры получают CCMT от своей
   резолюции. Base-finding re-push (UNCONFIRMED) ЗАКРЫТ.
   NEW (отдельные задачи, не CCMT): pcallk-continuation window
-  divergence — PUC кладёт error-object на arg1 для k, zig оставляет
-  nil (f9b_window: arg1_type=table vs nil при том же top) — C-API
-  parity-кандидат; oracle-hygiene: vendored PUC lib крэшится в
+  divergence подтверждена как отдельный BLOCKER выше. Поэтому F9b
+  доказывает сохранение кадра/CCMT, но не может быть byte-exact
+  acceptance для полного error text до исправления окна; oracle-hygiene:
+  vendored PUC lib крэшится в
   lua_close после ≥43 raw C-push (C-пробы через _exit/Lua-routes).
-  Дизайн готов к implementation после ревью владельцем.
+  Владелец утвердил направление 2026-09-30: два cut'а (per-frame CCMT,
+  затем PUC-layout `lua_Debug`/C API); implementation scope и gates — в
+  новом `prompt.md`. Пункт остаётся открыт до product-фикса.
+  CLOSED (ccmt milestone: cut 1 8c9e1f7 + cut 2 2718f09): per-frame
+  CIST_CCMT (биты 8-11 callstatus; запись в 3 choke-точках активации:
+  pushStagedFast/pushStagedBytecodeExecFrame/initBuiltinCFrame;
+  ResolvedCall.ccmt транспорт; tailcall-reuse сохраняет старые биты =
+  PUC-квирка; 15/16 PUC-exact предел + единый текст; divert'ы без
+  C-кадра → generic-путь) + PUC-layout lua_Debug ABI (extraargs u8@63,
+  ftransfer/ntransfer int@68/72, sizeof 144, 19 C Static_assert +
+  comptime 18 offset-ассертов обеих сборок; cross-read PUC-header→zig =
+  byte-identical) + C getinfo "t" (CCMT) / "r" (ldebug.c:376-383, прежде
+  else-утечка; ntransfer=70001 контроль) + luaL_argerror «nt» полный
+  PUC-порядок («extra argument»/renumbering/method-self). Evidence:
+  smoke-89 (17 Lua-форм byte-exact PUC) + canonical 36_ccmt_abi (3
+  линии zig/-puc/-xread: F1-F3/F6d-e/F7c/F9/N15-N16/R1-R2) triple-
+  identical sha256 0c7a7fb2; negative-before на каждом cut'е;
+  мутации ×3 (choke-точка / не-запись битов / u16-ABI) RED→revert.
+  Гейты: 358/358 D+RF; matrix zig_fail=0; smoke 88/88; c_api 24-36
+  PASS оба режима; api580 GREEN (lua_Debug=144 PUC-layout в probe);
+  perf instruction-parity (cut1 lua_calls −1.32% instr). F9b
+  pcallk-window и F4n17/F8n17 where-attribution — остаются открытыми
+  отдельными пунктами (не CCMT).
+
+- [ ] **Safety BLOCKER (pre-existing, найден независимо ccmt cut 1/2
+  + координатором; stash-verified на pristine ad03a06 и 8c9e1f7):
+  Debug-паника bcGrowFrame OOB на валидной Lua 15-звенной чисто-Lua
+  __call-цепочке**: `local function chk(...) return 1 end local v=chk
+  for i=1,15 do v=setmetatable({},{__call=v}) end local ok,err=
+  pcall(function() return v() end)` — Debug: panic index 41/42, len 40
+  (vm.zig bcGrowFrame `regs.* = th.stack[base..base+cap_now]`); RF:
+  корректен (= PUC `true 1`); C-callee-формы не падают. Класс: стек не
+  растёт, когда frame cap помещается (needed_local <= cap.*), но base
+  продвинулся за th.stack.len — slice OOB. Fix-направление: ensure
+  стек-окна при активации кадра покрывает base+cap независимо от роста
+  cap (или slice от @min). Open-count 28→29.
 
 - [x] **C API lauxlib argument-error parity после cidx (BLOCKER,
   FIX-NOW).** В изменённом `luaL_checklstring`/`luaL_optlstring` путь

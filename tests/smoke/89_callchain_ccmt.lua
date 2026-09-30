@@ -190,3 +190,178 @@ do
   echo(ok1, ok2, type(n) == "number", #t)
   echo(collectgarbage("count") ~= 0, string.sub("wxyz", 2, 3)) -- reuse control
 end
+
+-- Bytecode-lane Lua-hook identity (PUC luaD_precall order: the callee's
+-- CallInfo exists BEFORE the call hook fires, so getinfo(2,"ft") from the
+-- hook describes the CALLEE activation — func/what/istailcall/extraargs —
+-- not the caller). The C-hook control for the same property is 36_ccmt_abi
+-- (F7f); the host-origin control is HB1/HB2 above. Every hook body reads
+-- getinfo(2) directly (a helper call would shift the level) and logs
+-- without calling anything.
+local function hclog(fn)
+  local log = {}
+  local function h(ev)
+    local i = debug.getinfo(2, "Sft")
+    log[#log + 1] = ev .. "|" .. tostring(i and i.what) ..
+      "|" .. tostring(i and i.istailcall) ..
+      "|" .. tostring(i and i.extraargs)
+  end
+  debug.sethook(h, "c")
+  local ok, r = fn()
+  debug.sethook()
+  local parts = {}
+  for k, v in ipairs(log) do parts[k] = tostring(v) end
+  echo(ok, tostring(r), #log, table.concat(parts, " "))
+end
+
+-- HC1: 1-link chain to a builtin from a BYTECODE caller: the activation
+-- event sees extraargs = 1 (was the caller-frame 0 before the fix).
+hclog(function()
+  local ob = setmetatable({}, { __call = type })
+  local function f() local x = ob("x") return x end
+  return f()                                               -- "string"
+end)
+
+-- HC2: 2-link chain from a bytecode caller: extraargs = 2.
+hclog(function()
+  local mid = setmetatable({}, { __call = type })
+  local o2 = setmetatable({}, { __call = mid })
+  local function f() local x = o2("x") return x end
+  return f()
+end)
+
+-- HC3: 15-link chain from a bytecode caller: extraargs = 15.
+hclog(function()
+  return (mkchain(15, type)("x"))
+end)
+
+-- HC4: tail calls. A tail call to a chained BUILTIN still fires a plain
+-- "call" on the fresh C activation (PUC pretailcall → precallC pushes a
+-- CallInfo without CIST_TAIL); a tail call into a chained LUA closure
+-- fires "tail call" on the reused frame (stale count, istailcall = true).
+hclog(function()
+  local ob = setmetatable({}, { __call = type })
+  local function f() return ob("y") end
+  return f()
+end)
+hclog(function()
+  local ol = setmetatable({}, { __call = function(_, s) return s end })
+  local function f() return ol("z") end
+  return f()
+end)
+
+-- HC5: vararg callee reached through a chain (the event fires at the
+-- callee's VARARGPREP, after the extra arguments are folded — PUC
+-- luaG_tracecall skips vararg fresh frames, lvm.c OP_VARARGPREP fires
+-- luaD_hookcall): extraargs = links, arguments intact.
+hclog(function()
+  local ov = setmetatable({}, { __call = function(_, ...) return select("#", ...) end })
+  local function f() local n = ov(1, 2, 3) return n end
+  return f()
+end)
+hclog(function()
+  local ov = setmetatable({}, { __call = function(_, ...) return select("#", ...) end })
+  local function f() return ov(1, 2, 3) end
+  return f()                                               -- tail form
+end)
+
+-- HC6: a C-closure callee (coroutine.wrap) is a C activation: what="C"
+-- from the hook, arguments delivered once, wrap result correct.
+hclog(function()
+  local w = coroutine.wrap(function() return "wres" end)
+  local function f() local r = w() return r end
+  return f()
+end)
+
+-- HC7: direct-call controls — a direct Lua closure and a direct builtin
+-- under the same hook: what/extraargs of the callee activation, plus the
+-- vararg direct control.
+hclog(function()
+  local function dl(s) return s end
+  local function dv(...) return select("#", ...) end
+  local a = dl("a")
+  local b = dv(1, 2)
+  return a .. b
+end)
+hclog(function()
+  local function f() local x = type(1) return x end
+  return f()
+end)
+
+-- HC8: a real GC step inside the hook body while a chained activation is
+-- on the stack: the activation's identity stays correct and the callee's
+-- arguments survive the collection (the transfer window is owned by the
+-- dispatcher for the hook's duration).
+hclog(function()
+  local ob = setmetatable({}, { __call = function(_, s) return s .. "!" end })
+  local function f() local x = ob("arg") return x end
+  local log_seen
+  local function h(ev)
+    local i = debug.getinfo(2, "ft")
+    if i and i.func == ob.__call and i.extraargs == 1 then
+      log_seen = ev
+      collectgarbage("step")
+      local j = debug.getinfo(2, "ft")
+      log_seen = log_seen .. "|" .. tostring(j and j.extraargs)
+    end
+  end
+  debug.sethook(h, "c")
+  local r = f()
+  debug.sethook()
+  return tostring(r) .. "/" .. tostring(log_seen)
+end)
+
+-- HC9: an error raised inside the hook on the chained activation
+-- propagates to the caller's pcall with the exact object (level 0 — no
+-- position prefix to diverge), and the engine stays usable afterwards.
+hclog(function()
+  local ob = setmetatable({}, { __call = type })
+  local function h(ev)
+    local i = debug.getinfo(2, "ft")
+    if i and i.func == type and i.extraargs == 1 then error("hookboom", 0) end
+  end
+  debug.sethook(h, "c")
+  local ok, msg = pcall(function() return ob("x") end)
+  debug.sethook()
+  return tostring(ok) .. "/" .. tostring(msg)
+end)
+
+-- HC10: a call-event hook cannot yield (PUC hookf uses lua_call): the
+-- yield attempt raises the C-call-boundary error, catchable inside the
+-- hook, and the chained call still completes exactly once.
+hclog(function()
+  local ob = setmetatable({}, { __call = type })
+  local co = coroutine.create(function()
+    local function h(ev)
+      local i = debug.getinfo(2, "ft")
+      if i and i.func == type then
+        local ok = pcall(coroutine.yield)
+        h.yield_denied = tostring(ok)
+      end
+    end
+    debug.sethook(h, "c")
+    local r = ob("x")
+    debug.sethook()
+    return r .. "/" .. tostring(h.yield_denied)
+  end)
+  local ok, res = coroutine.resume(co)
+  return tostring(ok) .. "/" .. tostring(res)
+end)
+
+-- HC11: a line hook that yields across a chained call in a coroutine
+-- body: on resume the callee runs to completion exactly once (no double
+-- execution through the hook machinery).
+do
+  local ob = setmetatable({}, { __call = function(_, s) return s end })
+  local calls = 0
+  local co = coroutine.create(function()
+    local function h() coroutine.yield("park") end
+    debug.sethook(h, "l")
+    local r = ob("once")
+    debug.sethook()
+    return r
+  end)
+  local ok1, y = coroutine.resume(co)
+  local ok2, r = coroutine.resume(co)
+  echo(ok1, tostring(y), ok2, tostring(r))
+end

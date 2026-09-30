@@ -65,12 +65,45 @@ pub const lua_Debug = extern struct {
     nups: u8 = 0,
     nparams: u8 = 0,
     isvararg: u8 = 0,
+    extraargs: u8 = 0,
     istailcall: u8 = 0,
-    ftransfer: u16 = 0,
-    ntransfer: u16 = 0,
+    ftransfer: c_int = 0,
+    ntransfer: c_int = 0,
     short_src: [60]u8 = [_]u8{0} ** 60,
     i_ci: ?*anyopaque = null,
 };
+
+// The published layout must stay binary-compatible with PUC Lua 5.5's
+// lua_Debug (LP64): a C client compiled against PUC's lua.h reads a
+// luazig-built library through these offsets. int-typed ftransfer/ntransfer
+// are part of that contract — the transfer window carries actual argument
+// counts, which exceed 16 bits (a call with 70001 arguments reports
+// ntransfer=70001). i_ci is an opaque encoded handle (frame index + 1),
+// never a dereferenceable pointer.
+comptime {
+    if (@sizeOf(usize) == 8) {
+        std.debug.assert(@offsetOf(lua_Debug, "event") == 0);
+        std.debug.assert(@offsetOf(lua_Debug, "name") == 8);
+        std.debug.assert(@offsetOf(lua_Debug, "namewhat") == 16);
+        std.debug.assert(@offsetOf(lua_Debug, "what") == 24);
+        std.debug.assert(@offsetOf(lua_Debug, "source") == 32);
+        std.debug.assert(@offsetOf(lua_Debug, "srclen") == 40);
+        std.debug.assert(@offsetOf(lua_Debug, "currentline") == 48);
+        std.debug.assert(@offsetOf(lua_Debug, "linedefined") == 52);
+        std.debug.assert(@offsetOf(lua_Debug, "lastlinedefined") == 56);
+        std.debug.assert(@offsetOf(lua_Debug, "nups") == 60);
+        std.debug.assert(@offsetOf(lua_Debug, "nparams") == 61);
+        std.debug.assert(@offsetOf(lua_Debug, "isvararg") == 62);
+        std.debug.assert(@offsetOf(lua_Debug, "extraargs") == 63);
+        std.debug.assert(@offsetOf(lua_Debug, "istailcall") == 64);
+        std.debug.assert(@offsetOf(lua_Debug, "ftransfer") == 68);
+        std.debug.assert(@offsetOf(lua_Debug, "ntransfer") == 72);
+        std.debug.assert(@offsetOf(lua_Debug, "short_src") == 76);
+        std.debug.assert(@offsetOf(lua_Debug, "i_ci") == 136);
+        std.debug.assert(@sizeOf(lua_Debug) == 144);
+        std.debug.assert(@alignOf(lua_Debug) == 8);
+    }
+}
 
 // Shared helpers from api.zig (single source of truth).
 const normalizeIndex = api.normalizeIndex;
@@ -2957,30 +2990,32 @@ pub export fn luaL_typeerror(L: ?*lua_State, arg: c_int, tname: [*:0]const u8) c
 
 pub export fn luaL_argerror(L: ?*lua_State, arg: c_int, extramsg: ?[*:0]const u8) c_int {
     // PUC lauxlib.c:171-194: the message names the level-0 frame (this C
-    // function) — getinfo "n" reads the caller's call site; a method call
-    // shifts the numbering past the implicit self ("calling 'name' on bad
-    // self" when the self itself is the bad argument); an unnamed function
-    // falls back to pushglobalfuncname (the registry _LOADED search) or
-    // '?'. luaL_error prepends the where-prefix of the Lua caller (level
-    // 1). No level-0 frame at all: the bare "bad argument #n (msg)" form.
-    //
-    // PUC 5.5 also renumbers arguments behind a __call chain (ar.extraargs,
-    // the CIST_CCMT count read by getinfo 't'); the count is persisted per
-    // frame (callstatus bits 8-11, vm.zig), but the C-side lua_Debug has no
-    // extraargs field yet and this renumbering branch is not implemented —
-    // a C function reached through a __call chain reports the chain's self
-    // arguments as regular arguments (known boundary).
+    // function) — getinfo "nt" reads the caller's call site; an argument
+    // that is one of the __call-chain's shifted extras keeps its original
+    // number ("bad extra argument #N"); otherwise the numbering drops the
+    // chain count (arg -= extraargs) and a method call then shifts past
+    // the implicit self ("calling 'name' on bad self" when the self itself
+    // is the bad argument); an unnamed function falls back to
+    // pushglobalfuncname (the registry _LOADED search) or '?'. luaL_error
+    // prepends the where-prefix of the Lua caller (level 1). No level-0
+    // frame at all: the bare "bad argument #n (msg)" form.
     var ar: lua_Debug = .{};
     if (lua_getstack(L, 0, &ar) == 0) {
         return luaL_error(L, "bad argument #%d (%s)", arg, extramsg);
     }
-    _ = lua_getinfo(L, "n", &ar);
+    _ = lua_getinfo(L, "nt", &ar);
     var argnum = arg;
-    if (ar.namewhat) |nw| {
-        if (std.mem.eql(u8, std.mem.span(nw), "method")) {
-            argnum -= 1;
-            if (argnum == 0) {
-                return luaL_error(L, "calling '%s' on bad self (%s)", ar.name, extramsg);
+    var argword: [*:0]const u8 = "argument";
+    if (arg <= @as(c_int, ar.extraargs)) {
+        argword = "extra argument";
+    } else {
+        argnum -= ar.extraargs;
+        if (ar.namewhat) |nw| {
+            if (std.mem.eql(u8, std.mem.span(nw), "method")) {
+                argnum -= 1;
+                if (argnum == 0) {
+                    return luaL_error(L, "calling '%s' on bad self (%s)", ar.name, extramsg);
+                }
             }
         }
     }
@@ -2994,7 +3029,7 @@ pub export fn luaL_argerror(L: ?*lua_State, arg: c_int, extramsg: ?[*:0]const u8
         // rooting window needed on this cold error path.
         const vm = h.vm;
         const th = vm.current_thread orelse vm.main_thread orelse {
-            return luaL_error(L, "bad argument #%d to '%s' (%s)", argnum, name, extramsg);
+            return luaL_error(L, "bad %s #%d to '%s' (%s)", argword, argnum, name, extramsg);
         };
         const ci_raw = if (ar.i_ci) |ci| @intFromPtr(ci) else 0;
         if (ci_raw != 0 and ci_raw - 1 < th.call_frames.len()) {
@@ -3010,7 +3045,7 @@ pub export fn luaL_argerror(L: ?*lua_State, arg: c_int, extramsg: ?[*:0]const u8
             }
         }
     }
-    return luaL_error(L, "bad argument #%d to '%s' (%s)", argnum, name, extramsg);
+    return luaL_error(L, "bad %s #%d to '%s' (%s)", argword, argnum, name, extramsg);
 }
 
 pub export fn luaL_error(L: ?*lua_State, fmt: [*:0]const u8, ...) c_int {
@@ -3427,7 +3462,8 @@ pub export fn lua_getstack(L: ?*lua_State, level: c_int, ar: *lua_Debug) c_int {
 /// PUC `lua_getinfo` (lapi.c:lua_getinfo): fill `lua_Debug` fields from the
 /// frame identified by `ar->i_ci` (set by `lua_getstack`). The `what` string
 /// controls which fields are filled: 'S' (source), 'l' (currentline),
-/// 'u' (ups/params), 't' (tailcall), 'n' (name/namewhat).
+/// 'u' (ups/params), 't' (tailcall/extraargs), 'n' (name/namewhat),
+/// 'r' (transfer window).
 ///
 /// Returns 1 on success, 0 on invalid frame handle.
 pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c_int {
@@ -3524,7 +3560,11 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
                 }
             },
             't' => {
+                // PUC auxgetinfo 't' (ldebug.c:356-366): extraargs is the
+                // frame's committed __call-chain count (callstatus bits
+                // 8-11), istailcall the CIST_TAIL flag.
                 ar.istailcall = if (frame.isTailCall()) 1 else 0;
+                ar.extraargs = @intCast(frame.ccmt());
             },
             'n' => {
                 // PUC auxgetinfo 'n' (ldebug.c:369-373): namewhat comes from
@@ -3583,6 +3623,18 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
                     }
                 } else {
                     ar.name = null;
+                }
+            },
+            'r' => {
+                // PUC auxgetinfo 'r' (ldebug.c:376-383): both transfer
+                // fields are zero except on the frame a running hook is
+                // interrupting, which reports the active transfer window.
+                if (vm.debugTransferWindowForFrame(th, frame_idx)) |tr| {
+                    ar.ftransfer = @intCast(tr.ftransfer);
+                    ar.ntransfer = @intCast(tr.ntransfer);
+                } else {
+                    ar.ftransfer = 0;
+                    ar.ntransfer = 0;
                 }
             },
             else => {}, // ignore unknown flags (PUC default)

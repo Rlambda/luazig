@@ -21,10 +21,10 @@
 **      (global / local / field / method), where-prefix, pcall'd C caller
 **      (no call-site name -> _LOADED name or '?').
 **
-** Excluded (documented boundary, see the correction report): C functions
-** reached through __call chains — PUC 5.5 renumbers those arguments via
-** ar.extraargs (the __call-chain count in callstatus CIST_CCMT), which
-** luazig does not persist per frame.
+** Excluded (kept out of this suite's forms): C functions reached through
+** __call chains — their argument renumbering (ar.extraargs, the
+** __call-chain count persisted in callstatus CIST_CCMT) is the subject of
+** the dedicated 36_ccmt_abi suite.
 */
 #include <stdio.h>
 #include <string.h>

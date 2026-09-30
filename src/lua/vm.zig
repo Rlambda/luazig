@@ -1480,8 +1480,8 @@ const MAXRESULTS: i32 = 250;
 /// prepCallInfo commits it once into the callee's callstatus). Tailcall
 /// frame reuse never rewrites it (PUC luaD_pretailcall keeps the Lua
 /// frame's stale bits); read by debug.getinfo 't' (extraargs).
-const CIST_CCMT: u32 = 8; // shift count, not mask
-const MAX_CCMT: u32 = 0xf << CIST_CCMT;
+pub const CIST_CCMT: u32 = 8; // shift count, not mask
+pub const MAX_CCMT: u32 = 0xf << CIST_CCMT;
 /// PUC MAX_CCMT semantics: at most 15 committed __call links per
 /// activation; the 16th link is rejected with "'__call' chain too long"
 /// (checked AFTER a successful __call lookup, ldo.c tryfuncTM).
@@ -2119,6 +2119,11 @@ pub const CallFrame = extern struct {
 
     pub fn isTailCall(fr: CallFrame) bool {
         return (fr.callstatus & CIST_TAIL) != 0;
+    }
+    /// The frame's committed __call-chain count (callstatus bits 8-11) —
+    /// the single reader for getinfo 't'/luaL_argerror extraargs.
+    pub fn ccmt(fr: CallFrame) u32 {
+        return (fr.callstatus & MAX_CCMT) >> CIST_CCMT;
     }
     pub fn isDebugHook(fr: CallFrame) bool {
         return (fr.callstatus & CIST_HOOKED) != 0;
@@ -6506,6 +6511,50 @@ pub const Vm = struct {
     fn activeDebugTransferStart(self: *Vm) i64 {
         if (self.activeAsyncDebugHookTransfer()) |tr| return tr.start;
         return self.debug_transfer_start;
+    }
+
+    /// The transfer window visible to getinfo 'r' on the hooked frame.
+    pub const TransferWindow = struct { ftransfer: i64, ntransfer: i64 };
+
+    /// PUC auxgetinfo 'r' (ldebug.c:376-383): the transfer window is
+    /// visible ONLY on the frame the running hook is interrupting — PUC
+    /// marks that ci CIST_HOOKED for the hook's duration (ldo.c luaD_hook),
+    /// every other frame (and any query outside a hook) sees zeros. The
+    /// transfer values themselves come from the existing canonical record
+    /// (activeDebugTransfer*): the sync C-hook window publishes the
+    /// dispatcher's slice, the async Lua-hook window the pending call's
+    /// `.hook` continuation. zig does not set CIST_HOOKED on the
+    /// interrupted frame (the flag lives on the async hook's own frame,
+    /// and the frameless sync C-hook marks its window through
+    /// DebugHookState.sync_hook_frame_idx instead), so the frame identity
+    /// is reconstructed from those two window records. Returns null when
+    /// `frame_idx` is not the interrupted frame (caller reports zeros).
+    pub fn debugTransferWindowForFrame(self: *Vm, th: *Thread, frame_idx: usize) ?TransferWindow {
+        const active_th = self.activeBytecodeThread();
+        if (active_th == th) {
+            if (th.hook_frame_index != INVALID_HOOK_FRAME and
+                th.hook_frame_index != 0 and
+                th.hook_frame_index < th.call_frames.len() and
+                frame_idx + 1 == th.hook_frame_index)
+            {
+                // Async Lua-hook window: the interrupted frame is the
+                // hook frame's parent.
+                return self.transferWindowOrNull();
+            }
+            if (self.activeHookState().sync_hook_frame_idx) |sync_idx| {
+                if (frame_idx == sync_idx) return self.transferWindowOrNull();
+            }
+        }
+        return null;
+    }
+
+    fn transferWindowOrNull(self: *Vm) ?TransferWindow {
+        const vals = self.activeDebugTransferValues() orelse
+            return .{ .ftransfer = 0, .ntransfer = 0 };
+        return .{
+            .ftransfer = self.activeDebugTransferStart(),
+            .ntransfer = @intCast(vals.len),
+        };
     }
 
     fn activeDebugHookEventCalllike(self: *Vm) bool {
@@ -36852,7 +36901,7 @@ pub const Vm = struct {
                                 fr.isTailCall();
                             // PUC auxgetinfo 't': the frame's CIST_CCMT count
                             // (NOT the vararg count — 'u'/isvararg reports that).
-                            const extraargs: i64 = @intCast((fr.callstatus & MAX_CCMT) >> CIST_CCMT);
+                            const extraargs: i64 = @intCast(fr.ccmt());
                             try self.setField(t, "istailcall", .{ .Bool = is_tail });
                             try self.setField(t, "extraargs", .{ .Int = extraargs });
                         }

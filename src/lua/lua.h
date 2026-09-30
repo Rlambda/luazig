@@ -322,12 +322,40 @@ typedef struct lua_Debug {
     unsigned char nups;
     unsigned char nparams;
     char isvararg;
-    char istailcall;
-    unsigned short ftransfer;
-    unsigned short ntransfer;
-    char short_src[LUA_IDSIZE];
-    void *i_ci;
+    unsigned char extraargs;  /* (t) number of extra arguments */
+    char istailcall;	/* (t) */
+    int ftransfer;   /* (r) index of first value transferred */
+    int ntransfer;   /* (r) number of transferred values */
+    char short_src[LUA_IDSIZE]; /* (S) */
+    void *i_ci;  /* active function */
 } lua_Debug;
+
+/* The published layout must stay binary-compatible with PUC Lua 5.5's
+** lua_Debug on every ABI this header targets: a C client compiled against
+** PUC's lua.h reads a luazig-built library (and vice versa) through these
+** offsets. int-typed ftransfer/ntransfer are part of that contract: the
+** transfer window carries actual argument counts, which exceed 16 bits
+** (a call with 70001 arguments reports ntransfer=70001). */
+_Static_assert(sizeof(void *) == 8, "LP64 layout contract");
+_Static_assert(offsetof(lua_Debug, event) == 0, "lua_Debug layout");
+_Static_assert(offsetof(lua_Debug, name) == 8, "lua_Debug layout");
+_Static_assert(offsetof(lua_Debug, namewhat) == 16, "lua_Debug layout");
+_Static_assert(offsetof(lua_Debug, what) == 24, "lua_Debug layout");
+_Static_assert(offsetof(lua_Debug, source) == 32, "lua_Debug layout");
+_Static_assert(offsetof(lua_Debug, srclen) == 40, "lua_Debug layout");
+_Static_assert(offsetof(lua_Debug, currentline) == 48, "lua_Debug layout");
+_Static_assert(offsetof(lua_Debug, linedefined) == 52, "lua_Debug layout");
+_Static_assert(offsetof(lua_Debug, lastlinedefined) == 56, "lua_Debug layout");
+_Static_assert(offsetof(lua_Debug, nups) == 60, "lua_Debug layout");
+_Static_assert(offsetof(lua_Debug, nparams) == 61, "lua_Debug layout");
+_Static_assert(offsetof(lua_Debug, isvararg) == 62, "lua_Debug layout");
+_Static_assert(offsetof(lua_Debug, extraargs) == 63, "lua_Debug layout");
+_Static_assert(offsetof(lua_Debug, istailcall) == 64, "lua_Debug layout");
+_Static_assert(offsetof(lua_Debug, ftransfer) == 68, "lua_Debug layout");
+_Static_assert(offsetof(lua_Debug, ntransfer) == 72, "lua_Debug layout");
+_Static_assert(offsetof(lua_Debug, short_src) == 76, "lua_Debug layout");
+_Static_assert(offsetof(lua_Debug, i_ci) == 136, "lua_Debug layout");
+_Static_assert(sizeof(lua_Debug) == 144, "lua_Debug layout");
 
 /* PUC `lua_Hook` (lua.h:453): hook function called at hook events. */
 typedef void (*lua_Hook)(lua_State *L, lua_Debug *ar);

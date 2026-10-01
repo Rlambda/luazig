@@ -45,6 +45,43 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
+- [ ] **precover region-close: yielding closer протаскивает nil error
+  object сквозь `coroutine.resume`, VM после этого непригодна (BLOCKER,
+  FIX-NOW-кандидат; research pkres, 2026-10-01, к `60a9ee9`).** Форма N:
+  yielding closer внутри precover's yieldable region-close —
+  `closeTbcRegion` корректно ставит CLSRET и возвращает `error.Yield`
+  (vm.zig:47052+), но все три call-site'а `precover` в trampoline
+  (16375/16473/16562) используют `try` без конвертации в
+  `bytecodeCoroutineYieldStep` (как у finishCcall-ветки 16362) →
+  nil-объект ошибки пролезает во внешний pcall. Decisive differential
+  `/tmp/opencode/pkres/f1_decisive.lua` (N_r1: PUC `true inclose nil
+  suspended` + второй resume с исходным объектом; zig — dead/потеря).
+  Подтверждено координатором лично (Debug+RF). Артефакты/raw:
+  `/tmp/opencode/pkres_report.md` §3-4.
+
+- [ ] **GY: arg-marks вне chain-региона закрываются truncation-close с
+  nil-объектом и yy=0 (BLOCKER-класс, research pkres, 2026-10-01).**
+  Closer получает nil вместо исходного error object; yield конвертирован
+  в ошибку. Расширение (ii) единого recovery-owner (см. F1-обновление
+  ниже). Decisive: GY_r1/GY_r2 в `/tmp/opencode/pkres/f1_decisive.lua`.
+
+- [ ] **P: c_api `lua_pcallk` ловит `OutOfMemory` синхронно —
+  continuation `k` пропускается (HIGH, research pkres, 2026-10-01).**
+  zig: clearYpcall + `return 4` без вызова k; PUC доставляет
+  `k(LUA_ERRMEM, "not enough memory")`. Контроль RuntimeError-vs-OOM
+  включён в f9b_window.c (статически линкованный oracle, rc=1 vs 0).
+
+- [ ] **DGC: continuation window `[prefix, fret, r2]` обязан переживать
+  настоящий GC между resume (HIGH, research pkres, 2026-10-01).** PUC
+  сохраняет окно; zig-окно пустое. Код GC (atomic clear-dead-stack,
+  vm.zig:32410+) ОПРОВЕРГАЕТ починку «пересборка окна из stale-слотов» —
+  допустимо только сохранение window-end на C-кадре (рекомендация
+  A(a), pkres §5). Форма J1/J2/J_gc_done в f1_decisive.lua.
+
+- [ ] **ORDINARY-BACKLOG (research pkres): «block too big» — PUC ERRRUN
+  vs zig ERRMEM.** Побочный finding f9b-оракула; отдельный
+  error-class-класс, не входит в recovery-owner cut.
+
 - [ ] **`lua_pcallk` recovery: error object отсутствует в окне continuation
   (BLOCKER, ORDINARY-BACKLOG; review `ad03a06`).** На pristine
   `b6564bf` валидная C-проба `f9b_window.c` после ошибки в защищённом
@@ -54,9 +91,25 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   первая неверная граница — `finishpcallk`/публикация C-window перед `k`,
   а не запись `CIST_CCMT`. Исправление — отдельный parity-cut с
   проверкой identity/status/stack effects через `pcallk` и следующий
-  resume. Это расхождение нельзя включать в byte-exact F9b gate
+  resume.   Это расхождение нельзя включать в byte-exact F9b gate
   CCMT-cut'а без отдельного исправления; F9b metadata/owner proof
   остаётся пригодным. Open-count 27→28.
+  RESEARCH UPDATE (pkres, 2026-10-01, к `60a9ee9`; артефакты
+  `/tmp/opencode/pkres/`, отчёт `/tmp/opencode/pkres_report.md`):
+  CONFIRMED заново восстановленным статически-линкованным oracle
+  `/tmp/opencode/pkres/f9b_window.c` (PUC из in-repo lua-5.5.0): zig
+  rc=1 vs PUC rc=0; по осям — a1=nil против исходного table error
+  object (identity rawequal=0), OOM-строка, error-handler failure,
+  nested; `driver error: type=nil val=(null)` в хвосте. F9b и F1 —
+  ОДНА недостающая сущность: PUC CIST_YPCALL-кадр + `finishpcallk`
+  владеет публикацией error object в continuation window,
+  recovery-close всех marks по level (yy=1 в корутине) и выживанием
+  окна через suspension; в luazig это разрезано по lane'ам и сайтам.
+  Первое неверное действие — граница publication/recovery в
+  finishpcallk-эквиваленте + c_api catch{}-обработка OOM (см. пункт P);
+  починка через stale-слоты опровергнута (см. пункт DGC). Рекомендован
+  единый pcallk-recovery owner (вариант A, 5 cuts: N-crash → F1 → (ii)
+  → окно → OOM; pkres §5-6). Пункт остаётся открытым до implementation.
 
 - [x] **`lua_Debug` ABI-layout относительно PUC 5.5 (HIGH,
   ARCHITECTURAL-BACKLOG; review A1.next-ccmt research).** Предложенный
@@ -177,8 +230,101 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   perf instruction-parity (cut1 lua_calls −1.32% instr). F9b
   pcallk-window и F4n17/F8n17 where-attribution — остаются открытыми
   отдельными пунктами (не CCMT).
+  REVIEW `f437af7`: closure ПРЕЖДЕВРЕМЕННО. Две встроенные функции
+  (`collectgarbage`, `string.sub`) остаются frameless по
+  `builtinNeedsCFrame`; даже при `ccmt>0` вызов через `__call` не
+  активирует C-кадр и не публикует CCMT. Независимая валидная форма
+  `setmetatable({}, {__call=collectgarbage})('count')` под call-hook:
+  PUC даёт `call:1`, luazig — нет события; аналогично `string.sub`.
+  PUC `luaD_precall` создаёт CallInfo и коммитит CIST_CCMT для любого
+  C-callee. Нарушен инвариант Cut 1; FIX-NOW. Open-count 27→28.
+  CORRECTION `470025e`: sync C-hook, host `__call`-builtin и Debug c_pop
+  исправлены, но Lua-hook bytecode-lane остаётся неверным: `opCall`
+  вызывает `tryPushBytecodeDebugHook` ДО создания C CallFrame; hook видит
+  временно подменённый func_slot вызывающего Lua-кадра, у которого
+  `extraargs=0`. Независимый дифференциал `local o=setmetatable({},
+  {__call=type}); local function f() return o('x') end` под Lua call-hook,
+  фильтр `debug.getinfo(2,'ft').func==type`: PUC `call:1`, luazig
+  `call:0`; тот же класс для `collectgarbage` под `pcall`. Это
+  наблюдаемая ошибка в обещанном hook/CCMT-контракте correction,
+  BLOCKER FIX-NOW; пункт остаётся открытым.
+  CLOSED (`456a3c3` + safety correction `266f98c`): Lua-hook теперь
+  видит активированный кадр callee и его per-frame CCMT; vararg hook
+  переживает realloc FrameStack по индексу, событийная строка укоренена
+  до fallible copy/dispatch. Ревьювер повторил Debug smoke-89 и
+  36_ccmt_abi: вывод побайтово совпал с PUC; Debug battery 358/358.
+  Отдельные pre-existing host-hook и builtin-argument пункты ниже
+  не входят в закрытый per-frame CCMT-контракт. Open-count 31→30.
 
-- [ ] **Safety BLOCKER (pre-existing, найден независимо ccmt cut 1/2
+- [x] **C API suite 36 Debug N15: `c_pop` safepoint-window panic
+  (BLOCKER, FIX-NOW; review `f437af7`).** Новый обязательный
+  `36_ccmt_abi` в Debug завершается SIGABRT после F7c на N15:
+  `top=24` выше `windowTop` Lua-кадра при `popBuiltinCFrame` после
+  15-звенного tailcall→C→argerror. Ревьювер воспроизвёл на финальном
+  дереве; `/tmp/opencode/ccmtcut2/nb_pristine_debug_panic.out`
+  показывает тот же сбой на Cut-1 baseline, то есть это не ABI-регрессия
+  Cut 2, но новый обязательный gate НЕ green. Не путать с отдельной
+  `bcGrowFrame` OOB-паникой чисто-Lua цепочки ниже; это другой первый
+  неверный сайт. Исправление обязано сохранить error-object/status,
+  живые roots и дальнейшую работоспособность VM; не выключать checker
+  и не изымать N15 из differential suite. Open-count 28→29.
+  CLOSED (`470025e`): `fr.limit=ctx.cap+1` публикуется после chain-
+  резолюции в opTailcall/opTforcall/C-closure-arm opCall. Ревьювер
+  повторил Debug `36_ccmt_abi`: exit 0, вывод побайтово совпал с PUC
+  и `-xread` (включая N15); Debug smoke-89 также совпал с PUC.
+  Open-count 29→28.
+
+- [ ] **Parity BLOCKER, ORDINARY-BACKLOG: прямой host-origin builtin
+  пропускает LUA_HOOKCALL.** Независимый дифференциал
+  `debug.sethook(h,'c'); pcall(collectgarbage,'count')`, где `h`
+  фильтрует `debug.getinfo(2,'ft').func==collectgarbage`: PUC 5.5
+  `call:0`, luazig — пусто. Первая неверная операция —
+  `callBuiltin(.host, ccmt=0)` не отправляет activation-hook после
+  создания C-frame (либо прямой frameless-путь не создаёт его вовсе).
+  Этот pre-existing класс не закрыт correction `470025e`; для паритета
+  нужна общая C-активация с правильным hook owner, не test-specific
+  событие. Не перехватывает текущую CCMT-correction автоматически.
+  Open-count 28→29.
+
+- [ ] **Parity BLOCKER, ORDINARY-BACKLOG: builtin argument contract
+  (`collectgarbage`/`string.sub`) не соответствует PUC.** Прямая
+  валидная форма `pcall(collectgarbage,nil)`: PUC 5.5 возвращает
+  `true, number, 0`, luazig — RuntimeError `collectgarbage expects
+  string`; это не только формат текста. Ошибки других аргументов тоже
+  обходят PUC `luaL_argerror`, поэтому `__call`-цепь не получает
+  корректный `extra argument` в error object несмотря на правильный
+  CCMT в кадре. Pre-existing stdlib-класс, не изменён `470025e`,
+  нужен единый PUC-подобный аргументный механизм. Open-count 29→30.
+
+- [x] **Safety BLOCKER, FIX-NOW: vararg call-hook держит `*CallFrame`
+  через возможный realloc `FrameStack.heap` (`456a3c3`).** Новая
+  OP_VARARGPREP-ветка берёт `fr_hk = ctx.exec_frames.getPtr(...)`,
+  ставит `fr_hk.u.lua.pc=1`, затем `defer fr_hk.u.lua.pc=0` после
+  `debugDispatchHookWithCalleeTransfer`. Lua-hook может исполнить
+  глубокую рекурсию на том же Thread; `FrameStack.addOne` растит
+  `heap` через ArrayList.realloc. Если vararg-кадр лежит в heap,
+  отложенная запись идёт по потенциально освобождённому указателю
+  (UAF/corruption). Ревьювер подтвердил достижимость глубокой
+  рекурсии из такого hook (40 кадров до vararg + 90 внутри hook);
+  конкретный realloc/poison oracle нужен в correction. Хранить индекс
+  и повторно получать `getPtr` при cleanup, доказать error/yield пути;
+  не отключать hook/vararg событие. HC8/HC10/HC11 в текущем smoke-89
+  не доказывают заявленные GC/yield/re-entry свойства (ветка HC8 не
+  исполняет GC; HC10 падает из-за `h.yield_denied`; HC11 получает
+  запрещённый yield и мёртвую корутину). Смежное новое MayGC-окно:
+  Lua-hook ветка `debugDispatchHookTransfer` интернирует строку события
+  в локальный `argv_buf[0]`, затем делает fallible `alloc.dupe(transfer)`
+  до публикации/root этого GC-значения; emergency GC может освободить
+  строку. Нужны rooting/rollback proof и принудительный OOM-oracle.
+  Open-count 30→31.
+  CLOSED (`266f98c`): отложенный cleanup повторно получает кадр по
+  индексу; RootScope защищает строку события через MayGC-окно;
+  HC8/HC10/HC11 переписаны на исполняемые PUC-дифференциалы.
+  Принудительные realloc/poison и RED-мутации сохранены в артефактах
+  correction; ревьювер сверил код и сырые трассы, повторил smoke-89.
+  Open-count 30→29.
+
+- [x] **Safety BLOCKER (pre-existing, найден независимо ccmt cut 1/2
   + координатором; stash-verified на pristine ad03a06 и 8c9e1f7):
   Debug-паника bcGrowFrame OOB на валидной Lua 15-звенной чисто-Lua
   __call-цепочке**: `local function chk(...) return 1 end local v=chk
@@ -190,6 +336,27 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   продвинулся за th.stack.len — slice OOB. Fix-направление: ensure
   стек-окна при активации кадра покрывает base+cap независимо от роста
   cap (или slice от @min). Open-count 28→29.
+  CLOSED (`60a9ee9`): tailcall-reuse резервирует точное окно нового callee
+  до переносов и инфаллибельно публикует base/cap/top/limit;
+  `bcGrowFrame` коммитит cap только после reserve, а общий window-helper
+  не возвращает успех без физической ёмкости. Ревьювер повторил исходную
+  форму и smoke-90 против PUC (побайтово), Debug vararg.lua --testc
+  (rc=0), Debug battery 358/358; RF perf-бинарь совпал по SHA с
+  пересобранным финальным source. VATAB nil-fill и stale `va_slice`
+  также исправлены в этом коммите. Open-count 29→28.
+
+- [ ] **MEDIUM, UNCONFIRMED: VATAB raw extras могут остаться выше `top`
+  на fallible push нового кадра.** В `pushStagedBytecodeExecFrame`
+  (`vm.zig` около 17965) `th.top = base + frame_cap`, хотя при большом
+  числе raw extras аргументы занимают слоты выше этого bound; затем
+  `FrameStack.addOne` может аллоцировать до `OP_VARARGPREP`. Обычный
+  PUC-дифференциал с GC в call-hook не воспроизвёл потерю (40 extras:
+  обе реализации вернули `40, true`), поэтому это пока не доказанный
+  UAF. Следующий решающий эксперимент: глубокий (>32) VATAB-вызов с
+  единственным GC-объектом в extra-слоте выше windowTop, принудительный
+  emergency GC ровно в `addOne`, poison/unmap и PUC-сравнение; проверить
+  физическую ёмкость, `top`, root и следующий GC cycle. Отдельный
+  pre-existing push-путь, не результат `60a9ee9`. Open-count 28→29.
 
 - [x] **C API lauxlib argument-error parity после cidx (BLOCKER,
   FIX-NOW).** В изменённом `luaL_checklstring`/`luaL_optlstring` путь
@@ -1928,6 +2095,20 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   Фикс требует replay-owner для mid-recovery-close suspension —
   архитектурное решение (кандидат на пересмотр в milestone TBC/close
   unification). Найдено TBC-escape stage (F1).
+  RESEARCH UPDATE (pkres, 2026-10-01, к `60a9ee9`): CONFIRMED на
+  4 осях (timing: suspension vs eager; eventual close: потерян;
+  error object: исходная ошибка заменена конвертационной; второй
+  resume), Debug==RF; контроли S2/S4/S5 — parity (чистый Lua и
+  main-thread корректны). Decisive differential
+  `/tmp/opencode/pkres/f1_decisive.lua` (S1_r1: `dead` vs PUC
+  `suspended`+recovered). REDESIGN-вариант конкретизирован (pkres §5,
+  рекомендация A): pcallk-recovery owner как единая точка — level-регион
+  marks, yy по потоку (корутина→1), потребление `error.Yield` в
+  trampoline (см. новый пункт N), window-end на C-кадре (см. DGC),
+  OOM в recovery (см. P); миграция 5 cuts с acceptance в pkres §6,
+  порядок N-crash → F1 → (ii) GY → окно → OOM; legacy-путь
+  `finishBytecodeProtectedFailure` non-yieldable close удаляется cut'ом
+  F1. Пункт остаётся открытым (implementation не выполнялся).
 
 - [x] **P16.50-review correction (REOPENED→CLOSED by review-7)**: rollback ownership + C-closure upvalue semantics — (a) BLOCKER 1: opClosure count-prefix rollback неверен при смешанных дескрипторах (proxy/new instack/уже-boxed) — exact ownership worklist/bitmap, rollback только созданных этим вызовом Cells в reverse-порядке; закрыть post-commit окно (gcStoreCellValue после commit) — либо provably-infallible через preparation/order, либо полный rollback owner для Closure/tree/register/accounting/register-slot; dispatch-driven mixed-upvalue тест ([proxy, new instack] из реального bytecode; existing-boxed; провал на следующем Cell и на Closure alloc; post-commit barrier failure; byte-exact всё + minor collection + repeated + success); negative copy count-prefix rollback детерминированно ловится; (b) BLOCKER 2: lua_newthread errdefer НЕ работает (?*lua_State ≠ error union) — inner error-union transaction / явный cleanup helper, ABI-wrapper маппит в null ПОСЛЕ cleanup; preserve/restore прежний vm.c_api_thread; тест против реального экспортированного lua_newthread (fail на registry prepare / Thread alloc / handle alloc / parent stack growth; registries/stack/handle/counters/live-set + GC после); (c) BLOCKER 3: registerfuncs алиасит C-closure upvalues (общие Cell-объекты: setupvalue(f1) виден f2) — PUC luaL_setfuncs (lauxlib.c:965-978) копирует VALUES на стек + lua_pushcclosure (lapi.c:609+) свежий CClosure с inline slots; один канонический C-closure конструктор для pushcclosure+registerfuncs с per-closure Cells; убрать неверный LClosure rationale; differential-тест (upvalueid differs; setupvalue A не меняет B; сбор в обоих порядках без leaks; OOM на non-preinterned names + table-growth setfield); (d) error propagation: lua_pushcclosure/lua_pushcfunction/luaL_setfuncs/luaL_newlib catch {} — обследовать защищённый механизм (protected call/throw) и маршрутизировать ЛИБО зафиксировать архитектурный blocker (owner решает); (e) HIGH: testcChargeMemory коммитит total_bytes ДО нативных аллокаций — split check/reserve от accounting commit / точный rollback; тест с активным testc_ctrl + провалы registry reserve/Userdata/uservalues/payload; аудит всех testcChargeMemory-сайтов; (f) cleanup: устаревшие BLOCKED/KNOWN-leak комментарии в тестах, skip fail-индексов 2..4 в pushcclosure matrix, smoke provenance prose (84 файла, 85-й номер — один из 84).
 

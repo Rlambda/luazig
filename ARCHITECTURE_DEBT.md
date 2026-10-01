@@ -82,6 +82,17 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
    REDESIGN constraint.** Recovery-close должен допустить yield и после
    resume продолжить recovery/continuation. Открытый HIGH-пункт
    в `STATUS.md`.
+   RESEARCH UPDATE (pkres, 2026-10-01, к `60a9ee9`): F1 и f9b_window —
+   одна недостающая сущность (PUC CIST_YPCALL-кадр + finishpcallk
+   владеет publication/recovery-close/window-survival). Рекомендован
+   вариант A — единый pcallk-recovery owner: level-регион marks, yy по
+   потоку, потребление `error.Yield` в trampoline (закрывает N-crash),
+   window-end на C-кадре (закрывает DGC; stale-слоты опровергнуты GC-
+   кодом), OOM в recovery (закрывает P). Миграция 5 cuts
+   (N → F1 → GY → окно → OOM) с acceptance-критериями в
+   `/tmp/opencode/pkres_report.md` §6; legacy non-yieldable close в
+   `finishBytecodeProtectedFailure` удаляется cut'ом F1. Новый
+   Thread-global replay field не требуется.
 2. **Единое ordered TBC representation — подтверждённый архитектурный
    долг.** PUC имеет один `tbclist`; luazig делит obligations на
    `bytecode_tbc_regs` и `c_tbc_chain`. Decisive differential найден при

@@ -58,12 +58,24 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   suspended` + второй resume с исходным объектом; zig — dead/потеря).
   Подтверждено координатором лично (Debug+RF). Артефакты/raw:
   `/tmp/opencode/pkres_report.md` §3-4.
+  VERIFICATION UPDATE (pkres-v, 2026-10-01, к `917339a`; отчёт
+  `/tmp/opencode/pkresv_report.md`, артефакты `/tmp/opencode/pkresv/`):
+  Consumer-less precover-сайтов ЧЕТЫРЕ, не три — найден 4-й в
+  direct-resume unroll builtinCoroutineResume (vm.zig:29398); прежняя
+  формулировка «already loops correctly» опровергнута (корректен только
+  recovered-case; `try` пропускает error.Yield так же). Cut N
+  конвертирует четыре сайта. Продукт не менялся (baseline `917339a`
+  = `60a9ee9` product-wise); координатор верифицировал E4-дифференциал
+  лично (Debug): generic builtinPcall-путь воспроизводит F1-оси
+  (eager close + log-уже-в-r1 vs PUC suspension; r2 `cannot resume
+  dead coroutine` vs завершение).
 
 - [ ] **GY: arg-marks вне chain-региона закрываются truncation-close с
   nil-объектом и yy=0 (BLOCKER-класс, research pkres, 2026-10-01).**
   Closer получает nil вместо исходного error object; yield конвертирован
   в ошибку. Расширение (ii) единого recovery-owner (см. F1-обновление
-  ниже). Decisive: GY_r1/GY_r2 в `/tmp/opencode/pkres/f1_decisive.lua`.
+  ниже). Decisive: GY_r1/GY_r2 в `/tmp/opencode/pkres/f9b_window.c`
+  (`gy` mode).
 
 - [ ] **P: c_api `lua_pcallk` ловит `OutOfMemory` синхронно —
   continuation `k` пропускается (HIGH, research pkres, 2026-10-01).**
@@ -75,8 +87,8 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   настоящий GC между resume (HIGH, research pkres, 2026-10-01).** PUC
   сохраняет окно; zig-окно пустое. Код GC (atomic clear-dead-stack,
   vm.zig:32410+) ОПРОВЕРГАЕТ починку «пересборка окна из stale-слотов» —
-  допустимо только сохранение window-end на C-кадре (рекомендация
-  A(a), pkres §5). Форма J1/J2/J_gc_done в f1_decisive.lua.
+  живой prefix требует опубликованной GC-границы либо иного доказанного
+  root-owner. Decisive: `dgc` mode в `/tmp/opencode/pkres/f9b_window.c`.
 
 - [ ] **ORDINARY-BACKLOG (research pkres): «block too big» — PUC ERRRUN
   vs zig ERRMEM.** Побочный finding f9b-оракула; отдельный
@@ -91,7 +103,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   первая неверная граница — `finishpcallk`/публикация C-window перед `k`,
   а не запись `CIST_CCMT`. Исправление — отдельный parity-cut с
   проверкой identity/status/stack effects через `pcallk` и следующий
-  resume.   Это расхождение нельзя включать в byte-exact F9b gate
+  resume. Это расхождение нельзя включать в byte-exact F9b gate
   CCMT-cut'а без отдельного исправления; F9b metadata/owner proof
   остаётся пригодным. Open-count 27→28.
   RESEARCH UPDATE (pkres, 2026-10-01, к `60a9ee9`; артефакты
@@ -100,16 +112,38 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   `/tmp/opencode/pkres/f9b_window.c` (PUC из in-repo lua-5.5.0): zig
   rc=1 vs PUC rc=0; по осям — a1=nil против исходного table error
   object (identity rawequal=0), OOM-строка, error-handler failure,
-  nested; `driver error: type=nil val=(null)` в хвосте. F9b и F1 —
-  ОДНА недостающая сущность: PUC CIST_YPCALL-кадр + `finishpcallk`
-  владеет публикацией error object в continuation window,
-  recovery-close всех marks по level (yy=1 в корутине) и выживанием
-  окна через suspension; в luazig это разрезано по lane'ам и сайтам.
-  Первое неверное действие — граница publication/recovery в
-  finishpcallk-эквиваленте + c_api catch{}-обработка OOM (см. пункт P);
-  починка через stale-слоты опровергнута (см. пункт DGC). Рекомендован
-  единый pcallk-recovery owner (вариант A, 5 cuts: N-crash → F1 → (ii)
-  → окно → OOM; pkres §5-6). Пункт остаётся открытым до implementation.
+  nested; `driver error: type=nil val=(null)` в хвосте. PUC объединяет
+  эти обязанности в CIST_YPCALL-кадре и `finishpcallk`, но эквивалентный
+  единый owner в luazig пока НЕ доказан: bytecode-fast-path `pcall` не
+  создаёт C-кадр, а `finishBytecodeProtectedFailure` передаёт
+  `clsret_frame=null` в `closeTbcRegion`, где yield требует C-кадр.
+  `restoreTopAtFrame` и `cWindowSetCount` отдельно теряют живой prefix
+  окна; `c_api` отдельно ловит OOM до continuation (см. P/DGC).
+  Предложенные в pkres §5-6 вариант A и порядок 5 cuts — гипотеза,
+  не утверждённый implementation-план: acceptance N требует сохранения
+  окна, отложенного предложенным порядком до четвёртого cut. Требуется
+  bounded verification owner/порядка; пункт остаётся открытым.
+  VERIFICATION UPDATE (pkres-v, 2026-10-01, к `917339a`; отчёт
+  `/tmp/opencode/pkresv_report.md`, артефакты `/tmp/opencode/pkresv/`,
+  product не менялся): bounded verification выполнена. Consumer-less
+  precover-сайтов ЧЕТЫРЕ, не три — 4-й в direct-resume unroll
+  builtinCoroutineResume (vm.zig:29398); прежнее «already loops
+  correctly» опровергнуто (корректен только recovered-case; `try`
+  пропускает error.Yield так же) → Cut N конвертирует четыре сайта.
+  Дизайн-сравнение (pkresv §4): Д1 (реальный YPCALL-кадр для bytecode
+  lane) vs Д2 (типизированный recovery-контракт, lane-specific
+  frame-backed носители: C CallFrame + bytecode continuation; без
+  второго mutable authority и Thread-global replay field; CLSRET
+  yield/re-entry через S4-proven machinery; zero hot-path cost).
+  Generic builtinPcall/builtinXpcall пути чинятся в любом дизайне
+  (defer-to-precover при yieldable-at-entry — YPCALL-кадр уже есть),
+  что сужает добавочную цену Д1 до routing + удаления fast path;
+  Д2 даёт mixed-carriers end state. Рекомендация pkres-v — Д2,
+  финальный выбор за owner. Cut-порядок переработан (pkresv §6):
+  N-acceptance требует prefix/window — объединён с бывшим Cut 4 либо
+  переставлен; каждый cut — зелёное дерево + достижимый
+  PUC-differential acceptance. Координатор верифицировал лично (Debug,
+  `917339a`-дерево): E4-дифференциал generic-пути и S1-ось f1.
 
 - [x] **`lua_Debug` ABI-layout относительно PUC 5.5 (HIGH,
   ARCHITECTURAL-BACKLOG; review A1.next-ccmt research).** Предложенный
@@ -2101,14 +2135,27 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   resume), Debug==RF; контроли S2/S4/S5 — parity (чистый Lua и
   main-thread корректны). Decisive differential
   `/tmp/opencode/pkres/f1_decisive.lua` (S1_r1: `dead` vs PUC
-  `suspended`+recovered). REDESIGN-вариант конкретизирован (pkres §5,
-  рекомендация A): pcallk-recovery owner как единая точка — level-регион
-  marks, yy по потоку (корутина→1), потребление `error.Yield` в
-  trampoline (см. новый пункт N), window-end на C-кадре (см. DGC),
-  OOM в recovery (см. P); миграция 5 cuts с acceptance в pkres §6,
-  порядок N-crash → F1 → (ii) GY → окно → OOM; legacy-путь
-  `finishBytecodeProtectedFailure` non-yieldable close удаляется cut'ом
-  F1. Пункт остаётся открытым (implementation не выполнялся).
+  `suspended`+recovered). PUC-ориентир — CIST_YPCALL/`finishpcallk`;
+  вариант A из pkres §5 требует доутверждения. В luazig bytecode-fast-
+  path `pcall` без C-кадра, `closeTbcRegion` при yield требует
+  `clsret_frame`, а текущий caller передаёт null: простой перевод
+  yy=0→1 вызовет panic, не создаст continuation owner. У PUC yieldable-
+  ветка `lua_pcallk` выбирается по `k != NULL && yieldable(L)`, не
+  только по факту корутины. Нужны конкретный frame/continuation owner
+  и независимые acceptance gates; 5 cuts из pkres §6 пока не утверждены.
+  VERIFICATION UPDATE (pkres-v, 2026-10-01, к `917339a`): F1-семейство
+  расширенно до ТРЁХ product-сайтов + OOM-arm: кроме
+  finishBytecodeProtectedFailure (vm.zig:17088) — builtinPcall catch
+  (27479-27563) и builtinXpcall catch (27780/27818); E4-дифференциал
+  `/tmp/opencode/pkresv/e4_generic_lane.lua` доказывает те же 4 оси на
+  generic-пути (координатор верифицировал лично, Debug: eager close +
+  log-уже-в-r1 vs PUC suspension; конвертированная ошибка замещает
+  исходную; r2 `cannot resume dead coroutine` vs PUC завершение).
+  Cut F1 scope: 3 сайта + E4 в acceptance, включая OOM-arm (PUC
+  luaB_pcall = pcallk с k=finishpcall — ERRMEM идёт через тот же
+  yy=1 recovery). Дизайн и cut-порядок — см. VERIFICATION UPDATE в
+  пункте f9b_window выше (Д1 vs Д2, рекомендация Д2 за owner;
+  N+window объединены). Пункт остаётся открытым.
 
 - [x] **P16.50-review correction (REOPENED→CLOSED by review-7)**: rollback ownership + C-closure upvalue semantics — (a) BLOCKER 1: opClosure count-prefix rollback неверен при смешанных дескрипторах (proxy/new instack/уже-boxed) — exact ownership worklist/bitmap, rollback только созданных этим вызовом Cells в reverse-порядке; закрыть post-commit окно (gcStoreCellValue после commit) — либо provably-infallible через preparation/order, либо полный rollback owner для Closure/tree/register/accounting/register-slot; dispatch-driven mixed-upvalue тест ([proxy, new instack] из реального bytecode; existing-boxed; провал на следующем Cell и на Closure alloc; post-commit barrier failure; byte-exact всё + minor collection + repeated + success); negative copy count-prefix rollback детерминированно ловится; (b) BLOCKER 2: lua_newthread errdefer НЕ работает (?*lua_State ≠ error union) — inner error-union transaction / явный cleanup helper, ABI-wrapper маппит в null ПОСЛЕ cleanup; preserve/restore прежний vm.c_api_thread; тест против реального экспортированного lua_newthread (fail на registry prepare / Thread alloc / handle alloc / parent stack growth; registries/stack/handle/counters/live-set + GC после); (c) BLOCKER 3: registerfuncs алиасит C-closure upvalues (общие Cell-объекты: setupvalue(f1) виден f2) — PUC luaL_setfuncs (lauxlib.c:965-978) копирует VALUES на стек + lua_pushcclosure (lapi.c:609+) свежий CClosure с inline slots; один канонический C-closure конструктор для pushcclosure+registerfuncs с per-closure Cells; убрать неверный LClosure rationale; differential-тест (upvalueid differs; setupvalue A не меняет B; сбор в обоих порядках без leaks; OOM на non-preinterned names + table-growth setfield); (d) error propagation: lua_pushcclosure/lua_pushcfunction/luaL_setfuncs/luaL_newlib catch {} — обследовать защищённый механизм (protected call/throw) и маршрутизировать ЛИБО зафиксировать архитектурный blocker (owner решает); (e) HIGH: testcChargeMemory коммитит total_bytes ДО нативных аллокаций — split check/reserve от accounting commit / точный rollback; тест с активным testc_ctrl + провалы registry reserve/Userdata/uservalues/payload; аудит всех testcChargeMemory-сайтов; (f) cleanup: устаревшие BLOCKED/KNOWN-leak комментарии в тестах, skip fail-индексов 2..4 в pushcclosure matrix, smoke provenance prose (84 файла, 85-й номер — один из 84).
 

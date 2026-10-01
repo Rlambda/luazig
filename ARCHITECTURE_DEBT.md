@@ -82,17 +82,29 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
    REDESIGN constraint.** Recovery-close должен допустить yield и после
    resume продолжить recovery/continuation. Открытый HIGH-пункт
    в `STATUS.md`.
-   RESEARCH UPDATE (pkres, 2026-10-01, к `60a9ee9`): F1 и f9b_window —
-   одна недостающая сущность (PUC CIST_YPCALL-кадр + finishpcallk
-   владеет publication/recovery-close/window-survival). Рекомендован
-   вариант A — единый pcallk-recovery owner: level-регион marks, yy по
-   потоку, потребление `error.Yield` в trampoline (закрывает N-crash),
-   window-end на C-кадре (закрывает DGC; stale-слоты опровергнуты GC-
-   кодом), OOM в recovery (закрывает P). Миграция 5 cuts
-   (N → F1 → GY → окно → OOM) с acceptance-критериями в
-   `/tmp/opencode/pkres_report.md` §6; legacy non-yieldable close в
-   `finishBytecodeProtectedFailure` удаляется cut'ом F1. Новый
-   Thread-global replay field не требуется.
+   RESEARCH UPDATE (pkres, 2026-10-01, к `60a9ee9`): PUC объединяет
+   publication/recovery-close/window-survival в CIST_YPCALL-кадре и
+   `finishpcallk`; F1, F9b, N, GY, P и DGC наблюдаемо расходятся.
+   Вариант A и пять cuts из `/tmp/opencode/pkres_report.md` §5-6 пока
+   НЕ утверждены: bytecode-fast-path `pcall` не создаёт C-кадр, а
+   `closeTbcRegion` при yield требует `clsret_frame` (текущий F1-site
+   передаёт null). Кроме того, N-acceptance зависит от сохранения
+   prefix/window, поставленного в исходном плане лишь четвёртым cut.
+   Следующий шаг — bounded verification общего frame/continuation owner,
+   GC-root/window контракта и самостоятельно зелёного порядка cuts.
+   Thread-global replay field не вводить без отдельного обоснования.
+   VERIFICATION UPDATE (pkres-v, 2026-10-01, к `917339a`, product не
+   менялся): verification выполнена — карта owners для обоих lane,
+   сравнение Д1 (PUC-подобный YPCALL-кадр и для bytecode lane) vs Д2
+   (типизированный recovery-контракт с lane-specific frame-backed
+   носителями, без второго mutable authority/replay-field;
+   CLSRET-yield/re-entry через S4-proven machinery, zero hot-path
+   cost) в `/tmp/opencode/pkresv_report.md` §4; рекомендация — Д2,
+   финальный выбор за owner. F1-семейство = 3 product-сайта +
+   OOM-arm (finishBytecodeProtectedFailure + builtinPcall +
+   builtinXpcall; E4-дифференциал). Consumer-less precover-сайтов
+   четыре (4-й — direct-resume unroll 29398). Cut-порядок переработан
+   (pkresv §6): N+window объединены, каждый cut независимо зелёный.
 2. **Единое ordered TBC representation — подтверждённый архитектурный
    долг.** PUC имеет один `tbclist`; luazig делит obligations на
    `bytecode_tbc_regs` и `c_tbc_chain`. Decisive differential найден при

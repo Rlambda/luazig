@@ -962,55 +962,6 @@ const BytecodeSavedError = struct {
     errfunc: StackOffset = ERRFUNC_NONE,
 };
 
-const BytecodeProtectedKind = enum { pcall, xpcall };
-
-const BytecodeProtectedLayer = struct {
-    thread: *Thread,
-    kind: BytecodeProtectedKind,
-    saved_error: BytecodeSavedError,
-};
-
-const BytecodeProtectedCall = struct {
-    thread: *Thread,
-    kind: BytecodeProtectedKind,
-    /// P16.23 T6: nCcalls at protection entry. On a CAUGHT error the
-    /// iterative unwind pops frames WITHOUT running their paired ccall
-    /// exits (no C-stack unwind like PUC), so the recovery point restores
-    /// the thread depth to this snapshot. Parked/continued frames across
-    /// yield never pass here, preserving their live increments.
-    saved_ncalls: u32 = 0,
-    /// PUC lua_pcallk (lapi.c): when errfunc != 0, L->errfunc is armed for
-    /// the protected call's duration. For xpcall this is the stack slot
-    /// holding the message handler (staged just below the target frame);
-    /// ERRFUNC_NONE for pcall (PUC arms errfunc = 0). The handler runs at
-    /// the throw site (invokeErrfunc / PUC luaG_errormsg) — NOT after the
-    /// unwind — so finishBytecodeProtectedCall only needs to pop the slot
-    /// and let restoreBytecodeSavedError bring back the outer errfunc.
-    armed_errfunc: StackOffset = ERRFUNC_NONE,
-    saved_error: BytecodeSavedError,
-    /// P16.31 Cut 3: the thread's c_tbc_chain length at protection entry —
-    /// the PUC `old_top` equivalent (lua_pcallk saves L->top just above the
-    /// staged func+args; luaD_pcall's catch closes every tbclist entry at a
-    /// level >= old_top). Marks made BEFORE the protected call (the caller's
-    /// own hook-lane marks) sit below it and are NOT closed here; marks made
-    /// by the target or anything above it (frame_slot entries on frames the
-    /// error unwind already popped — detached — plus any survivors) close at
-    /// the failure recovery (finishBytecodeProtectedFailure), non-yieldable,
-    /// last-error-wins (PUC luaD_closeprotected, ldo.c:1059).
-    tbc_chain_base: usize = 0,
-    /// Outermost-to-innermost protected builtins whose target is another
-    /// pcall/xpcall. The innermost Lua target is the active protection above;
-    /// once it completes, each parked outer target completed successfully and
-    /// contributes one leading `true` result without re-entering Zig.
-    outer_layers: []BytecodeProtectedLayer = &.{},
-};
-
-const BytecodeProtectedRecovery = union(enum) {
-    not_handled,
-    resumed,
-    completed: []Value,
-};
-
 const BytecodeResultContinuation = struct {
     dst: u8,
     nresults: i32,
@@ -1191,7 +1142,6 @@ const BytecodeDispatchFault = enum {
 };
 
 const BytecodeUnwindDisposition = union(enum) {
-    protected_parent: usize,
     close_parent: usize,
     propagate,
 };
@@ -1358,7 +1308,6 @@ const BytecodePendingCompletion = union(enum) {
 const BytecodePendingCall = struct {
     callee: Value,
     completion: BytecodePendingCompletion,
-    protection: ?*BytecodeProtectedCall = null,
     /// P15.51n: Debug name override for the child frame created by this
     /// continuation. Set when the child frame is pushed (e.g. "metamethod"
     /// / "__add"). Read by debug.getinfo and traceback. Stored here rather
@@ -1403,8 +1352,7 @@ const EXTRA_MARGIN: usize = 5;
 /// has written a fresh value. This is safe because every `set()` writes
 /// every field of `BytecodePendingCall` that will be read (the struct has
 /// no fields with non-trivial defaults that `set()` callers rely on without
-/// explicitly providing — `protection` defaults to `null` inside the struct
-/// literal at each `set()` callsite).
+/// explicitly providing).
 ///
 /// PUC Lua parallel: PUC's `CallInfo` does not carry an inline continuation
 /// payload. The caller's `savedpc` and the bytecode itself encode the
@@ -1759,7 +1707,13 @@ const TbcEntry = union(enum) {
     /// so a mark's slot is a stable absolute index — exactly PUC's
     /// tbclist LEVEL, which is also an L->stack index).
     frame_slot: struct { cframe_idx: usize, slot_idx: usize },
-    detached: Value,
+    /// A mark whose owning frame is gone: the captured value plus the
+    /// mark's stack level. PUC's tbclist stores LEVELS, not values — a
+    /// popped ci does not unrange its marks; whichever boundary's
+    /// `luaF_close(func, ...)` covers the level runs the closer. The
+    /// captured level lets every level-based region selection (the
+    /// pcallk recovery close) decide membership exactly like PUC.
+    detached: struct { value: Value, level: usize },
 };
 
 /// PUC `CallInfo.u.l` — Lua function frame state.
@@ -2634,6 +2588,13 @@ pub const Thread = struct {
     /// invokeErrfunc when the message handler itself errors. Reset to
     /// false at every error-throw site BEFORE invokeErrfunc.
     err_is_errerr: bool = false,
+    /// PUC LUA_ERRMEM kind bit: the in-flight error is a memory error.
+    /// PUC's luaD_throw carries the STATUS alongside the object; luazig
+    /// reconstructs it from the kind bits of the thread error state
+    /// (see errStatus). Set by setOutOfMemoryError; reset at every
+    /// fresh error-throw site, exactly like err_is_errerr. Never derived
+    /// from the object's text.
+    err_is_oom: bool = false,
     /// Source chunk name / line of the fault point (for message
     /// building at raise time; borrowed from the raising frame's proto).
     err_source: ?[]const u8 = null,
@@ -2708,9 +2669,6 @@ pub const Thread = struct {
     /// runBytecodeInternal call must be preserved so resume doesn't process
     /// frames belonging to outer callers.
     bytecode_resume_boundary: usize = 0,
-    /// Protected bytecode continuations are per Lua thread. Parked coroutines
-    /// must not consume another thread's protected-call/error-handler budget.
-    bytecode_protected_depth: usize = 0,
     /// Nested unwind states are possible when a yielding __close handler
     /// raises while an older error is already closing another frame.
     /// Inline-prefix storage: see BytecodeUnwindStack.
@@ -2777,6 +2735,14 @@ pub const Thread = struct {
     /// permanent root, and `gcFreeObject(.thread)` skips main handles).
     /// `null` for Lua-created coroutines (no C handle).
     api_handle: ?*lua_State = null,
+
+    /// The PUC status of the in-flight error (luaD_throw's status
+    /// argument): 5 = LUA_ERRERR, 4 = LUA_ERRMEM, 2 = LUA_ERRRUN.
+    pub fn errStatus(th: *const Thread) i32 {
+        if (th.err_is_errerr) return 5;
+        if (th.err_is_oom) return 4;
+        return 2;
+    }
 
     /// PUC `isyieldable` (ldo.c): the thread may yield iff no non-yieldable
     /// C-call boundary is active (upper 16 bits of `nCcalls` are zero).
@@ -4260,7 +4226,7 @@ comptime {
     std.debug.assert(@sizeOf(Closure) == 48);
     std.debug.assert(@sizeOf(Cell) == 48);
     std.debug.assert(@sizeOf(Userdata) == 56);
-    std.debug.assert(@sizeOf(Thread) == 3824);
+    std.debug.assert(@sizeOf(Thread) == 3816);
 }
 
 /// Result of compiling a text chunk through the host-selected bytecode
@@ -5550,11 +5516,6 @@ pub const Vm = struct {
     protected_call_depth: usize = 0,
     // P15.78: errfunc and errfunc_running moved from Vm to Thread, matching
     // PUC's L->errfunc on lua_State (not global_State). See Thread.errfunc.
-    // P16.41 Cut 1: protected_c_frame_depths (a registered-depth array for
-    // errorLocationFrameIndex) is GONE — slow-path pcall/xpcall/dofile now
-    // have REAL visible C-frames, and the frame-less fast path is derived
-    // from the armed pending-protection on the caller frame (see
-    // errorLocationFrameIndex). No registered state, no stale depths.
     close_metamethod_depth: usize = 0,
     close_metamethod_err_depth: usize = 0,
     testc_close_metamethod_depth: usize = 0,
@@ -6446,10 +6407,6 @@ pub const Vm = struct {
             }
         }
         return &.{};
-    }
-
-    fn activeProtectedCallDepth(self: *Vm) usize {
-        return self.protected_call_depth + self.activeBytecodeThread().bytecode_protected_depth;
     }
 
     fn activeErrorHandlerDepth(self: *Vm) usize {
@@ -8879,14 +8836,11 @@ pub const Vm = struct {
     }
 
     /// Label for a virtual C frame that has no CallFrame on the stack:
-    /// either a phantom fast-path pcall/xpcall layer (the PUC CallInfo of
-    /// the pcall C function that tryPushBytecodeProtectedCall skips), or
     /// the yield C frame of a suspended coroutine whose frame was popped
     /// at suspension. The name follows PUC funcnamefromcall: read the
     /// caller frame's call instruction and its A operand — but only when
     /// the caller is the frame that actually called this C function
-    /// (`from_call_site`; an inner pcall layer's caller is the OUTER
-    /// pcall's C frame, which yields no code name). Fallback:
+    /// (`from_call_site`). Fallback:
     /// pushglobalfuncname ("function 'name'"), then "?".
     /// PUC funcnamefromcall for a C frame whose caller is the Lua frame
     /// at `caller_idx`: read the caller's current instruction; if it is a
@@ -8933,23 +8887,10 @@ pub const Vm = struct {
         return try std.fmt.allocPrint(self.alloc, "[C]: in ?", .{});
     }
 
-    /// One traceback level: a real frame, a phantom fast-path pcall layer
-    /// (PUC: the pcall C function's CallInfo, which the zig fast path does
-    /// not push), or the virtual yield C frame of a suspended coroutine.
-    /// A phantom fast-path pcall/xpcall layer: `armed_idx` is the armed
-    /// caller frame (whose call instruction names the outermost layer),
-    /// `kind` which pcall variant this layer is, `outermost` whether this
-    /// layer's caller is the armed frame itself (inner layers' callers
-    /// are outer C frames).
-    const TracebackPhantom = struct {
-        armed_idx: usize,
-        kind: BytecodeProtectedKind,
-        outermost: bool,
-    };
-
+    /// One traceback level: a real frame, or the virtual yield C frame
+    /// of a suspended coroutine whose frame was popped at suspension.
     const TracebackItem = union(enum) {
         frame: usize,
-        phantom: TracebackPhantom,
         virtual_yield,
     };
 
@@ -8959,14 +8900,7 @@ pub const Vm = struct {
     ///    frame itself) gets a virtual yield item at level 0 — PUC keeps
     ///    luaB_yield's CallInfo (db.lua: checktraceback expects the
     ///    "yield" line for both plain and hook yields);
-    ///  - visible frames, with the phantom pcall layers of an armed frame
-    ///    inserted BEFORE it, innermost first (PUC chain top-down:
-    ///    ..., target, xpcall(C), pcall(C), caller — the protection kind
-    ///    is the innermost layer; outer_layers park the outer ones,
-    ///    outermost first, so they emit reversed). Only the OUTERMOST
-    ///    layer is named from the armed frame's call site — an inner
-    ///    layer's caller is the outer pcall's C frame (no code name; PUC
-    ///    falls back to pushglobalfuncname).
+    ///  - visible frames.
     fn collectTracebackItems(self: *Vm, th: *Thread, items: *std.ArrayListUnmanaged(TracebackItem)) DispatchError!void {
         if (th.status == .suspended and th.suspended_builtin != null) {
             const n = th.call_frames.len();
@@ -8985,41 +8919,19 @@ pub const Vm = struct {
             // host-window frames never appear in tracebacks or debug
             // levels.
             if (fr.isBase()) continue;
-            if (self.getPendingCallConst(fr.pending_call_index)) |pending| {
-                if (pending.protection) |prot| {
-                    // Innermost layer first (closest to the target above).
-                    try items.append(self.alloc, .{ .phantom = .{
-                        .armed_idx = i,
-                        .kind = prot.kind,
-                        .outermost = prot.outer_layers.len == 0,
-                    } });
-                    // Then the parked outer layers, innermost-outer first
-                    // (outer_layers is stored outermost-first).
-                    var k: usize = prot.outer_layers.len;
-                    while (k > 0) {
-                        k -= 1;
-                        try items.append(self.alloc, .{ .phantom = .{
-                            .armed_idx = i,
-                            .kind = prot.outer_layers[k].kind,
-                            .outermost = k == 0,
-                        } });
-                    }
-                }
-            }
             try items.append(self.alloc, .{ .frame = i });
         }
     }
 
     /// A resolved debug level (PUC lua_getstack: 0-based CallInfo depth
     /// from the top; level 0 = the running C function's own frame). The
-    /// SAME item model as the traceback: phantom fast-path pcall/xpcall
-    /// layers and the suspended yield C frame are real levels, so
-    /// debug.getinfo, debug.getlocal, debug.setlocal and debug.traceback
-    /// agree on level numbering (PUC: one CallInfo chain serves all of
-    /// them). `frame.index` is the index into th.call_frames.
+    /// SAME item model as the traceback: the suspended yield C frame is a
+    /// real level, so debug.getinfo, debug.getlocal, debug.setlocal and
+    /// debug.traceback agree on level numbering (PUC: one CallInfo chain
+    /// serves all of them). `frame.index` is the index into
+    /// th.call_frames.
     const DebugLevel = union(enum) {
         frame: struct { frame: *CallFrame, index: usize },
-        phantom: TracebackPhantom,
         virtual_yield,
     };
 
@@ -9040,7 +8952,6 @@ pub const Vm = struct {
                 .frame = th.call_frames.getPtr(fi),
                 .index = fi,
             } },
-            .phantom => |ph| .{ .phantom = ph },
             .virtual_yield => .virtual_yield,
         };
     }
@@ -9075,15 +8986,6 @@ pub const Vm = struct {
             }
             limit2show -= 1;
             switch (items.items[@intCast(lvl)]) {
-                .phantom => |ph| {
-                    const callee: Value = switch (ph.kind) {
-                        .pcall => .{ .Builtin = .pcall },
-                        .xpcall => .{ .Builtin = .xpcall },
-                    };
-                    const label = try self.virtualCFrameLabel(th, ph.armed_idx, callee, ph.outermost);
-                    defer self.alloc.free(label);
-                    w.print("\n\t{s}", .{label}) catch return error.OutOfMemory;
-                },
                 .virtual_yield => {
                     const callee: Value = .{ .Builtin = th.suspended_builtin.? };
                     // The caller is the top parked frame: its pc is at the
@@ -9151,6 +9053,7 @@ pub const Vm = struct {
         };
         if (top_is_lua) return self.fail(fmt, args);
         self.errThread().err_is_errerr = false;
+        self.errThread().err_is_oom = false;
         var tmp: [2048]u8 = undefined;
         const msg = std.fmt.bufPrint(tmp[0..], fmt, args) catch "runtime error";
         self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
@@ -9211,6 +9114,7 @@ pub const Vm = struct {
     noinline fn failWithPosFrame(self: *Vm, pos_frame: ?*const Frame, comptime fmt: []const u8, args: anytype) Error {
         // Fresh error: reset LUA_ERRERR signal before invokeErrfunc.
         self.errThread().err_is_errerr = false;
+        self.errThread().err_is_oom = false;
         // PUC Lua error messages can be long — e.g. `require`'s "module not
         // found" message lists every searched path (path + cpath), which can
         // exceed 512 bytes with the full default LUA_PATH_DEFAULT. Use a
@@ -9299,6 +9203,7 @@ pub const Vm = struct {
     noinline fn raiseAuxwrapError(self: *Vm, pos_frame: ?*const Frame, msg: []const u8) Error {
         // Fresh error: reset LUA_ERRERR signal before invokeErrfunc.
         self.errThread().err_is_errerr = false;
+        self.errThread().err_is_oom = false;
         var full: []const u8 = msg;
         if (pos_frame) |fr| {
             const line = self.frameCurrentLine(fr);
@@ -9346,6 +9251,7 @@ pub const Vm = struct {
     fn failC(self: *Vm, comptime fmt: []const u8, args: anytype) Error {
         // Fresh error: reset LUA_ERRERR signal before invokeErrfunc.
         self.errThread().err_is_errerr = false;
+        self.errThread().err_is_oom = false;
         var tmp: [2048]u8 = undefined;
         const msg = std.fmt.bufPrint(tmp[0..], fmt, args) catch "runtime error";
         self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
@@ -9369,6 +9275,7 @@ pub const Vm = struct {
     fn failLib(self: *Vm, comptime fmt: []const u8, args: anytype) Error {
         // Fresh error: reset LUA_ERRERR signal before invokeErrfunc.
         self.errThread().err_is_errerr = false;
+        self.errThread().err_is_oom = false;
         var tmp: [2048]u8 = undefined;
         const msg = std.fmt.bufPrint(tmp[0..], fmt, args) catch "runtime error";
         self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
@@ -9716,7 +9623,10 @@ pub const Vm = struct {
             // Handler succeeded — its first result replaces the error object
             // as-is (PUC luaG_errormsg: no tostring coercion). nil → the
             // literal "<no error object>" (PUC luaD_seterrorobj semantics).
+            // The result slice is caller-owned transport (apiCall contract)
+            // and dies here — the value itself is copied into err_obj.
             var value = if (result.len > 0) result[0] else .Nil;
+            self.alloc.free(result);
             self.errThread().err_obj = value;
             self.err = if (value == .String) value.String.bytes() else null;
             self.errThread().err_has_obj = true;
@@ -9765,6 +9675,7 @@ pub const Vm = struct {
     /// re-running message handlers on it.
     fn raiseErrerr(self: *Vm) Error {
         self.errThread().err_is_errerr = true;
+        self.errThread().err_is_oom = false;
         self.err = "error in error handling";
         self.errThread().err_obj = .{ .String = self.internStrAssume("error in error handling") };
         self.errThread().err_has_obj = true;
@@ -9775,8 +9686,10 @@ pub const Vm = struct {
     }
 
     pub fn setOutOfMemoryError(self: *Vm) void {
-        // Fresh error: reset LUA_ERRERR signal.
+        // Fresh error: reset LUA_ERRERR signal; set the ERRMEM kind bit
+        // (luaD_throw carries LUA_ERRMEM alongside the object).
         self.errThread().err_is_errerr = false;
+        self.errThread().err_is_oom = true;
         self.err = "not enough memory";
         // P16.50-review-3: PUC luaD_seterrorobj(ERRMEM) uses the FIXED
         // statMsg literal — allocation-free by construction. Our
@@ -10097,6 +10010,7 @@ pub const Vm = struct {
     /// fails, fall back to the true OOM transport.
     fn raiseAuxBoxOom(self: *Vm) Error {
         self.errThread().err_is_errerr = false;
+        self.errThread().err_is_oom = false;
         self.err = "not enough memory";
         self.errThread().err_source = null;
         self.errThread().err_line = -1;
@@ -11746,75 +11660,6 @@ pub const Vm = struct {
         if (saved.err_traceback) |traceback| self.alloc.free(traceback);
     }
 
-    fn releaseBytecodeProtectedDepth(self: *Vm, protection: *BytecodeProtectedCall) void {
-        _ = self;
-        std.debug.assert(protection.thread.bytecode_protected_depth != 0);
-        protection.thread.bytecode_protected_depth -= 1;
-    }
-
-    fn releaseBytecodeProtectedLayer(self: *Vm, layer: BytecodeProtectedLayer) void {
-        _ = self;
-        std.debug.assert(layer.thread.bytecode_protected_depth != 0);
-        layer.thread.bytecode_protected_depth -= 1;
-    }
-
-    fn finishBytecodeProtectedCall(self: *Vm, protection: *BytecodeProtectedCall) void {
-        // PUC lua_pcallk completion: pop the armed errfunc handler slot from
-        // stack (only if the errfunc is still ours — every nested arming
-        // restores on its own completion). restoreBytecodeSavedError below
-        // then restores the OUTER errfunc saved at protection entry.
-        if (protection.armed_errfunc != ERRFUNC_NONE) {
-            const th_ef = protection.thread;
-            if (th_ef.errfunc == protection.armed_errfunc) {
-                th_ef.errfunc = ERRFUNC_NONE;
-                if (self.activeBytecodeThread().top > protection.armed_errfunc) self.activeBytecodeThread().top = protection.armed_errfunc;
-            }
-        }
-        // P16.23 T6: restore the C-call depth to the protection's entry
-        // snapshot. On SUCCESS this is a no-op (paired ccall exits already
-        // returned to the entry depth); on a CAUGHT error the iterative
-        // unwind popped frames without running their paired exits, so this
-        // is where the leaked increments are reclaimed (PUC gets this for
-        // free from the C-stack unwind). Parked frames above a YIELDED
-        // protection never reach here — their live increments persist.
-        protection.thread.nCcalls = protection.saved_ncalls;
-        self.restoreBytecodeSavedError(protection.saved_error);
-        self.releaseBytecodeProtectedDepth(protection);
-        var i = protection.outer_layers.len;
-        while (i > 0) {
-            i -= 1;
-            const layer = protection.outer_layers[i];
-            self.restoreBytecodeSavedError(layer.saved_error);
-            self.releaseBytecodeProtectedLayer(layer);
-        }
-        if (protection.outer_layers.len != 0) self.alloc.free(protection.outer_layers);
-        // PUC ldo.c:luaD_pcall calls luaD_shrinkstack after the protected
-        // call completes (success or error). This shrinks stack back
-        // to normal size if it was grown during a stack overflow.
-        self.shrinkBcStack();
-    }
-
-    /// Drop a protected continuation because its caller itself is being
-    /// unwound or collected.  Unlike normal completion, the current error is
-    /// authoritative and must not be overwritten with the parked caller error.
-    fn discardBytecodeProtectedCall(self: *Vm, protection: *BytecodeProtectedCall) void { // The armed handler slot dies with this unwind; clear a matching
-        // errfunc so no later error on this thread invokes a stale handler
-        // (PUC: unwinding past a pcallk frame restores the old errfunc).
-        if (protection.armed_errfunc != ERRFUNC_NONE) {
-            const th_ef = protection.thread;
-            if (th_ef.errfunc == protection.armed_errfunc) {
-                th_ef.errfunc = ERRFUNC_NONE;
-            }
-        }
-        self.discardBytecodeSavedError(protection.saved_error);
-        self.releaseBytecodeProtectedDepth(protection);
-        for (protection.outer_layers) |layer| {
-            self.discardBytecodeSavedError(layer.saved_error);
-            self.releaseBytecodeProtectedLayer(layer);
-        }
-        if (protection.outer_layers.len != 0) self.alloc.free(protection.outer_layers);
-    }
-
     fn freeBytecodeHookPost(self: *Vm, post: BytecodeHookPost) void {
         switch (post) {
             .store_results => |state| self.alloc.free(state.values),
@@ -12105,7 +11950,7 @@ pub const Vm = struct {
                         self.setCFrameTbcSlotNil(state.owner_thread, fs.cframe_idx, fs.slot_idx);
                         break :blk v;
                     },
-                    .detached => |v| v,
+                    .detached => |d| d.value,
                 };
                 // Pop the mark BEFORE the closer runs (PUC poptbclist): a
                 // closer error/yield must not re-close this entry.
@@ -12527,13 +12372,6 @@ pub const Vm = struct {
             },
             .coroutine_resume => |cont| self.discardBytecodeSavedError(cont.saved_error),
             else => {},
-        }
-        if (pending.protection) |protection| {
-            self.discardBytecodeProtectedCall(protection);
-            // P16.50-review-6: destroy the heap protection struct (see the
-            // matching destroy in completeBytecodeProtectedResult).
-            self.alloc.destroy(protection);
-            pending.protection = null;
         }
     }
 
@@ -14749,7 +14587,7 @@ pub const Vm = struct {
 
     /// P15.83r: builtins whose OP_CALL/OP_TAILCALL dispatch may be REPLACED by
     /// the iterative fast paths (tryPushBytecodePairsMetamethod,
-    /// tryPushBytecodeProtectedCall, tryRequestBytecodeCoroutineSwitch,
+    /// tryRequestBytecodeCoroutineSwitch,
     /// tryStartBytecodeGsub) before callBuiltin ever runs. These keep the
     /// legacy caller-frame CALL identity because the fast-path completion
     /// machinery requires the callee body frame to sit directly above its
@@ -15188,20 +15026,20 @@ pub const Vm = struct {
     ///   ccall unit. apiCall owns the C-API boundary; luaCallKShared passes
     ///   the mode THROUGH it (never wraps twice); the iterative gsub repl
     ///   owns its unit at push and releases at completion/cancel
-    ///   (repl_ccall_active); pcall-family installs own the target's unit
-    ///   (enter after the snapshot, so finishBytecodeProtectedCall's
-    ///   nCcalls restore doubles as the exit on EVERY completion path);
+    ///   (repl_ccall_active); the pcall/xpcall builtins own the target's
+    ///   unit for their whole body (ccallEnter(.yieldable) + defer — the
+    ///   defer releases on EVERY builtin exit, including the
+    ///   deferred-to-precover error propagation);
     ///   builtinCoroutineClose owns one non-yieldable unit per close.
     ///
-    ///   NORMAL COMPLETION: every entered unit exits exactly once; the
-    ///   protection snapshot restore is a no-op at entry depth.
+    ///   NORMAL COMPLETION: every entered unit exits exactly once.
     ///
     ///   CAUGHT ERROR: the iterative unwind pops frames without running
-    ///   paired exits; the protecting call's nCcalls snapshot restore
-    ///   reclaims ALL outstanding inner units at once (the Zig analog of
-    ///   PUC's C-stack unwind reclaiming every ccall frame).
+    ///   paired exits; each protecting call's own defer reclaims its unit
+    ///   as the error propagates out of it (the Zig analog of PUC's
+    ///   C-stack unwind reclaiming every ccall frame).
     ///
-    ///   UNCAUGHT ERROR: reclaimed by the OUTER protection's snapshot, or
+    ///   UNCAUGHT ERROR: reclaimed by the OUTER protection's exit, or
     ///   the thread's boundary.
     ///
     ///   YIELD: units of parked continuations stay accounted (the snapshot
@@ -15603,6 +15441,14 @@ pub const Vm = struct {
             // callee-region TBC entries were already closed by precover's
             // frame-pop loop (PUC closes them in finishpcallk's
             // luaF_close(func, status, yy=1) — same set, same order).
+            // PUC seterrorobj's LUA_ERRMEM arm publishes the FIXED
+            // memerrmsg — a message handler's transform of an ERRMEM
+            // object does not survive the recovery publication (kind over
+            // object).
+            const publish_obj: Value = if (status == 4)
+                .{ .String = self.oom_msg_str orelse self.internStrAssume("not enough memory") }
+            else
+                self.errThread().err_obj;
             if (self.errThread().err_has_obj) {
                 if (fr.u.c.testc_state != null) {
                     // testc frame: the window lives on the state's target
@@ -15615,7 +15461,7 @@ pub const Vm = struct {
                     // sees [prefix..., error] (PUC: L->top = func + 1).
                     const wth = if (fr.u.c.testc_state) |tcs| (tcs.target orelse th) else th;
                     self.truncateToPcallkFuncidx(wth, funcidx);
-                    self.cWindowPush(wth, self.errThread().err_obj) catch {};
+                    self.cWindowPush(wth, publish_obj) catch {};
                 } else {
                     // Production frame: the window lives on th.stack.
                     // funcidx is window-relative (the callee's position);
@@ -15625,7 +15471,7 @@ pub const Vm = struct {
                     // precover's region close — the truncation close inside
                     // cWindowSetCount finds nothing (defensive).
                     self.truncateToPcallkFuncidx(th, funcidx);
-                    self.cWindowPush(th, self.errThread().err_obj) catch {};
+                    self.cWindowPush(th, publish_obj) catch {};
                 }
             }
             // PUC: luaD_shrinkstack(L)
@@ -15723,16 +15569,29 @@ pub const Vm = struct {
         const fr = th.call_frames.getPtr(ci_idx);
         // LUA_ERRRUN = 2 (most common error status).
         // LUA_ERRERR = 5 (error in message handler — set by invokeErrfunc).
+        // LUA_ERRMEM = 4 (an OOM routed through the recovery — the thread
+        // error state carries the kind, mirroring PUC's luaD_throw which
+        // carries the status alongside the object).
         // Stack overflow uses LUA_ERRRUN with a "stack overflow" message.
-        const err_status: u32 = if (self.errThread().err_is_errerr) 5 else 2;
+        const err_status: u32 = @intCast(self.errThread().errStatus());
         fr.callstatus = setcistrecst(fr.callstatus, err_status);
-        // P16.31 Cut 3: ONE region close at the recovering boundary — the
-        // pcallk-entry snapshot [aux.pcallk.chain_base, len) = every mark
-        // made at/above the pcallk's callee (the callee frames' marks, now
-        // detached by the pop loop above). PUC finishpcallk:
-        // luaF_close(func, status, yy=1) at the CALLEE's level — the C
-        // function's own pre-pcallk marks are BELOW the boundary and close
-        // at its return instead (D7: [k-status=2; name=n7 err=none]).
+        // P16.31 Cut 3: ONE region close at the recovering boundary —
+        // PUC finishpcallk: luaF_close(func, status, yy=1) at the CALLEE's
+        // LEVEL: every tbclist entry whose stack slot is >= the callee's
+        // slot closes here, with the in-flight error. That includes the
+        // callee frames' marks (now detached by the pop loop above —
+        // chain indices >= the pcallk-entry snapshot) AND pre-pcallk
+        // arg-marks of the RECOVERING frame itself at slots >= the callee
+        // (lua_toclose on a pcallk argument above the callee: they close
+        // HERE, with the error, not at the frame's return). The chain
+        // snapshot alone misses the arg-marks — select the region base by
+        // LEVEL, scanning below the snapshot while entries qualify (a
+        // live mark by its absolute slot, a detached mark by its captured
+        // level). PUC's tbclist discipline (api_check: every new mark
+        // above the last marked one) keeps the level region a contiguous
+        // chain suffix for valid API usage. Marks BELOW the callee's slot
+        // (the C function's own window locals) stay out and close at its
+        // return instead (D7: [k-status=2; name=n7 err=none]).
         // YIELDABLE; a yielding closer suspends ON the pcall frame
         // (CLSRET — it is now the top frame, so the resume machinery's
         // finishCcall finds it; detached entries carry their captured
@@ -15747,12 +15606,33 @@ pub const Vm = struct {
         // the closer's fail()), refresh CIST_RECST, and close again until
         // the region is empty.
         const pcallk_chain_base = fr.u.c.aux.pcallk.chain_base;
+        var region_base: usize = pcallk_chain_base;
+        // A re-drive (after a mid-recovery suspension) may find the region
+        // already fully closed below the snapshot — clamp before scanning.
+        if (th.c_tbc_chain.items.len < region_base) region_base = th.c_tbc_chain.items.len;
+        if (fr.u.c.testc_state == null) {
+            // Production frame: the window (and the chain) live on th;
+            // level = the pcallk'd callee's absolute slot.
+            const level = fr.frameBase() + fr.u.c.aux.pcallk.funcidx;
+            while (region_base > 0) {
+                const below = th.c_tbc_chain.items[region_base - 1];
+                const in_region = switch (below) {
+                    .frame_slot => |fs| fs.slot_idx >= level,
+                    .detached => |d| d.level >= level,
+                };
+                if (!in_region) break;
+                region_base -= 1;
+            }
+        }
+        // testc frames keep the snapshot as the region base: their window
+        // may live on another thread's state lane, where th-relative slot
+        // comparisons are meaningless.
         while (true) {
             const err_arg: ?Value = if (self.errThread().err_has_obj) self.errThread().err_obj else null;
-            const err_status_i: i32 = if (self.errThread().err_is_errerr) 5 else 2;
+            const err_status_i: i32 = self.errThread().errStatus();
             _ = try self.closeTbcRegion(
                 th,
-                pcallk_chain_base,
+                region_base,
                 ci_idx,
                 err_arg,
                 err_status_i,
@@ -15770,13 +15650,13 @@ pub const Vm = struct {
             // into unroll. An empty region is full completion (or the last
             // closer errored with nothing left — the installed error state
             // carries it; no re-drive needed).
-            if (th.c_tbc_chain.items.len <= pcallk_chain_base) break;
+            if (th.c_tbc_chain.items.len <= region_base) break;
             // Re-fetch the frame pointer: the closer ran Lua code (frames
             // above ci_idx grew and possibly reallocated the stack), so the
             // saved `fr` may dangle. ci_idx itself is stable — nothing below
             // it changes during the close.
             const fr_now = th.call_frames.getPtr(ci_idx);
-            fr_now.callstatus = setcistrecst(fr_now.callstatus, if (self.errThread().err_is_errerr) 5 else 2);
+            fr_now.callstatus = setcistrecst(fr_now.callstatus, @intCast(self.errThread().errStatus()));
         }
         // PUC: luaD_rawrunprotected(L, unroll, NULL) — re-enter unroll.
         // luazig: the drive loop IS unroll. Return true to signal the
@@ -15945,16 +15825,22 @@ pub const Vm = struct {
                     self.err = if (fe == .String) fe.String.bytes() else null;
                     self.errThread().err_source = null;
                     self.errThread().err_line = -1;
-                    // err_is_errerr is current already when a live object
-                    // leads (installed by the failing close); the parked
-                    // fallback restores its RECST=5 origin.
+                    // err_is_errerr/err_is_oom are current already when a
+                    // live object leads (installed by the failing close);
+                    // the parked fallback restores its RECST origin kind.
                     if (cur == null) {
                         self.errThread().err_is_errerr = cs.error_status == 5;
+                        self.errThread().err_is_oom = cs.error_status == 4;
                     }
                     self.alloc.destroy(cs);
                     fr.u.c.clsret_state = null;
                     fr.clearClsret();
                     // Frame stays (unpopped): the error machinery pops it.
+                    // The re-raised kind must survive the re-drive: an OOM
+                    // recovery that suspended on a yielding closer re-enters
+                    // precover as error.OutOfMemory (PUC: the ERRMEM status
+                    // is preserved across the suspension by CIST_RECST).
+                    if (self.errThread().err_is_oom) return error.OutOfMemory;
                     return error.RuntimeError;
                 },
             }
@@ -16029,6 +15915,10 @@ pub const Vm = struct {
                 self.err = if (errval == .String) errval.String.bytes() else null;
                 self.errThread().err_source = null;
                 self.errThread().err_line = -1;
+                // The boundary knows the thrown PUC status — sync the kind
+                // bit with it before propagating (a k-scope OOM longjmp'd
+                // with LUA_ERRMEM).
+                self.errThread().err_is_oom = nret_signed.lua_err == 4;
                 self.captureErrorTraceback();
                 // P16.50-review-4 BLOCKER 1: carry the EXACT PUC status.
                 if (nret_signed.lua_err == 4) return error.OutOfMemory;
@@ -16999,455 +16889,6 @@ pub const Vm = struct {
     /// Returns false for builtin/IR targets, which keep using the ordinary
     /// builtin implementation.  The important Lua-controlled path never calls
     /// `runBytecode` recursively.
-    fn tryPushBytecodeProtectedCall(
-        self: *Vm,
-        exec_frames: *FrameStack,
-        parent_index: usize,
-        dst: u8,
-        nresults: i32,
-        id: BuiltinId,
-        args: []const Value,
-        tail_return: bool,
-    ) DispatchError!bool {
-        // P16.37: the value stack is Thread-owned; this helper runs on
-        // the active thread's frames (a coroutine switch makes the
-        // target active before re-driving continuations). The pcall fast path stages on the active thread.
-        const th = self.activeBytecodeThread();
-        if (id != .pcall and id != .xpcall) return false;
-        const owner = self.activeBytecodeThread();
-        const protected_depth_before = self.protected_call_depth + owner.bytecode_protected_depth;
-
-        const LayerSpec = struct {
-            kind: BytecodeProtectedKind,
-        };
-        // P16.50-review-7 BLOCKER 4: PUC lua_pcallk → luaD_pcall performs
-        // ZERO allocations before entering the protected region — pcall's
-        // own setup must be uncounted (infraAlloc) so a countdown/limit
-        // that exhausts at the setup step is caught by the protected call
-        // itself ([false, "not enough memory"]) instead of escaping pcall
-        // (verified divergence: T.alloccount(1) + pcall(f) previously
-        // killed the chunk; PUC catches). The frees below go through
-        // self.alloc, which passes infraAlloc'd (foreign) blocks through.
-        var outer_specs = std.ArrayListUnmanaged(LayerSpec).empty;
-        defer outer_specs.deinit(self.infraAlloc());
-
-        var active_id = id;
-        var active_args = args;
-        while (true) {
-            const min_args: usize = if (active_id == .pcall) 1 else 2;
-            if (active_args.len < min_args) return false;
-            const target = active_args[0];
-            const nested_id = switch (target) {
-                .Builtin => |builtin_id| builtin_id,
-                else => break,
-            };
-            if (nested_id != .pcall and nested_id != .xpcall) break;
-            if (active_id == .xpcall) {
-                switch (active_args[1]) {
-                    .Closure, .Builtin => {},
-                    else => return false,
-                }
-            }
-            try outer_specs.append(self.infraAlloc(), .{
-                .kind = if (active_id == .pcall) .pcall else .xpcall,
-            });
-            active_args = if (active_id == .pcall) active_args[1..] else active_args[2..];
-            active_id = nested_id;
-        }
-
-        const min_args: usize = if (active_id == .pcall) 1 else 2;
-        if (active_args.len < min_args) return false;
-        // PUC lbaselib.c:503: the xpcall message handler must pass
-        // luaL_checktype(L, 2, LUA_TFUNCTION) - raw type tag, no __call
-        // resolution. On failure this fast path bails to builtinXpcall,
-        // which raises the arg error with the PUC message.
-        if (active_id == .xpcall) {
-            switch (active_args[1]) {
-                .Closure, .Builtin => {},
-                else => return false,
-            }
-        }
-        const target = active_args[0];
-        const target_args = if (active_id == .pcall) active_args[1..] else active_args[2..];
-        const resolved = self.resolveCallable(target, target_args, null) catch return false;
-        defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-
-        // Most protected targets are bytecode closures directly. `pairs` is a
-        // special yieldable C-library bridge: its __pairs metamethod may also
-        // be bytecode and must share this protected continuation instead of
-        // re-entering runBytecode inside builtinPcall -> builtinPairs.
-        var pairs_arg_buf: [1]Value = undefined;
-        var child_owned_args: ?[]Value = null;
-        defer if (child_owned_args) |owned| self.alloc.free(owned);
-        var child_args: []const Value = resolved.args;
-        var child_debug_pairs = false;
-        // ccmt of the child's own __call resolution (the __pairs mm when
-        // child_debug_pairs, else the protected target itself).
-        var mm_ccmt: u4 = 0;
-        const cl = child: switch (resolved.callee) {
-            .Closure => |closure| break :child closure,
-            .Builtin => |builtin_id| {
-                if (builtin_id != .pairs or resolved.args.len == 0 or resolved.args[0] != .Table) return false;
-                const mm = self.getMetaFieldByObj(resolved.args[0], .pairs) orelse return false;
-                pairs_arg_buf[0] = resolved.args[0];
-                const mm_resolved = self.resolveCallable(mm, pairs_arg_buf[0..], null) catch return false;
-                child_owned_args = mm_resolved.owned_args;
-                child_args = mm_resolved.args;
-                child_debug_pairs = true;
-                mm_ccmt = mm_resolved.ccmt;
-                break :child switch (mm_resolved.callee) {
-                    .Closure => |closure| closure,
-                    else => return false,
-                };
-            },
-            else => return false,
-        };
-        const proto = cl.proto orelse return false;
-
-        // P16.50-review-7 BLOCKER 4: uncounted (infraAlloc) — see the
-        // outer_specs comment above (PUC pcall setup allocates nothing).
-        const outer_layers = try self.infraAlloc().alloc(BytecodeProtectedLayer, outer_specs.items.len);
-        var initialized_outer: usize = 0;
-        var outer_armed = true;
-        errdefer if (outer_armed) {
-            var i = initialized_outer;
-            while (i > 0) {
-                i -= 1;
-                const layer = outer_layers[i];
-                self.restoreBytecodeSavedError(layer.saved_error);
-                self.releaseBytecodeProtectedLayer(layer);
-            }
-            if (outer_layers.len != 0) self.alloc.free(outer_layers);
-        };
-        for (outer_specs.items, 0..) |spec, i| {
-            outer_layers[i] = .{
-                .thread = owner,
-                .kind = spec.kind,
-                .saved_error = self.saveBytecodeProtectedError(),
-            };
-            owner.bytecode_protected_depth += 1;
-            initialized_outer += 1;
-        }
-
-        // P16.50-review-7 BLOCKER 3.1: transactional publication. The heap
-        // protection struct is created BEFORE any state it restores is
-        // taken, and carries the FULL rollback snapshot (saved_ncalls
-        // captured before ccallEnter, tbc_chain_base, saved_error, outer
-        // layers). The `published` owner guard runs
-        // finishBytecodeProtectedCall on every pre-publish failure — it
-        // releases exactly what was taken (active depth, saved errors,
-        // errfunc, outer layers) and restores nCcalls to the pre-enter
-        // snapshot (idempotent with ccallEnter's own failure rollback).
-        // The old stack-fallback errdefer leaked the heap struct on a
-        // setPendingCall failure and restored nCcalls from a zero default.
-        // P16.50-review-7 BLOCKER 4: uncounted (infraAlloc) — see the
-        // outer_specs comment above (PUC pcall setup allocates nothing).
-        const protection_ptr = try self.infraAlloc().create(BytecodeProtectedCall);
-        var struct_owned = true;
-        errdefer if (struct_owned) self.alloc.destroy(protection_ptr);
-
-        const saved_error = self.saveBytecodeProtectedError();
-        owner.bytecode_protected_depth += 1;
-        // P16.23 T6: snapshot BEFORE the target runs — nested ccalls must
-        // not leak past a caught recovery (see BytecodeProtectedCall).
-        protection_ptr.* = .{
-            .thread = owner,
-            .saved_ncalls = owner.nCcalls,
-            .kind = if (active_id == .pcall) .pcall else .xpcall,
-            .saved_error = saved_error,
-            .outer_layers = outer_layers,
-            // P16.31 Cut 3: the old_top-equivalent chain boundary (see the
-            // field doc). Captured BEFORE the target frame is pushed and
-            // before any target-side mark can exist.
-            .tbc_chain_base = @intCast(owner.c_tbc_chain.items.len),
-        };
-        var published = false;
-        errdefer if (!published) {
-            // Pre-publish rollback: release the active layer and all outer
-            // layers through the single completion path, then let the
-            // struct_owned guard destroy the heap struct.
-            self.finishBytecodeProtectedCall(protection_ptr);
-        };
-        // The protection struct now owns the outer layers — disarm the
-        // per-layer guard (the finish guard above covers them).
-        outer_armed = false;
-
-        // P16.24 T4/T5: PUC lua_pcallk with a continuation (lbaselib pcall
-        // passes finishpcall) → docallK → luaD_call → ccall(ci=1): the
-        // target consumes ONE YIELDABLE depth unit. The snapshot above
-        // (saved BEFORE this enter) doubles as the unit's exit: every
-        // completion path funnels through finishBytecodeProtectedCall, whose
-        // nCcalls restore removes it; uncaught unwinds are reclaimed by the
-        // OUTER protection's snapshot — one mechanism.
-        try self.ccallEnter(owner, .yieldable);
-        try self.setPendingCall(exec_frames.getPtr(parent_index), .{
-            .callee = .{ .Builtin = id },
-            .completion = .{ .results = .{
-                .dst = dst,
-                .nresults = nresults,
-                .append_nil = child_debug_pairs,
-                .tail_return = tail_return,
-            } },
-            .protection = protection_ptr,
-        });
-        // Publish complete — the pending owns the protection struct; every
-        // later failure unwinds through cancelBytecodePendingCall, which
-        // destroys it (see the .protection branch there).
-        published = true;
-        struct_owned = false;
-        // Once the continuation is installed, every target-start failure is
-        // part of the innermost protected call. In particular, a Lua stack or
-        // protected-depth limit becomes `false, error`; parked outer pcall/
-        // xpcall targets then complete normally and prepend their own `true`.
-        // PUC lua_pcallk (lapi.c): errfunc != 0 arms L->errfunc for the
-        // protected call's duration — for xpcall that is ITS message
-        // handler (saveBytecodeProtectedError above cleared the outer one,
-        // matching PUC pcall's errfunc=0 for the protected child). The
-        // handler slot is staged on stack just below the target frame,
-        // so it stays GC-rooted and parked across yields like PUC's stack
-        // slot. Errors inside the target — including the C-stack-overflow
-        // raise below — run the handler AT THE THROW SITE (invokeErrfunc /
-        // PUC luaG_errormsg), before any unwinding. finishBytecodeProtected
-        // Call pops the slot; restoreBytecodeSavedError restores the outer
-        // errfunc.
-        if (active_id == .xpcall) {
-            protection_ptr.armed_errfunc = th.top;
-            self.setErrfuncValue(active_args[1]);
-        }
-        if (protected_depth_before + outer_specs.items.len >= 200)
-            return self.fail("C stack overflow", .{});
-
-        // Push a synthetic C-frame for the pcall/xpcall builtin call.
-        // In PUC, pcall/xpcall pushes a CallInfo via luaD_precall. luazig's
-        // fast path doesn't push a C-frame (it causes stack management issues
-        // with the frame stack). Instead, captureErrorTraceback and
-        // debugBuildCurrentTraceback synthetically insert [C]: in global
-        // 'pcall'/'xpcall' lines by checking pending_call.protection.
-        // PUC luaB_pcall: the target + args are staged on the stack, then
-        // activated (luaD_pcall → luaD_precall).
-        const staged_target = try self.stageBytecodeCall(th, th.top, cl, child_args);
-        // child_ccmt: the __pairs metamethod's own chain (mm_resolved) or
-        // the protected target's (resolved) — the fresh activation's count,
-        // exactly what luaD_pcall's nested precall would commit.
-        const child_ccmt: u4 = if (child_debug_pairs) mm_ccmt else resolved.ccmt;
-        try self.pushStagedBytecodeExecFrame(th, exec_frames, proto, staged_target.func_slot, staged_target.nargs, -1, child_ccmt);
-        // The pcall/xpcall target gets its CALL event here (PUC: pcall runs
-        // the target via luaD_call → luaD_precall → luaG_tracecall).
-        if (child_debug_pairs) {
-            self.setDebugName(exec_frames.getPtr(parent_index), "metamethod", "pairs");
-        }
-        try self.dispatchCalleeActivationHook(exec_frames, .{ .Closure = cl }, child_args.len);
-        return true;
-    }
-
-    fn completeBytecodeProtectedResult(
-        self: *Vm,
-        exec_frames: *FrameStack,
-        boundary_depth: usize,
-        parent_index: usize,
-        ret: []Value,
-    ) DispatchError!?[]Value {
-        // P16.50-review-8 §3.2: adopt the wrapped result slice at entry —
-        // the RootScope reserve and the outer-layer wrap allocs below are
-        // fallible, and until each handover (beginBytecodeClose post /
-        // hook post / applyBytecodePendingResults) this errdefer is the
-        // slice's single owner. The tag moves to each re-wrapped slice and
-        // disarms at the adoption points.
-        var completed_ret = ret;
-        var owned_ret = true;
-        errdefer if (owned_ret and !self.returnSliceIsOwned(completed_ret)) self.alloc.free(completed_ret);
-        const pending = self.getPendingCallConst(exec_frames.getPtr(parent_index).pending_call_index) orelse unreachable;
-        // P15.51n: Snapshot callee and completion before reentrant operations.
-        const pending_callee = pending.callee;
-        const protection = pending.protection orelse unreachable;
-        // Capacity: the initial slice + every re-wrapped slice (after layer
-        // i the slice has ret.len + i values, all re-protected) — the exact
-        // accumulate semantics of the old fallible adds, reserved up front:
-        // ret.len + L*ret.len + L*(L+1)/2.
-        const nlayers = protection.outer_layers.len;
-        var result_scope = try self.openRootScope(completed_ret.len + nlayers * ret.len + nlayers * (nlayers + 1) / 2, 0);
-        defer result_scope.close();
-        for (completed_ret) |value| _ = result_scope.protectValueAssumeCapacity(value);
-        var outer_index = protection.outer_layers.len;
-        while (outer_index > 0) {
-            outer_index -= 1;
-            const wrapped = try self.alloc.alloc(Value, completed_ret.len + 1);
-            wrapped[0] = .{ .Bool = true };
-            @memcpy(wrapped[1..], completed_ret);
-            self.alloc.free(completed_ret);
-            completed_ret = wrapped;
-            for (completed_ret) |value| _ = result_scope.protectValueAssumeCapacity(value);
-        }
-        self.finishBytecodeProtectedCall(protection);
-        // P16.50-review-6: the protection struct is heap-allocated in
-        // tryPushBytecodeProtectedCall (alloc.create) — finish consumes it
-        // fully, so the completion path destroys it here. (The errdefer
-        // fallback in tryPushBytecodeProtectedCall uses a STACK struct and
-        // must not destroy — hence the destroy lives at the owning call
-        // sites, not inside finish.) Pre-existing leak on every
-        // pcall/xpcall completion, exposed by the testC contract unit
-        // tests (leak-checked allocator).
-        self.alloc.destroy(protection);
-        self.getPendingCallPtr(exec_frames.getPtr(parent_index).pending_call_index).?.protection = null;
-
-        const result_cont = switch (pending.completion) {
-            .results => |cont| cont,
-            else => unreachable,
-        };
-        // pending pointer is now invalid after finishBytecodeProtectedCall
-        // (which may trigger GC). Use pending_callee and result_cont below.
-        if (result_cont.tail_return) {
-            // Our bytecode codegen emits TAILCALL as a terminal opcode.  Pop
-            // the protected builtin's caller exactly like the synchronous
-            // tail-call path instead of trying to advance to a non-existent
-            // RETURN instruction.
-            self.clearPendingCall(exec_frames.getPtr(parent_index));
-            // beginBytecodeClose adopts the post payload on every path —
-            // the exact adoption point for the slice.
-            owned_ret = false;
-            return switch (try self.beginBytecodeClose(
-                exec_frames,
-                boundary_depth,
-                parent_index,
-                0,
-                null,
-                true,
-                false,
-                .{ .return_frame = completed_ret },
-            )) {
-                .resume_dispatch => null,
-                .final => |final| final,
-                .propagate_error => error.RuntimeError,
-            };
-        }
-
-        self.clearPendingCall(exec_frames.getPtr(parent_index));
-        // P16.50-review-8 §3.2/§3.3: tryPushBytecodeDebugHook owns the post
-        // payload (and with it completed_ret) from its first fallible
-        // operation: on `true` the pending adopted it, on error it freed it
-        // exactly once — disarm our mirror owner in both cases. Only on
-        // `false` is the post still ours.
-        const hook_pushed = self.tryPushBytecodeDebugHook(
-            exec_frames,
-            parent_index,
-            "return",
-            null,
-            pending_callee,
-            completed_ret,
-            1,
-            .{ .store_results = .{
-                .continuation = result_cont,
-                .values = completed_ret,
-            } },
-        ) catch |err| {
-            owned_ret = false;
-            return err;
-        };
-        if (hook_pushed) {
-            owned_ret = false;
-            return null;
-        }
-        self.dispatchBytecodeHookWithCallee("return", pending_callee, completed_ret) catch |hook_err| {
-            owned_ret = false;
-            self.alloc.free(completed_ret);
-            return hook_err;
-        };
-        try self.setPendingCall(exec_frames.getPtr(parent_index), .{
-            .callee = pending_callee,
-            .completion = .{ .results = result_cont },
-        });
-        // applyBytecodePendingResults adopts the slice at entry (its
-        // errdefer frees it on failure).
-        owned_ret = false;
-        try self.applyBytecodePendingResults(exec_frames, parent_index, completed_ret, result_cont.dst, result_cont.nresults);
-        return null;
-    }
-
-    fn finishBytecodeProtectedFailure(
-        self: *Vm,
-        exec_frames: *FrameStack,
-        boundary_depth: usize,
-        parent_index: usize,
-        error_value: Value,
-    ) DispatchError!?[]Value {
-        var error_scope = try self.openRootScope(2, 0);
-        defer error_scope.close();
-        _ = error_scope.protectValueAssumeCapacity(error_value);
-        // P16.31 Cut 3: pcall recovery-boundary close (PUC luaD_pcall's
-        // catch: luaD_closeprotected(L, old_top, status), ldo.c:1092). The
-        // error unwind already popped every frame above the protected
-        // caller, detaching their chain marks into the region above the
-        // protection's call-time base (the old_top equivalent); close that
-        // region NOW — non-yieldable, last-error-wins — while the errfunc
-        // is still armed (PUC restores it only after closeprotected: a
-        // closer error goes through the armed message handler too, p31c
-        // [D]: handler sees both the original error and the closer error).
-        // A final closer error replaces the reported error object (PUC:
-        // closeprotected's status feeds luaD_seterrorobj).
-        {
-            const pending = self.getPendingCallConst(exec_frames.getConstPtr(parent_index).pending_call_index) orelse unreachable;
-            const protection = pending.protection orelse unreachable;
-            const owner = protection.thread;
-            if (owner.c_tbc_chain.items.len > protection.tbc_chain_base) {
-                const err_arg: ?Value = if (error_value == .Nil) null else error_value;
-                const final_err = try self.closeTbcRegion(owner, protection.tbc_chain_base, null, err_arg, 2, false, &.{});
-                var effective_error = error_value;
-                if (final_err) |fe| effective_error = fe;
-                _ = error_scope.protectValueAssumeCapacity(effective_error);
-                // infraAlloc (PUC stack-slot parity): the pcall FAILURE tuple
-                // is recovery transport — PUC's luaD_poscall moves the error
-                // object into the caller's pre-reserved stack slots, so the
-                // recovery path NEVER allocates. A counted tuple would fail
-                // under the very countdown/limit that caused the failure and
-                // its error would escape the recovery machinery
-                // (memerr.lua testalloc/testbytes).
-                const ret = try self.infraAlloc().alloc(Value, 2);
-                ret[0] = .{ .Bool = false };
-                ret[1] = effective_error;
-                return try self.completeBytecodeProtectedResult(
-                    exec_frames,
-                    boundary_depth,
-                    parent_index,
-                    ret,
-                );
-            }
-        }
-        // infraAlloc: same stack-slot parity as the TBC arm above — the
-        // failure tuple is recovery transport, never a counted allocation.
-        const ret = try self.infraAlloc().alloc(Value, 2);
-        ret[0] = .{ .Bool = false };
-        ret[1] = error_value;
-        return try self.completeBytecodeProtectedResult(
-            exec_frames,
-            boundary_depth,
-            parent_index,
-            ret,
-        );
-    }
-
-    fn finishBytecodeProtectedRecoveryAt(
-        self: *Vm,
-        exec_frames: *FrameStack,
-        boundary_depth: usize,
-        parent_index: usize,
-    ) DispatchError!BytecodeDispatchRecovery {
-        // PUC finishpcall (ldo.c): the message handler (xpcall) already ran
-        // AT THE THROW SITE — invokeErrfunc (PUC luaG_errormsg) transformed
-        // the error object BEFORE the unwind reached this protection, with
-        // the failed call's frames still intact. An errerr is likewise
-        // transported as the "error in error handling" OBJECT (set inside
-        // invokeErrfunc), so protectedErrorValue() is the complete,
-        // handler-transformed result for BOTH pcall and xpcall.
-        const error_value = self.protectedErrorValue();
-        const final = try self.finishBytecodeProtectedFailure(
-            exec_frames,
-            boundary_depth,
-            parent_index,
-            error_value,
-        );
-        return if (final) |ret| .{ .completed = ret } else .resumed;
-    }
-
     fn bytecodeUnwindDisposition(
         self: *Vm,
         exec_frames: *FrameStack,
@@ -17478,12 +16919,6 @@ pub const Vm = struct {
                     },
                     else => {},
                 }
-                if (pending.protection != null) {
-                    return .{
-                        .target_depth = i + 1,
-                        .disposition = .{ .protected_parent = i },
-                    };
-                }
             }
         }
         return .{ .target_depth = boundary_depth, .disposition = .propagate };
@@ -17506,7 +16941,7 @@ pub const Vm = struct {
         // live; our unwind is destructive, so the text is captured at the
         // last-intact point — a documented frame-lifetime divergence, see
         // tools/status/p16.41-cframe-parity.md. Recoverable errors
-        // (protected_parent / close_parent) skip this — pcall handles them
+        // (close_parent) skip this — the close continuation handles them
         // without needing a terminal trace. Unconditional: PUC shows the
         // chain for a coroutine that dies on its FIRST resume too (the old
         // trace_yields>0 gate lost it); error paths are cold, so the
@@ -17732,13 +17167,6 @@ pub const Vm = struct {
             _ = owner.bytecode_unwinds.pop();
             self.restoreRuntimeErrorValue(state.error_value);
             switch (state.disposition) {
-                .protected_parent => |parent_index| {
-                    return try self.finishBytecodeProtectedRecoveryAt(
-                        exec_frames,
-                        state.boundary_depth,
-                        parent_index,
-                    );
-                },
                 .close_parent => |parent_index| {
                     var pending = self.getPendingCallPtr(exec_frames.getPtr(parent_index).pending_call_index).?;
                     var close_state = switch (pending.completion) {
@@ -18798,35 +18226,8 @@ pub const Vm = struct {
             owned_ret = extended;
         }
         // OP_RETURN dispatches the callee's return hook while its frame is
-        // still active. Ordinary Lua calls therefore need no second event.
-        // A protected-call continuation is different: the Lua child returned,
-        // but the builtin pcall/xpcall activation is completing now. The
-        // completing child is always the protected TARGET — the message
-        // handler (xpcall) runs inside invokeErrfunc at the throw site, not
-        // as a staged child of this protection.
-        if (pending.protection != null) {
-            // Protection-wrap edge: the wrap alloc is a counted allocation —
-            // same emergency window as the nil-padding edge above. Root the
-            // values across the alloc + memcpy; the tag below still owns the
-            // storage on failure.
-            var wrap_scope = try self.openRootScope(completed_ret.len, 0);
-            defer wrap_scope.close();
-            for (completed_ret) |v| _ = wrap_scope.protectValueAssumeCapacity(v);
-            const wrapped = try self.alloc.alloc(Value, completed_ret.len + 1);
-            wrapped[0] = .{ .Bool = true };
-            @memcpy(wrapped[1..], completed_ret);
-            if (owned_ret) |slice| self.alloc.free(slice);
-            completed_ret = wrapped;
-            // completeBytecodeProtectedResult adopts the wrapped slice at
-            // entry (its errdefer frees it on failure).
-            owned_ret = null;
-            return try self.completeBytecodeProtectedResult(
-                exec_frames,
-                boundary_depth,
-                parent_index,
-                wrapped,
-            );
-        }
+        // still active; the completion below re-dispatches for the pending's
+        // callee where the completion contract needs it.
         switch (pending.completion) {
             .results => |cont| {
                 if (cont.tail_return) {
@@ -25585,18 +24986,9 @@ pub const Vm = struct {
         // = level 0) down through `previous`, counting EVERY CallInfo, C or
         // Lua. P16.41 Cut 1: builtin C-frames are real and visible, so the
         // walk is a plain frame enumeration — no per-builtin visibility
-        // rules. Only two things diverge from a naive walk:
+        // rules. Only one thing diverges from a naive walk:
         //   1. Hidden frames (CIST_HIDE) are the testC script frame — a
         //      genuinely-internal duplicate with no PUC CallInfo — skipped.
-        //   2. The pcall/xpcall FAST path (tryPushBytecodeProtectedCall)
-        //      runs its target without a C-frame; PUC would have the pcall
-        //      C-function's CallInfo between the target and its caller.
-        //      The armed pending-protection on the caller frame marks that
-        //      phantom layer: consume one level (resolving to null — a C
-        //      frame has no position, luaL_where pushes "") before the
-        //      armed frame's own level. This is state-derived (the flag
-        //      lives on the frame and survives yields), not a registered
-        //      depth — see captureErrorTraceback for the same derivation.
         const th = self.activeBytecodeThreadConst();
         const frames = th.call_frames;
         if (frames.len() == 0) return null;
@@ -25614,20 +25006,6 @@ pub const Vm = struct {
             // the frame below.
             if (i == top) continue;
             if (fr.isHidden()) continue;
-            // The phantom fast-path pcall layers sit between this frame and
-            // the frame above it (PUC: one CallInfo per pcall/xpcall layer —
-            // the armed kind plus one per parked outer layer). If the
-            // requested level IS a phantom, it resolves to a C frame — no
-            // position (luaL_where pushes "").
-            if (self.getPendingCallConst(fr.pending_call_index)) |pending| {
-                if (pending.protection) |prot| {
-                    var phantoms = 1 + prot.outer_layers.len;
-                    while (phantoms > 0) : (phantoms -= 1) {
-                        if (rem == 1) return null;
-                        rem -= 1;
-                    }
-                }
-            }
             rem -= 1;
             if (rem == 0) return fr;
         }
@@ -26221,6 +25599,7 @@ pub const Vm = struct {
             .@"error" => {
                 // Fresh error: reset LUA_ERRERR signal before invokeErrfunc.
                 self.errThread().err_is_errerr = false;
+                self.errThread().err_is_oom = false;
                 // P15.83q: fresh raise — no C-frame residue yet (only the
                 // string-prefix path below can set one).
                 self.errThread().err_cframe_residue = null;
@@ -27614,7 +26993,7 @@ pub const Vm = struct {
     /// in the slice.
     fn builtinPcall(self: *Vm, args: []const Value) DispatchError!?[]Value {
         if (args.len == 0) return self.fail("pcall expects function", .{});
-        if (self.activeProtectedCallDepth() >= 128) {
+        if (self.protected_call_depth >= 128) {
             self.err = "stack overflow error";
             const istr = try self.internStr("stack overflow error");
             self.errThread().err_obj = .{ .String = istr };
@@ -27669,9 +27048,10 @@ pub const Vm = struct {
         //
         // PUC lua_pcallk saves funcidx = restorestack(L, L->top) — the
         // stack position of the callee (func + args area). In luazig,
-        // the callee runs on stack; funcidx = cframe's base (func_slot+1)
-        // is the callee's stack position, matching PUC's L->top at pcallk
-        // entry (which points just past the pcall C-frame's func).
+        // the callee runs on stack as the pcall C-frame's FIRST window
+        // slot: the window-relative funcidx is 0 and the absolute callee
+        // slot is the cframe's frameBase(), matching PUC's L->top at
+        // pcallk entry (which points just past the pcall C-frame's func).
         //
         // PUC lua_pcallk saves OAH = L->allowhook. In luazig, allowhook
         // lives on Thread (th.allowhook). We save it via setOah so
@@ -27694,8 +27074,12 @@ pub const Vm = struct {
                     pcall_frame_idx = cfr_idx;
                     cfr.setYpcall();
                     cfr.u.c.old_errfunc = saved_errfunc;
+                    // funcidx is WINDOW-RELATIVE (the callee's position,
+                    // the same convention as c_api/testc pcallk): the pcall
+                    // builtin stages its callee as the C-frame's FIRST
+                    // window slot — funcidx = 0, level = frameBase().
                     cfr.u.c.aux.pcallk = .{
-                        .funcidx = @intCast(cfr.frameBase()),
+                        .funcidx = 0,
                         .chain_base = @intCast(cfr.tbc_chain_base),
                     };
                     cfr.callstatus = setoah(cfr.callstatus, th_pcall_ef.allowhook);
@@ -28042,7 +27426,7 @@ pub const Vm = struct {
             }
             th_xpcall_ef.errfunc = saved_errfunc;
         };
-        if (self.activeProtectedCallDepth() >= 128) {
+        if (self.protected_call_depth >= 128) {
             // PUC lua_pcallk → docallK → ccall: the C-stack depth check
             // fails inside the protected extent, so the armed message
             // handler sees this error too (luaG_runerror → luaG_errormsg).
@@ -28106,8 +27490,11 @@ pub const Vm = struct {
                     pcall_frame_idx = idx;
                     cfr.setYpcall();
                     cfr.u.c.old_errfunc = saved_errfunc;
+                    // Window-relative callee position — same convention as
+                    // builtinPcall and c_api/testc pcallk (funcidx = 0: the
+                    // callee is the C-frame's first window slot).
                     cfr.u.c.aux.pcallk = .{
-                        .funcidx = @intCast(cfr.frameBase()),
+                        .funcidx = 0,
                         .chain_base = @intCast(cfr.tbc_chain_base),
                     };
                     cfr.callstatus = setoah(cfr.callstatus, th_xpcall_cf.allowhook);
@@ -29179,8 +28566,8 @@ pub const Vm = struct {
         const th = try self.expectThread(args[0]);
         defer if (th.close_mode) self.clearForcedClose(th);
 
-        // P16.24 T5: the old activeProtectedCallDepth() >= 32 cap was a
-        // second implementation of the LUAI_MAXCCALLS resume invariant
+        // P16.24 T5: an older protected-depth >= 32 cap was a second
+        // implementation of the LUAI_MAXCCALLS resume invariant
         // (cstack "30 vs 195" divergence). Resume nesting is bounded by the
         // unified nCcalls model: resumeEnterC inherits getCcalls(from)+1
         // and fails at LUA_MAX_C_CALLS, exactly like PUC lua_resume.
@@ -29291,6 +28678,7 @@ pub const Vm = struct {
         th.err_has_obj = false;
         th.err_cframe_residue = null;
         th.err_is_errerr = false;
+        th.err_is_oom = false;
         th.err_source = null;
         th.err_line = -1;
 
@@ -30488,6 +29876,7 @@ pub const Vm = struct {
             th.err_has_obj = false;
             th.err_cframe_residue = null;
             th.err_is_errerr = false;
+            th.err_is_oom = false;
             th.err_source = null;
             th.err_line = -1;
         }
@@ -34698,7 +34087,7 @@ pub const Vm = struct {
                 for (th.c_tbc_chain.items) |entry| {
                     const v: Value = switch (entry) {
                         .frame_slot => continue,
-                        .detached => |dv| dv,
+                        .detached => |d| d.value,
                     };
                     if (GcObject.fromValue(v) != null) try self.gcMarkValue(v);
                 }
@@ -34881,15 +34270,6 @@ pub const Vm = struct {
                                 }
                             },
                             else => {},
-                        }
-                        if (pending.protection) |protection| {
-                            // The armed message handler is GC-rooted via the
-                            // thread's errfunc stack slot (marked in the
-                            // walks above), not via the protection struct.
-                            const saved_error = protection.saved_error.err_obj;
-                            if (GcObject.fromValue(saved_error) != null) {
-                                try self.gcMarkValue(saved_error);
-                            }
                         }
                     }
                 }
@@ -37309,14 +36689,10 @@ pub const Vm = struct {
 
     fn debugInferNameFromCaller(self: *Vm, caller_opt: ?*const CallFrame, target: Frame) DebugName {
         const caller = caller_opt orelse return .{};
-        // PUC's funcnamefromcall returns NULL for C frames (pcall/xpcall).
-        // When the caller frame has a pending protected call, the actual
-        // caller is the C function (pcall/xpcall), not this Lua frame.
-        // Return empty name so pushfuncname falls through to
-        // pushglobalfuncname or "function <src:linedefined>".
-        if (self.getPendingCallConst(caller.pending_call_index)) |pending| {
-            if (pending.protection != null) return .{};
-        }
+        // PUC's funcnamefromcall returns NULL for C frames (pcall/xpcall);
+        // a C caller frame yields no code name and the caller of this
+        // helper falls through to pushglobalfuncname / "function
+        // <src:linedefined>".
 
         if (caller.proto()) |proto| {
             // P15.51g: Derive regs from base .. windowTop() (no cached slice).
@@ -37572,9 +36948,9 @@ pub const Vm = struct {
                 // of the CallInfo chain — level 0 is the running C
                 // function's own frame (getinfo itself), level 1 the
                 // function that called it. The unified item model
-                // (debugResolveLevel) counts phantom pcall layers and the
-                // suspended yield C frame as real levels, so getinfo and
-                // traceback agree on numbering.
+                // (debugResolveLevel) counts the suspended yield C frame
+                // as a real level, so getinfo and traceback agree on
+                // numbering.
                 if (level < 0) {
                     outs[0] = .Nil;
                     return;
@@ -37586,39 +36962,6 @@ pub const Vm = struct {
                     return;
                 };
                 switch (resolved) {
-                    .phantom => |ph| {
-                        // A phantom fast-path pcall/xpcall layer (PUC: the
-                        // pcall C function's own CallInfo). C-function info
-                        // from the builtin value; name from funcnamefromcall
-                        // — only the OUTERMOST layer's caller is the armed
-                        // (Lua) frame; inner layers' callers are outer C
-                        // frames (no code name -> nil, PUC-faithful).
-                        const callee: Value = switch (ph.kind) {
-                            .pcall => .{ .Builtin = .pcall },
-                            .xpcall => .{ .Builtin = .xpcall },
-                        };
-                        var name: Value = .Nil;
-                        var namewhat: []const u8 = "";
-                        if (ph.outermost) {
-                            if (self.debugCallSiteName(th, ph.armed_idx)) |dn| {
-                                name = .{ .String = try self.internStr(dn.name) };
-                                namewhat = dn.namewhat;
-                            }
-                        }
-                        if (what.len == 0 or debugInfoHasOpt(what, 'n')) {
-                            try self.setField(t, "name", name);
-                            try self.setField(t, "namewhat", .{ .String = try self.internStr(namewhat) });
-                        }
-                        try self.setField(t, "currentline", .{ .Int = -1 });
-                        if (what.len == 0 or debugInfoHasOpt(what, 't')) {
-                            try self.setField(t, "istailcall", .{ .Bool = false });
-                            try self.setField(t, "extraargs", .{ .Int = 0 });
-                        }
-                        try self.debugFillInfoFromFunction(t, callee, what);
-                        if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
-                            try self.setField(t, "func", callee);
-                        }
-                    },
                     .virtual_yield => {
                         // The suspended coroutine's yield C frame (PUC:
                         // luaB_yield's CallInfo stays on the suspended
@@ -37713,8 +37056,8 @@ pub const Vm = struct {
                             } else {
                                 // PUC auxgetinfo: the name comes from the CALLER's
                                 // code (funcnamefromcall) only — resolve the
-                                // caller through the SAME item model so a phantom
-                                // pcall layer as caller yields no name (PUC: C
+                                // caller through the SAME item model so a
+                                // virtual caller yields no name (PUC: C
                                 // caller). No fallback to the function's own
                                 // name: PUC reports nil when the caller's code
                                 // cannot name the callee.
@@ -37723,13 +37066,6 @@ pub const Vm = struct {
                                     .frame => |rf| rf.frame,
                                     else => null,
                                 } else null;
-                                // PUC auxgetinfo: the name comes from the CALLER's
-                                // code (funcnamefromcall) only — resolve the
-                                // caller through the SAME item model so a phantom
-                                // pcall layer as caller yields no name (PUC: C
-                                // caller). No fallback to the function's own
-                                // name: PUC reports nil when the caller's code
-                                // cannot name the callee.
                                 if (caller_frame != null) {
                                     const inferred = self.debugInferNameFromCaller(caller_frame, fr.*);
                                     if (inferred.name) |nm| {
@@ -37742,7 +37078,7 @@ pub const Vm = struct {
                                     try self.setField(t, "namewhat", .{ .String = try self.internStr(inferred.namewhat) });
                                 } else {
                                     // No caller item (top of the item list) or a
-                                    // phantom/virtual caller (PUC: C caller with
+                                    // virtual caller (PUC: C caller with
                                     // no flags): no name from the caller.
                                     if (on_current and self.isInDebugHook() and lv == 2) {
                                         try self.setField(t, "name", .{ .String = try self.internStr("?") });
@@ -38303,7 +37639,6 @@ pub const Vm = struct {
                     const resolved = (try self.debugResolveLevel(th, level)) orelse return;
                     switch (resolved) {
                         .virtual_yield => return, // PUC: yield's window is empty once resume returned
-                        .phantom => return, // no observable window for a phantom pcall layer
                         .frame => |res| {
                             const fr = res.frame;
                             if (fr.isC()) {
@@ -46165,11 +45500,10 @@ pub const Vm = struct {
     /// P16.37 Cut 1: the unit is entered BEFORE the callable is activated
     /// (`resolveCallable` may run `__call` metamethods — PUC `tryfuncTM`
     /// runs inside the ccall window) and the Zig `defer` covers BOTH the
-    /// normal return and the error unwind. If this frame is unwound past
-    /// (pcall recovery), the existing nCcalls snapshot model
-    /// (`BytecodeProtectedCall.saved_ncalls`, vm.zig:864, restored at the
-    /// recovery boundary vm.zig:8224) reclaims the unit — the same model
-    /// P16.36 Cut 3 proven for gsub repl/`__index` continuations.
+    /// normal return and the error unwind. A pcall that catches the
+    /// comparator's error releases its own unit by its defer as the error
+    /// propagates out of it — the same model P16.36 Cut 3 proven for gsub
+    /// repl/`__index` continuations.
     /// The old `id == .coroutine_yield` comparator special cases (fail
     /// BEFORE the call, wrapping the message with a position prefix) are
     /// deleted: the natural `callBuiltin` path produces the exact PUC
@@ -47452,7 +46786,7 @@ pub const Vm = struct {
             if (chain.items[i] == .frame_slot) {
                 const fs = chain.items[i].frame_slot;
                 const v = self.cFrameTbcSlotValue(th, fs.cframe_idx, fs.slot_idx) orelse .Nil;
-                chain.items[i] = .{ .detached = v };
+                chain.items[i] = .{ .detached = .{ .value = v, .level = fs.slot_idx } };
             }
         }
     }
@@ -47489,11 +46823,11 @@ pub const Vm = struct {
     /// note for the intra-region interleaving caveat).
     ///
     /// The owning boundary closes the detached marks later:
-    /// finishBytecodeProtectedFailure / precover / apiCloseConventional
-    /// PcallBoundary (luaD_pcall's closeprotected) when an outer pcall
-    /// recovers the error, or coroutine.close's closeThreadRegionsOn
-    /// ClosedThread (luaE_resetthread → closeprotected, err = the
-    /// thread's stored error object) for a failed resume.
+    /// precover / apiCloseConventionalPcallBoundary (luaD_pcall's
+    /// closeprotected) when an outer pcall recovers the error, or
+    /// coroutine.close's closeThreadRegionsOnClosedThread
+    /// (luaE_resetthread → closeprotected, err = the thread's stored
+    /// error object) for a failed resume.
     noinline fn detachLuaFrameTbcMarks(self: *Vm, th: *Thread, frame: *const CallFrame) DispatchError!void {
         self.detachTbcRegion(th, frame.tbc_chain_base);
         const n = th.bytecode_tbc_regs.items.len - frame.tbc_mark;
@@ -47517,7 +46851,10 @@ pub const Vm = struct {
             // rejects them); skip defensively so a stale reg cannot
             // fabricate a closer run on a non-closable sentinel.
             if (obj == .Nil or (obj == .Bool and !obj.Bool)) continue;
-            th.c_tbc_chain.insertAssumeCapacity(frame.tbc_chain_base, .{ .detached = obj });
+            th.c_tbc_chain.insertAssumeCapacity(frame.tbc_chain_base, .{ .detached = .{
+                .value = obj,
+                .level = base + reg,
+            } });
         }
     }
 
@@ -47603,7 +46940,7 @@ pub const Vm = struct {
                     self.setCFrameTbcSlotNil(th, fs.cframe_idx, fs.slot_idx);
                     break :blk v;
                 },
-                .detached => |v| v,
+                .detached => |d| d.value,
             };
             // Pop the mark BEFORE the closer runs (PUC poptbclist): a
             // closer error/yield must not re-close this entry.
@@ -48731,6 +48068,11 @@ pub const Vm = struct {
                 self.err = if (errval == .String) errval.String.bytes() else null;
                 self.errThread().err_source = null;
                 self.errThread().err_line = -1;
+                // The boundary decoded the thrown PUC status — sync the
+                // ERRMEM kind bit with it (a lua_pcallk client routing an
+                // OOM through the recovery longjmps with status 4 and the
+                // memerrmsg object already installed).
+                self.errThread().err_is_oom = nret_signed.lua_err == 4;
                 self.captureErrorTraceback();
             }
             const cur_fr = th.call_frames.getPtr(my_cframe_idx);
@@ -51851,6 +51193,7 @@ pub const Vm = struct {
                 if (win.count() == 0) return self.fail("testC error without message", .{});
                 // Fresh error: reset LUA_ERRERR signal (bypasses fail()).
                 self.errThread().err_is_errerr = false;
+                self.errThread().err_is_oom = false;
                 const v = win.slot(win.count() - 1);
                 self.err = if (v == .String) v.String.bytes() else null;
                 self.errThread().err_obj = v;
@@ -65082,211 +64425,97 @@ test "P16.50-review-6 B1: owned-result OOM countdown sweep (before/after results
     try testing.expect(results[3] == .Bool and results[3].Bool == true);
 }
 
-// =========================================================================
-// P16.50-review-7 BLOCKER 3.1: tryPushBytecodeProtectedCall pre-publish
-// OOM edges roll back exactly.
-//
-// The transactional contract (see the restructure at the function): the
-// protection struct is created BEFORE any state it restores is taken and
-// carries the FULL rollback snapshot; the `published` owner guard runs
-// finishBytecodeProtectedCall on every pre-publish failure. This test
-// sweeps a FailingAllocator across EVERY allocation edge of the path —
-// outer-specs ArrayList growth, the outer-layers slice, the protection
-// struct create, the pending-slot append (setPendingCall), and the
-// post-publish target staging — for both a direct pcall target and a
-// doubly-nested pcall(pcall(target)). After EVERY failure:
-//   1. protected depth (Vm + thread) restored,
-//   2. errfunc unchanged,
-//   3. pending slot INVALID (no leak),
-//   4. frame count unchanged (post-publish staging failures unwind
-//      dispatcher-style: pop child, cancel parent pending),
-//   5. TrackingAllocator live bytes byte-exact vs the pre-call snapshot.
-// The success iteration proves the published contract: pending installed
-// with the protection, depth raised, target frame pushed — and cleans up
-// through the single cleanup authority with the same byte-exact check.
-// The ccallEnter depth-guard variant (RuntimeError "C stack overflow",
-// not OOM) is forced separately and must roll back the same way.
-// =========================================================================
-test "P16.50-review-7 B3.1: protected-call pre-publish OOM edges roll back exactly" {
+// ─────────────────────────────────────────────────────────────────────
+// The public pcall/xpcall owner (real C/YPCALL C-frames routed through
+// builtinPcall/builtinXpcall): the observable contracts of the whole
+// family through plain Lua — catch/rethrow shape, message handler,
+// nested protections, the deferred coroutine recovery (yielding __close
+// suspends mid-recovery; the ORIGINAL error object survives and the
+// second resume completes the close), and the entry-yieldability
+// discriminator (a pcall inside a non-yieldable C boundary stays
+// conventional: the closer's yield is caught by THAT pcall).
+// ─────────────────────────────────────────────────────────────────────
+test "public pcall/xpcall: C-frame owner contracts (catch, handler, nested, coroutine recovery)" {
     const testing = std.testing;
-    const TrackingAllocator = @import("tracking_alloc.zig").TrackingAllocator;
-
-    // One allocator for everything (protos, closures, VM): the VM's GC
-    // frees registered closures/proto trees through self.alloc, so mixing
-    // an arena for objects with a tracker for the VM would free foreign
-    // blocks. Per-iteration tracker deltas are the leak check; the
-    // persistent proto/closure bytes are reclaimed at deinit.
-    var tracker = TrackingAllocator.init(std.heap.page_allocator);
-    const track_alloc = tracker.allocator();
-
-    // The rollback path runs finishBytecodeProtectedCall, whose
-    // shrinkBcStack (PUC luaD_shrinkstack parity) would otherwise shrink
-    // the 2048-slot initial stack to ~2x the small in-use extent on the
-    // first failure — a legitimate one-time capacity release that would
-    // break the per-iteration byte-exact baseline. PUC's `stackinuse` is
-    // the max extent over all CallInfo frames AND the current stack top;
-    // anchoring ~700 staged values above the parent frame (never popped)
-    // holds that high-water mark at >= 683 slots, so inuse*3 >= 2048 and
-    // the shrink is a structural no-op for the whole test.
-    const parent_proto = try compileTestProto(track_alloc, "return 1\n");
-    const target_proto = try compileTestProto(track_alloc, "return 2\n");
-
-    var vm = Vm.init(track_alloc, false);
+    var vm: Vm = .init(testing.allocator, false);
     defer vm.deinit();
 
-    const parent_cl = try track_alloc.create(Closure);
-    parent_cl.* = .{ .proto = parent_proto, .upvalues = &.{} };
-    _ = vm.retainTreeForClosure(parent_proto);
-    vm.gcRegisterClosure(parent_cl);
-    const target_cl = try track_alloc.create(Closure);
-    target_cl.* = .{ .proto = target_proto, .upvalues = &.{} };
-    _ = vm.retainTreeForClosure(target_proto);
-    vm.gcRegisterClosure(target_cl);
-    try vm.resolveProtoConstants(parent_proto);
-    try vm.resolveProtoConstants(target_proto);
-
-    const th = vm.activeBytecodeThread();
-    const exec_frames = &th.call_frames;
-    const staged_parent = try vm.stageBytecodeCall(th, 0, parent_cl, &.{});
-    try vm.pushStagedBytecodeExecFrame(th, exec_frames, parent_proto, staged_parent.func_slot, staged_parent.nargs, -1, 0);
-    const parent_index: usize = 0;
-
-    // Pre-warm the FrameStack capacity (push + pop a scratch target
-    // frame): the frame stack is persistent VM state, and the sweep's
-    // per-iteration byte-exact baseline must not be skewed by its one-time
-    // capacity growth on the first target push.
-    {
-        const scratch = try vm.stageBytecodeCall(th, th.top, target_cl, &.{.{ .Int = 1 }});
-        try vm.pushStagedBytecodeExecFrame(th, exec_frames, target_proto, scratch.func_slot, scratch.nargs, -1, 0);
-        vm.popBytecodeExecFrame(th, exec_frames);
-    }
-
-    // Stack high-water anchor (see the comment near the protos): stage
-    // ~700 values above the parent frame and deliberately NEVER push or
-    // pop their frame. Staging writes the values but does not move
-    // top (only frame activation does), so the top is
-    // raised manually to just above the staged window — every slot in
-    // [old top, new top) now holds an initialized non-GC Int, and
-    // shrinkBcStack's inuse (PUC stackinuse: max over frame extents AND
-    // the stack top) stays high enough that the 2048-slot initial stack
-    // is never shrunk.
-    {
-        var anchor_args: [700]Value = undefined;
-        for (&anchor_args) |*v| v.* = .{ .Int = 1 };
-        const anchor_base = th.top;
-        _ = try vm.stageBytecodeCall(th, anchor_base, target_cl, &anchor_args);
-        th.top = anchor_base + 1 + anchor_args.len;
-    }
-
-    const base_nccalls = th.nCcalls;
-    const base_depth = vm.protected_call_depth + th.bytecode_protected_depth;
-    const base_errfunc = th.errfunc;
-    const base_frames = exec_frames.len();
-
-    // Two arg shapes: a direct pcall target, and a doubly-nested
-    // pcall(pcall(target)) — the nested shape additionally exercises the
-    // outer-specs ArrayList growth and the outer-layers slice allocation.
-    const arg_shapes = [_][]const Value{
-        &[_]Value{.{ .Closure = target_cl }},
-        &[_]Value{ .{ .Builtin = .pcall }, .{ .Builtin = .pcall }, .{ .Closure = target_cl } },
-    };
-
-    for (arg_shapes) |args| {
-        // Depth the success contract must show: the active layer plus one
-        // saved outer layer per nested wrapper.
-        const expected_depth = base_depth + 1 + (if (args.len == 3) @as(usize, 2) else 0);
-
-        var fail_idx: usize = 0;
-        var saw_success = false;
-        while (fail_idx <= 16) : (fail_idx += 1) {
-            try testing.expectEqual(INVALID_PENDING, exec_frames.getPtr(parent_index).pending_call_index);
-            const bytes_before = tracker.total_bytes;
-            const pool_cap_before = vm.pending_calls.capacity;
-
-            var failing = std.testing.FailingAllocator.init(track_alloc, .{
-                .fail_index = fail_idx,
-                .resize_fail_index = fail_idx,
-            });
-            const saved_alloc = vm.alloc;
-            vm.alloc = failing.allocator();
-            const result = vm.tryPushBytecodeProtectedCall(exec_frames, parent_index, 0, -1, .pcall, args, false);
-            vm.alloc = saved_alloc;
-
-            // The pending-call slot pool is persistent VM state: the
-            // append path's one-time capacity growth is the ONLY
-            // legitimate byte increase across an iteration.
-            const pool_growth = (vm.pending_calls.capacity - pool_cap_before) * @sizeOf(PendingCallSlot);
-
-            if (result) |pushed| {
-                // ── Success contract: pending published with the heap
-                // protection, protected depth raised, target frame pushed.
-                try testing.expect(pushed);
-                const frame = exec_frames.getPtr(parent_index);
-                try testing.expect(frame.pending_call_index != INVALID_PENDING);
-                try testing.expect(vm.getPendingCallPtr(frame.pending_call_index).?.protection != null);
-                try testing.expectEqual(expected_depth, vm.protected_call_depth + th.bytecode_protected_depth);
-                try testing.expectEqual(base_frames + 1, exec_frames.len());
-                // Dispatcher-style completion cleanup: pop the target frame,
-                // then cancel the parent's pending through the single
-                // cleanup authority (discard semantics — the unwind path).
-                vm.popBytecodeExecFrame(th, exec_frames);
-                const pending = vm.getPendingCallPtr(exec_frames.getPtr(parent_index).pending_call_index).?;
-                vm.cancelBytecodePendingCall(pending, exec_frames.getPtr(parent_index));
-                vm.clearPendingCall(exec_frames.getPtr(parent_index));
-                // cancelBytecodePendingCall DISCARDS (unwind semantics) and
-                // does not restore the ccallEnter unit — in production the
-                // outer protection's snapshot or thread teardown reclaims
-                // it. This synthetic direct-call cleanup restores it
-                // explicitly so the next sweep iteration starts clean.
-                th.nCcalls = base_nccalls;
-                try testing.expectEqual(base_depth, vm.protected_call_depth + th.bytecode_protected_depth);
-                try testing.expectEqual(base_errfunc, th.errfunc);
-                try testing.expectEqual(INVALID_PENDING, exec_frames.getPtr(parent_index).pending_call_index);
-                try testing.expectEqual(base_frames, exec_frames.len());
-                try testing.expectEqual(bytes_before + pool_growth, tracker.total_bytes);
-                saw_success = true;
-                break;
-            } else |err| {
-                try testing.expectEqual(error.OutOfMemory, err);
-                // Simulate the dispatcher's error unwind for POST-publish
-                // staging failures (target stage/push OOM): pop any pushed
-                // child frame, then cancel the parent's pending. For
-                // PRE-publish failures both are no-ops — the errdefers
-                // already rolled everything back.
-                while (exec_frames.len() > base_frames) vm.popBytecodeExecFrame(th, exec_frames);
-                if (vm.getPendingCallPtr(exec_frames.getPtr(parent_index).pending_call_index)) |pending| {
-                    vm.cancelBytecodePendingCall(pending, exec_frames.getPtr(parent_index));
-                    vm.clearPendingCall(exec_frames.getPtr(parent_index));
-                }
-                th.nCcalls = base_nccalls;
-                // ── Full rollback: depth, errfunc, pending slot, frame
-                // count, and byte-exact live allocations.
-                try testing.expectEqual(base_depth, vm.protected_call_depth + th.bytecode_protected_depth);
-                try testing.expectEqual(base_errfunc, th.errfunc);
-                try testing.expectEqual(INVALID_PENDING, exec_frames.getPtr(parent_index).pending_call_index);
-                try testing.expectEqual(base_frames, exec_frames.len());
-                try testing.expectEqual(bytes_before + pool_growth, tracker.total_bytes);
-            }
-        }
-        try testing.expect(saw_success);
-    }
-
-    // ── ccallEnter depth-guard variant: RuntimeError, not OOM. The guard
-    // trips inside the fallible region; the published guard must roll the
-    // depth/saved-error/outer-layers back through finishBytecodeProtected
-    // Call (idempotent with ccallEnter's own increment rollback).
-    {
-        th.nCcalls = Thread.LUA_MAX_C_CALLS - 1; // +1 yieldable unit trips the guard
-        const result = vm.tryPushBytecodeProtectedCall(exec_frames, parent_index, 0, -1, .pcall, arg_shapes[0], false);
-        th.nCcalls = base_nccalls;
-        try testing.expectError(error.RuntimeError, result);
-        try testing.expectEqual(base_depth, vm.protected_call_depth + th.bytecode_protected_depth);
-        try testing.expectEqual(base_errfunc, th.errfunc);
-        try testing.expectEqual(INVALID_PENDING, exec_frames.getPtr(parent_index).pending_call_index);
-        try testing.expectEqual(base_frames, exec_frames.len());
-        // The staged "C stack overflow" message is thread-owned until the
-        // next error or teardown — not a leak, so no byte-exact check here.
-    }
+    const src =
+        \\local log = {}
+        \\local function mkclose(name, err, yld)
+        \\  return setmetatable({}, {__close = function(o, e)
+        \\    log[#log+1] = name .. ':' .. tostring(type(e) == 'table' and e.id or e)
+        \\    if yld then local y = coroutine.yield('inclose'); log[#log+1] = name .. '_after:' .. tostring(y) end
+        \\    if err then error(err) end
+        \\  end})
+        \\end
+        \\
+        \\-- (1) plain catch: [false, err], original object identity.
+        \\local boom = {id=7}
+        \\local ok, e = pcall(function() error(boom) end)
+        \\assert(not ok and e == boom, 'pcall returns the original object')
+        \\
+        \\-- (2) xpcall message handler transforms the object.
+        \\local ok2, e2 = xpcall(function() error('raw', 0) end, function(m) return 'H:' .. m end)
+        \\assert(not ok2 and e2 == 'H:raw', 'xpcall handler transform')
+        \\
+        \\-- (3) nested: the inner pcall eats the error; the outer sees success.
+        \\local inner = {pcall(pcall, function() error('deep', 0) end)}
+        \\assert(inner[1] == true and inner[2] == false and inner[3] == 'deep', 'nested pcall')
+        \\
+        \\-- (4) success lane with values.
+        \\local a, b, c = pcall(function() return 1, nil, 3 end)
+        \\assert(a and b == 1 and c == nil, 'pcall success')
+        \\
+        \\-- (5) coroutine deferred recovery: r1 suspends INSIDE the recovery
+        \\-- close (yielding __close in the pcall'd callee), r2 completes the
+        \\-- close; the pcall returns the ORIGINAL error object.
+        \\local co = coroutine.create(function()
+        \\  return pcall(function()
+        \\    local v <close> = mkclose('v', nil, true)
+        \\    error({id=9})
+        \\  end)
+        \\end)
+        \\local r1 = {coroutine.resume(co)}
+        \\assert(r1[1] == true and r1[2] == 'inclose' and coroutine.status(co) == 'suspended',
+        \\  'recovery suspends at the yielding closer')
+        \\local r2 = {coroutine.resume(co, 'r2')}
+        \\assert(r2[1] == true, 'second resume completes')
+        \\assert(r2[2] == false and r2[3].id == 9, 'pcall returns the original object after recovery')
+        \\assert(coroutine.status(co) == 'dead', 'coroutine dead after recovery')
+        \\assert(log[1] == 'v:9', 'closer saw the error object')
+        \\assert(log[2] == 'v_after:r2', 'closer resumed with r2')
+        \\
+        \\-- (6) a pcall inside a NON-yieldABLE C boundary (sort comparator
+        \\-- inside a coroutine) stays conventional: the closer's yield is
+        \\-- an ordinary error CAUGHT by that pcall, and the sort completes.
+        \\local t = {3, 1, 2}
+        \\local yielded_err
+        \\local co6 = coroutine.create(function()
+        \\  table.sort(t, function(x, y)
+        \\    local ok3, e3 = pcall(function()
+        \\      local w <close> = mkclose('w', nil, true)
+        \\      error('sorterr')
+        \\    end)
+        \\    yielded_err = e3
+        \\    return x < y
+        \\  end)
+        \\end)
+        \\local r6 = coroutine.resume(co6)
+        \\assert(r6 == true, 'sort comparator completed inside the coroutine')
+        \\assert(yielded_err == 'attempt to yield across a C-call boundary', 'non-yieldable boundary stays conventional')
+        \\assert(t[1] == 1 and t[3] == 3, 'sort completed')
+        \\
+        \\return true
+    ;
+    const chunk_v = try vm.compileChunkValue(src, "=pcall-owner-test");
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(chunk_v);
+    const cl = chunk_v.Closure;
+    const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
+    defer vm.alloc.free(results);
+    try testing.expect(results[0] == .Bool and results[0].Bool == true);
 }
 
 // =========================================================================
@@ -66243,22 +65472,22 @@ test "P16.50-review-8 §3.1: async gsub completion destroys the state struct (no
 }
 
 // =========================================================================
-// P16.50-review-8 §3.2: completeBytecodeExecFrame / protected-result /
-// pending-concat OOM edges — countdown sweep with byte-exact rollback.
+// P16.50-review-8 §3.2: completeBytecodeExecFrame / pending-concat /
+// pending-results OOM edges — countdown sweep with byte-exact rollback.
 //
 // The tagged-owner restructure (see completeBytecodeExecFrame): the
 // child's return slice is adopted at entry (null tag = borrowed
 // bc_return_scratch, never freed), the tag moves to each re-wrapped
-// slice (nil padding, protection wrap), and disarms at each adoption
-// point (C-parent return, external boundary, the pending appliers,
-// beginBytecodeClose post). completeBytecodeProtectedResult and
-// applyBytecodePendingConcat adopt at entry the same way.
+// slice (nil padding), and disarms at each adoption point (C-parent
+// return, external boundary, the pending appliers, beginBytecodeClose
+// post). applyBytecodePendingConcat adopts at entry the same way.
 //
 // One chunk drives every edge: __pairs returning fewer than three
-// values (nil padding), pcall (protection wrap + result roots), a tail
-// pcall (tail_return → beginBytecodeClose post), and a simple-result
-// builtin call (frame-growth path). Every countdown failure must leave
-// the drained-frames / zero-pending state and byte-exact live bytes
+// values (nil padding), pcall (a C-frame completion through the real
+// builtinPcall C-frame + result roots), a tail pcall (tail_return →
+// beginBytecodeClose post), and a simple-result builtin call
+// (frame-growth path). Every countdown failure must leave the
+// drained-frames / zero-pending state and byte-exact live bytes
 // after a full GC; any success must carry the exact 7-value contract.
 // The borrowed scratch is never freed (a free of the VM-owned scratch
 // would corrupt the byte accounting / crash on reuse — the repeated

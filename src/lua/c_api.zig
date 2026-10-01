@@ -523,6 +523,7 @@ pub export fn lua_error(L: ?*lua_State) noreturn {
     }
     // Fresh error: reset LUA_ERRERR signal before invokeErrfunc.
     eth.err_is_errerr = false;
+    eth.err_is_oom = false;
     // (d) internal cleanup, unobservable: the thrown object is ALREADY
     // installed on eth (the fold above); invokeErrfunc's error return can
     // only be an OOM from its RootScope reserve — PUC's equivalent
@@ -1231,7 +1232,9 @@ pub export fn lua_toclose(L: ?*lua_State, idx: c_int) void {
         // — and need not — reproduce).
         const value = th.stack[abs_slot];
         // Same luaF_newtbcmark OOM contract as the frame_slot lane above.
-        chain.append(vm.alloc, .{ .detached = value }) catch |e| cThrowOn(vm, h, e);
+        // The captured level is the mark's PUC tbclist LEVEL — the level,
+        // not the frame, decides which boundary's close runs the closer.
+        chain.append(vm.alloc, .{ .detached = .{ .value = value, .level = abs_slot } }) catch |e| cThrowOn(vm, h, e);
     }
     // PUC sets CIST_TBC on L->ci (the frame "has marks" hint) — gates the
     // chain-region close at the frame's return (PUC moveresults) and the
@@ -2627,6 +2630,22 @@ pub export fn lua_pcallk(
                 return if (vm.errThread().err_is_errerr) 5 else 2;
             },
             error.OutOfMemory => {
+                // PUC: the yieldable branch has NO local catch — an ERRMEM
+                // longjmps to the nearest protected boundary with the
+                // status (luaD_throw(LUA_ERRMEM)), which for a pcallk
+                // inside a running coroutine is the resume boundary:
+                // precover → finishpcallk → k(LUA_ERRMEM, memerrmsg).
+                // Mirror the RuntimeError arm: install the fixed MEMERRMSG
+                // object, record the status, and longjmp — the CIST_YPCALL
+                // frame stays armed so the recovery owns the continuation.
+                if (vm.c_error_jmp) |jb| {
+                    vm.setOutOfMemoryError();
+                    vm.c_error_value = vm.errThread().err_obj;
+                    vm.c_error_status = 4; // LUA_ERRMEM
+                    _longjmp(jb, 1);
+                }
+                // No C-function boundary — fallback cleanup (the recovery
+                // machinery cannot run without one).
                 const fr2 = th.call_frames.getPtr(th.call_frames.len() - 1);
                 fr2.clearYpcall();
                 if (errfunc_val != null) {

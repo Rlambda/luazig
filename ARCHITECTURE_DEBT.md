@@ -105,6 +105,20 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
    builtinXpcall; E4-дифференциал). Consumer-less precover-сайтов
    четыре (4-й — direct-resume unroll 29398). Cut-порядок переработан
    (pkresv §6): N+window объединены, каждый cut независимо зелёный.
+   REVIEW UPDATE (2026-10-01): Д2 — не существующий общий
+   close-workhorse: `continueBytecodeClose` и `closeTbcRegion` имеют
+   отдельные циклы/носители; новая bytecode recovery-phase потребует
+   отдельного proof порядка C-chain, roots, cancel и re-entry. Заявленная
+   «zero hot-path cost» пока структурная оценка, не измерение. Ревьювер
+   рекомендует Д1 как один PUC-подобный YPCALL owner и удаление
+   `BytecodeProtectedCall` fast path (perf trade-off измерить, но
+   сохранение скорости не gate для архитектурного cut). Владелец
+   **утвердил Д1** (2026-10-01): correctness-модель PUC приоритетнее
+   отдельного shortcut; legacy bytecode protection удаляется целиком
+   в этом milestone, а не остаётся альтернативным recovery-owner. Также
+   `precover` вызывается в шести, а не четырёх местах
+   (vm.zig:16375/16473/16562/29128/29349/29398); два дополнительных
+   direct-resume сайта требуют focused reachability proof.
 2. **Единое ordered TBC representation — подтверждённый архитектурный
    долг.** PUC имеет один `tbclist`; luazig делит obligations на
    `bytecode_tbc_regs` и `c_tbc_chain`. Decisive differential найден при

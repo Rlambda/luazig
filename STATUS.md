@@ -69,6 +69,13 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   лично (Debug): generic builtinPcall-путь воспроизводит F1-оси
   (eager close + log-уже-в-r1 vs PUC suspension; r2 `cannot resume
   dead coroutine` vs завершение).
+  REVIEW UPDATE (2026-10-01): grep-полный inventory показывает ещё
+  два прямых `try self.precover(th)` в direct-resume unroll
+  (vm.zig:29128/29349) помимо 29398 и трёх trampoline-сайтов:
+  всего **шесть** call sites, а не четыре. Для двух дополнительных
+  сайтов достижимость yield из precover требует focused differential;
+  implementation обязан проверить и обработать все шесть, не
+  ограничиваться числом из research-отчёта.
 
 - [ ] **GY: arg-marks вне chain-региона закрываются truncation-close с
   nil-объектом и yy=0 (BLOCKER-класс, research pkres, 2026-10-01).**
@@ -144,6 +151,17 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   переставлен; каждый cut — зелёное дерево + достижимый
   PUC-differential acceptance. Координатор верифицировал лично (Debug,
   `917339a`-дерево): E4-дифференциал generic-пути и S1-ось f1.
+  REVIEW UPDATE (2026-10-01): Д2 пока только дизайн-эскиз, не
+  доказанный единый close-workhorse: `continueBytecodeClose` и
+  `closeTbcRegion` — разные циклы, а `.unwind_frame` сейчас не обходит
+  C-chain; для recovery понадобятся новая post/phase и проверка
+  порядка/rollback/roots. «Zero hot-path cost» означает отсутствие
+  запланированных операций на success-path, не измеренную нулевую цену.
+  Д1 удаляет bytecode fast-path и сводит recovery к C/YPCALL owner.
+  OWNER DECISION (2026-10-01): Д1 утверждён; текущий milestone —
+  миграция всех `pcall`/`xpcall` entrances на настоящий C/YPCALL-кадр
+  с удалением `BytecodeProtectedCall` и связанных replay/traceback/
+  depth путей. Perf измерить и раскрыть; прежняя скорость не gate.
 
 - [x] **`lua_Debug` ABI-layout относительно PUC 5.5 (HIGH,
   ARCHITECTURAL-BACKLOG; review A1.next-ccmt research).** Предложенный

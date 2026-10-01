@@ -3,7 +3,7 @@
 ** recovery owner on the EXPORTED lua_pcallk + continuation, driven from
 ** C through lua_resume (one fresh lua_State + coroutine per case).
 **
-** PUC model under test (lapi.c lua_pcallk yieldable path, ldo.c precover /
+** PUC model under test (lapi.c lua_pcallk yieldable path, ldo.c recover /
 ** finishCcall / finishpcallk, lfunc.c luaF_close):
 **
 **   N     the pcallk'd CALLEE (a C function) marks its own value with
@@ -42,12 +42,17 @@
 ** (nresults nil-fill), J (full GC after a completed recovery + VM reuse
 ** in the same state).
 **
-** Output determinism: the whole drive is C-side; the k continuations and
-** the C bodies' post-pcallk returns print through a DEFERRED event log
-** (klog) flushed once per case, because the interleaving of k with the
-** C caller's own return is an internal resume-machine ordering, not part
-** of the compared semantics. Closer activity is logged by the Lua
-** __close bodies into a table and printed per case, in order.
+** Chronological event stream: EVERY observable event is printed at the
+** moment it happens, into one stream — the k continuations and the C
+** bodies' post-pcallk code (they run inside the lua_resume window that
+** finishes the protected call), the __close bodies (they call the
+** registered logc(), which prints immediately from inside the drive),
+** and the driver's own resume/gc/closethread reports (printed after the
+** corresponding call returns). Stdout is unbuffered; nothing is grouped
+** by source or reordered: the interleaving of k and closer activity
+** relative to the lua_resume / lua_closethread calls is part of the
+** compared contract, because that interleaving is exactly what the C
+** client observes.
 */
 #include <stdio.h>
 #include <stdarg.h>
@@ -57,40 +62,36 @@
 #include "lualib.h"
 
 /* ------------------------------------------------------------------ */
-/* deferred event log for prints inside the resumed drive               */
+/* immediate chronological event output                                  */
 /* ------------------------------------------------------------------ */
-#define KLOG_MAX 128
-#define KLOG_LINE 240
-static char klog_buf[KLOG_MAX][KLOG_LINE];
-static int klog_n = 0;
-
-static void klog(const char *fmt, ...) {
+static void ev(const char *fmt, ...) {
     va_list ap;
-    if (klog_n >= KLOG_MAX) return;
     va_start(ap, fmt);
-    vsnprintf(klog_buf[klog_n], KLOG_LINE, fmt, ap);
+    vprintf(fmt, ap);
     va_end(ap);
-    klog_n++;
+    putchar('\n');
 }
 
-static void klog_flush(void) {
-    int i;
-    for (i = 0; i < klog_n; i++) printf("%s\n", klog_buf[i]);
-    klog_n = 0;
+/* Lua-side __close bodies log through this registered C function so the
+** closer activity joins the same chronological stream at the moment the
+** closer runs (inside a resume/recovery/closethread window). */
+static int logc(lua_State *L) {
+    printf("closer: %s\n", luaL_checkstring(L, 1));
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
 /* shared helpers                                                      */
 /* ------------------------------------------------------------------ */
 
-/* Dump the current window into ONE klog line: tag, status, top, every
+/* Dump the current window into ONE event line: tag, status, top, every
 ** value (type + controlled payload); rawequal identity against the
 ** registry-ref'd original when ctx carries a ref. */
 static void dump_window(lua_State *L, int status, lua_KContext ctx,
                         const char *tag) {
     int top = lua_gettop(L);
     int i;
-    char line[KLOG_LINE];
+    char line[512];
     int n = snprintf(line, sizeof line, "%s: status=%d top=%d", tag,
                      status, top);
     for (i = 1; i <= top && n < (int)sizeof line - 1; i++) {
@@ -126,7 +127,7 @@ static void dump_window(lua_State *L, int status, lua_KContext ctx,
         }
         lua_pop(L, 1);
     }
-    klog("%s", line);
+    ev("%s", line);
 }
 
 static int k_fin(lua_State *L, int status, lua_KContext ctx) {
@@ -164,7 +165,7 @@ static int cbox(lua_State *L) {
     ref = luaL_ref(L, LUA_REGISTRYINDEX);
     {
         int st = lua_pcallk(L, 1, LUA_MULTRET, 0, (lua_KContext)ref, k_fin);
-        klog("cbox: pcallk returned %d top=%d", st, lua_gettop(L));
+        ev("cbox: pcallk returned %d top=%d", st, lua_gettop(L));
         luaL_unref(L, LUA_REGISTRYINDEX, ref);
         if (st != LUA_OK) { lua_pushboolean(L, 0); return 1; }
         return lua_gettop(L);
@@ -174,7 +175,7 @@ static int cbox(lua_State *L) {
 /* D: cyield(f) — plain yield then return: k(status=1) with results. */
 static int cyield(lua_State *L) {
     int st = lua_pcallk(L, 0, LUA_MULTRET, 0, 0, k_fin);
-    klog("cyield: pcallk returned %d top=%d", st, lua_gettop(L));
+    ev("cyield: pcallk returned %d top=%d", st, lua_gettop(L));
     if (st != LUA_OK) { lua_pushboolean(L, 0); return 1; }
     return lua_gettop(L);
 }
@@ -186,7 +187,7 @@ static int cerrf(lua_State *L) {
     push_errtable(L, 44);
     {
         int st = lua_pcallk(L, 1, LUA_MULTRET, 1, 0, k_fin);
-        klog("cerrf: pcallk returned %d top=%d", st, lua_gettop(L));
+        ev("cerrf: pcallk returned %d top=%d", st, lua_gettop(L));
         if (st != LUA_OK) { lua_pushboolean(L, 0); return 1; }
         return lua_gettop(L) - 1;
     }
@@ -197,7 +198,7 @@ static int cerrerr(lua_State *L) {
     push_errtable(L, 49);
     {
         int st = lua_pcallk(L, 1, LUA_MULTRET, 1, 0, k_fin);
-        klog("cerrerr: pcallk returned %d top=%d", st, lua_gettop(L));
+        ev("cerrerr: pcallk returned %d top=%d", st, lua_gettop(L));
         if (st != LUA_OK) { lua_pushboolean(L, 0); return 1; }
         return lua_gettop(L) - 1;
     }
@@ -206,7 +207,7 @@ static int cerrerr(lua_State *L) {
 /* K: cnres(f) — pcallk(nresults=2), callee returns 1 value: nil-fill. */
 static int cnres(lua_State *L) {
     int st = lua_pcallk(L, 0, 2, 0, 0, k_fin);
-    klog("cnres: pcallk returned %d top=%d", st, lua_gettop(L));
+    ev("cnres: pcallk returned %d top=%d", st, lua_gettop(L));
     if (st != LUA_OK) { lua_pushboolean(L, 0); return 1; }
     return 2;
 }
@@ -228,7 +229,7 @@ static int cmark(lua_State *L) {
     lua_pushcclosure(L, cmark_inner, 1);
     {
         int st = lua_pcallk(L, 0, LUA_MULTRET, 0, 0, k_fin);
-        klog("cmark: pcallk returned %d top=%d", st, lua_gettop(L));
+        ev("cmark: pcallk returned %d top=%d", st, lua_gettop(L));
         if (st != LUA_OK) { lua_pushboolean(L, 0); return 1; }
         return lua_gettop(L) - 1;
     }
@@ -245,7 +246,7 @@ static int cgy(lua_State *L) {
     ref = luaL_ref(L, LUA_REGISTRYINDEX);
     {
         int st = lua_pcallk(L, 1, LUA_MULTRET, 0, (lua_KContext)ref, k_fin);
-        klog("cgy: pcallk returned %d top=%d", st, lua_gettop(L));
+        ev("cgy: pcallk returned %d top=%d", st, lua_gettop(L));
         luaL_unref(L, LUA_REGISTRYINDEX, ref);
         if (st != LUA_OK) { lua_pushboolean(L, 0); return 1; }
         return lua_gettop(L) - 1;
@@ -263,7 +264,7 @@ static int cbelow(lua_State *L) {
     ref = luaL_ref(L, LUA_REGISTRYINDEX);
     {
         int st = lua_pcallk(L, 1, LUA_MULTRET, 0, (lua_KContext)ref, k_fin);
-        klog("cbelow: pcallk returned %d top=%d", st, lua_gettop(L));
+        ev("cbelow: pcallk returned %d top=%d", st, lua_gettop(L));
         luaL_unref(L, LUA_REGISTRYINDEX, ref);
         if (st != LUA_OK) { lua_pushboolean(L, 0); return 1; }
         return lua_gettop(L) - 1;
@@ -280,7 +281,7 @@ static int chx(lua_State *L) {
     lua_toclose(L, 3);
     {
         int st = lua_pcallk(L, 1, LUA_MULTRET, 1, 0, k_fin);
-        klog("chx: pcallk returned %d top=%d", st, lua_gettop(L));
+        ev("chx: pcallk returned %d top=%d", st, lua_gettop(L));
         if (st != LUA_OK) { lua_pushboolean(L, 0); return 1; }
         return lua_gettop(L) - 1;
     }
@@ -297,7 +298,7 @@ static int coom(lua_State *L) {
     lua_pushcfunction(L, coom_inner);
     {
         int st = lua_pcallk(L, 0, LUA_MULTRET, 0, 0, k_fin);
-        klog("coom: pcallk returned %d top=%d", st, lua_gettop(L));
+        ev("coom: pcallk returned %d top=%d", st, lua_gettop(L));
         if (st != LUA_OK) { lua_pushboolean(L, 0); return 1; }
         return lua_gettop(L);
     }
@@ -313,7 +314,7 @@ static int cdgc(lua_State *L) {
     ref = luaL_ref(L, LUA_REGISTRYINDEX);
     {
         int st = lua_pcallk(L, 0, LUA_MULTRET, 0, (lua_KContext)ref, k_fin);
-        klog("cdgc: pcallk returned %d top=%d", st, lua_gettop(L));
+        ev("cdgc: pcallk returned %d top=%d", st, lua_gettop(L));
         luaL_unref(L, LUA_REGISTRYINDEX, ref);
         if (st != LUA_OK) { lua_pushboolean(L, 0); return 1; }
         return lua_gettop(L) - 1;
@@ -334,7 +335,7 @@ static int cnest(lua_State *L) {
     lua_pushcclosure(L, cnest_inner, 1);
     {
         int st = lua_pcallk(L, 0, LUA_MULTRET, 0, 0, k_fin_in);
-        klog("cnest_inner: pcallk returned %d top=%d", st, lua_gettop(L));
+        ev("cnest_inner: pcallk returned %d top=%d", st, lua_gettop(L));
         if (st != LUA_OK) { lua_pushboolean(L, 0); return 1; }
         return lua_gettop(L);
     }
@@ -344,7 +345,7 @@ static int cnest_outer(lua_State *L) {
     lua_pushcfunction(L, cnest);
     {
         int st = lua_pcallk(L, 0, LUA_MULTRET, 0, 0, k_fin_out);
-        klog("cnest_outer: pcallk returned %d top=%d", st, lua_gettop(L));
+        ev("cnest_outer: pcallk returned %d top=%d", st, lua_gettop(L));
         if (st != LUA_OK) { lua_pushboolean(L, 0); return 1; }
         return lua_gettop(L);
     }
@@ -364,7 +365,7 @@ static int ckyield(lua_State *L) {
     lua_toclose(L, 1);
     {
         int st = lua_pcallk(L, 0, LUA_MULTRET, 0, 0, k_yielder);
-        klog("ckyield: pcallk returned %d top=%d", st, lua_gettop(L));
+        ev("ckyield: pcallk returned %d top=%d", st, lua_gettop(L));
         if (st != LUA_OK) { lua_pushboolean(L, 0); return 1; }
         return lua_gettop(L) - 1;
     }
@@ -391,21 +392,6 @@ static void report(const char *tag, int st, int nres, lua_State *co) {
     printf("\n");
 }
 
-static void print_log(lua_State *L) {
-    lua_getglobal(L, "table");
-    lua_getfield(L, -1, "concat");
-    lua_remove(L, -2);
-    lua_getglobal(L, "LOG");
-    if (lua_pcall(L, 1, 1, 0) != 0) {
-        printf("FAIL: log: %s\n",
-               lua_tostring(L, -1) ? lua_tostring(L, -1) : "?");
-        lua_pop(L, 1);
-        return;
-    }
-    printf("log: %s\n", lua_tostring(L, -1) ? lua_tostring(L, -1) : "(nil)");
-    lua_pop(L, 1);
-}
-
 typedef struct {
     const char *name;   /* case tag */
     const char *setup;  /* per-case Lua setup (ARGS table) */
@@ -416,12 +402,11 @@ typedef struct {
 } Case;
 
 static const char *setup_common =
-    "LOG = {}\n"
     "local function mkclose(name, err, id, yld)\n"
     "  local t = {id=id}\n"
     "  return setmetatable(t, {__close = function(o, e)\n"
-    "    LOG[#LOG+1] = name..':'..tostring(type(e)=='table' and e.id or e)\n"
-    "    if yld then local y = coroutine.yield('inclose'); LOG[#LOG+1] = name..'_after:'..tostring(y) end\n"
+    "    logc(name..':'..tostring(type(e)=='table' and e.id or e))\n"
+    "    if yld then local y = coroutine.yield('inclose'); logc(name..'_after:'..tostring(y)) end\n"
     "    if err then error(err, 0) end\n"
     "  end})\n"
     "end\n"
@@ -436,6 +421,7 @@ static const char *setup_common =
     "F_YIELD = f_yield\n";
 
 static void register_cfuncs(lua_State *L) {
+    lua_register(L, "logc", logc);
     lua_register(L, "cbox", cbox);
     lua_register(L, "cyield", cyield);
     lua_register(L, "cerrf", cerrf);
@@ -451,33 +437,35 @@ static void register_cfuncs(lua_State *L) {
     lua_register(L, "ckyield", ckyield);
 }
 
-static int run_case(const Case *c) {
+static lua_State *case_setup(const char *name, const char *setup) {
     lua_State *L = luaL_newstate();
-    lua_State *co;
-    int co_ref;
-    int nres = 0, st;
-    char buf[512];
-    printf("=== %s ===\n", c->name);
-    if (!L) { printf("FAIL: newstate\n"); return 1; }
+    printf("=== %s ===\n", name);
+    if (!L) { printf("FAIL: newstate\n"); return NULL; }
     luaL_openlibs(L);
     register_cfuncs(L);
     if (luaL_dostring(L, setup_common) != 0 ||
-        (c->setup && luaL_dostring(L, c->setup) != 0)) {
+        (setup && luaL_dostring(L, setup) != 0)) {
         printf("FAIL: setup: %s\n",
                lua_isstring(L, -1) ? lua_tostring(L, -1) : "?");
         lua_close(L);
-        return 1;
+        return NULL;
     }
-    /* co = coroutine.create(function() return CFN(table.unpack(ARGS)) end)
-    ** — the body reads its call args itself (pushing them onto the fresh
-    ** coroutine via lua_xmove is unchecked in release PUC: lua_xmove does
-    ** not grow the destination stack, api_check only). */
+    return L;
+}
+
+/* create co = coroutine.create(function() return CFN(table.unpack(ARGS))
+** end) rooted in the registry; the body reads its call args itself
+** (pushing them onto the fresh coroutine via lua_xmove is unchecked in
+** release PUC: lua_xmove does not grow the destination stack,
+** api_check only). */
+static lua_State *case_coro(lua_State *L, const char *cfn, int *ref) {
+    lua_State *co;
+    char buf[512];
     snprintf(buf, sizeof buf,
-             "return function() return %s(table.unpack(ARGS)) end", c->cfn);
+             "return function() return %s(table.unpack(ARGS)) end", cfn);
     if (luaL_loadstring(L, buf) != 0 || lua_pcall(L, 0, 1, 0) != 0) {
         printf("FAIL: body factory\n");
-        lua_close(L);
-        return 1;
+        return NULL;
     }
     lua_getglobal(L, "coroutine");
     lua_getfield(L, -1, "create");
@@ -486,16 +474,26 @@ static int run_case(const Case *c) {
     if (lua_pcall(L, 1, 1, 0) != 0) {
         printf("FAIL: create: %s\n",
                lua_isstring(L, -1) ? lua_tostring(L, -1) : "?");
-        lua_close(L);
-        return 1;
+        return NULL;
     }
     co = lua_tothread(L, -1);
-    if (!co) { printf("FAIL: not a thread\n"); lua_close(L); return 1; }
+    if (!co) { printf("FAIL: not a thread\n"); return NULL; }
     /* root the coroutine for the whole case: a thread is a collectable
-    ** value, and the full GC between resumes would free an unrooted one
+    ** value, and a full GC between resumes would free an unrooted one
     ** (the C-local pointer would dangle). */
-    co_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    *ref = luaL_ref(L, LUA_REGISTRYINDEX);
     lua_pop(L, 1);   /* factory closure */
+    return co;
+}
+
+static int run_case(const Case *c) {
+    lua_State *L = case_setup(c->name, c->setup);
+    lua_State *co;
+    int co_ref;
+    int nres = 0, st;
+    if (!L) return 1;
+    co = case_coro(L, c->cfn, &co_ref);
+    if (!co) { lua_close(L); return 1; }
 
     st = lua_resume(co, L, 0, &nres);
     report("resume1", st, nres, co);
@@ -513,8 +511,6 @@ static int run_case(const Case *c) {
         st = lua_closethread(co, L);
         printf("closethread: st=%d\n", st);
     }
-    print_log(L);
-    klog_flush();
     luaL_unref(L, LUA_REGISTRYINDEX, co_ref);
     lua_close(L);
     return 0;
@@ -523,50 +519,27 @@ static int run_case(const Case *c) {
 /* J: error recovery + full GC + VM reuse — same state, second coroutine
 ** created and driven after the GC. */
 static int run_j(void) {
-    lua_State *L = luaL_newstate();
+    lua_State *L = case_setup("J_recover_gc_reuse", "ARGS = {F_ERR}");
     lua_State *co1, *co2;
     int co1_ref, co2_ref;
     int nres = 0, st;
-    printf("=== J_recover_gc_reuse ===\n");
-    if (!L) { printf("FAIL: newstate\n"); return 1; }
-    luaL_openlibs(L);
-    register_cfuncs(L);
-    if (luaL_dostring(L, setup_common) != 0 ||
-        luaL_dostring(L, "ARGS = {F_ERR}") != 0) {
-        printf("FAIL: setup\n");
-        lua_close(L);
-        return 1;
-    }
-    lua_getglobal(L, "coroutine");
-    lua_getfield(L, -1, "create");
-    lua_remove(L, -2);
-    luaL_loadstring(L, "return function() return cbox(table.unpack(ARGS)) end");
-    lua_pcall(L, 0, 1, 0);
-    lua_call(L, 1, 1);
-    co1 = lua_tothread(L, -1);
-    co1_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    if (!L) return 1;
+    co1 = case_coro(L, "cbox", &co1_ref);
+    if (!co1) { lua_close(L); return 1; }
     st = lua_resume(co1, L, 0, &nres);
     report("j_resume1", st, nres, co1);
     if (nres > 0) lua_xmove(co1, L, nres);
     lua_gc(L, LUA_GCCOLLECT);
     printf("j_gc_done\n");
     /* second coroutine in the same state */
-    lua_getglobal(L, "coroutine");
-    lua_getfield(L, -1, "create");
-    lua_remove(L, -2);
-    luaL_loadstring(L, "return function() return cyield(table.unpack(ARGS)) end");
-    lua_pcall(L, 0, 1, 0);
-    lua_call(L, 1, 1);
-    co2 = lua_tothread(L, -1);
-    co2_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    co2 = case_coro(L, "cyield", &co2_ref);
+    if (!co2) { lua_close(L); return 1; }
     st = lua_resume(co2, L, 0, &nres);
     report("j2_resume1", st, nres, co2);
     if (nres > 0) lua_xmove(co2, L, nres);
     st = lua_resume(co2, L, 0, &nres);
     report("j2_resume2", st, nres, co2);
     if (nres > 0) lua_xmove(co2, L, nres);
-    print_log(L);
-    klog_flush();
     luaL_unref(L, LUA_REGISTRYINDEX, co1_ref);
     luaL_unref(L, LUA_REGISTRYINDEX, co2_ref);
     lua_close(L);

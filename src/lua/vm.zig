@@ -7714,9 +7714,22 @@ pub const Vm = struct {
     /// `error.RuntimeError`: C-frame stays (`CIST_YPCALL`) for `precover` —
     /// propagate to the caller's regime.
     ///
-    /// `errfunc_val` null = no handler for the duration (`th.errfunc := ERRFUNC_NONE`,
-    /// matching PUC `L->errfunc = func` where `func = 0` when `errfunc == 0`).
-    /// On normal return, `th.errfunc` is restored to the saved `old_errfunc`.
+    /// `errfunc_slot` null = no handler for the duration (`th.errfunc :=
+    /// ERRFUNC_NONE`, matching PUC `L->errfunc = func` where `func = 0`
+    /// when `errfunc == 0`). Non-null: the ABSOLUTE stack slot of the
+    /// client's handler (PUC lapi.c:1081-1087: `func =
+    /// savestack(index2stack(errfunc))` — the client's own stack slot, an
+    /// INDEX, never a copy staged above the window). A copy above the
+    /// window would sit at the window's published end, inside the
+    /// recovery close's blast radius (the closer staging and the closer
+    /// frames run upward from the region base), so a closer error on the
+    /// resumed drive would read a clobbered handler slot instead of the
+    /// handler; the client's slot (conventionally below the callee, like
+    /// luaB_xpcall's errfunc=2) lies below every staging zone and keeps
+    /// the armed handler valid across the recovery close, its suspension
+    /// and the re-drive (PUC finishpcallk runs luaF_close BEFORE
+    /// restoring L->errfunc). On normal return, `th.errfunc` is restored
+    /// to the saved `old_errfunc`.
     ///
     /// Both c_api (`lua_pcallk` yieldable path) and testC (`.pcallk` branch)
     /// delegate here. The caller handles error conversion (`_longjmp` or Zig
@@ -7727,7 +7740,7 @@ pub const Vm = struct {
         th: *Thread,
         callee: Value,
         args: []const Value,
-        errfunc_val: ?Value,
+        errfunc_slot: ?StackOffset,
         funcidx: usize,
         nresults: i32,
         k: *const fn (?*lua_State, c_int, isize) callconv(.c) c_int,
@@ -7766,11 +7779,9 @@ pub const Vm = struct {
         // PUC's poscall reads via get_nresults.
         fr.callstatus = (fr.callstatus & ~CIST_NRESULTS) | encodeNresults(nresults);
         fr.u.c.old_errfunc = th.errfunc;
-        if (errfunc_val) |ef| {
-            self.setErrfuncValue(ef);
-        } else {
-            th.errfunc = ERRFUNC_NONE;
-        }
+        // PUC lapi.c:1107 `L->errfunc = func`: arm the client's slot
+        // index (savestack discipline) — see the doc comment above.
+        th.errfunc = errfunc_slot orelse ERRFUNC_NONE;
         fr.setOah(th.allowhook);
         fr.setYpcall();
 
@@ -7787,9 +7798,6 @@ pub const Vm = struct {
         // Normal return: clear CIST_YPCALL, restore errfunc
         // (PUC lapi.c:1110-1112).
         fr.clearYpcall();
-        if (errfunc_val != null) {
-            self.setErrfuncValue(null);
-        }
         th.errfunc = fr.u.c.old_errfunc;
         return ret;
     }
@@ -15612,7 +15620,12 @@ pub const Vm = struct {
         if (th.c_tbc_chain.items.len < region_base) region_base = th.c_tbc_chain.items.len;
         if (fr.u.c.testc_state == null) {
             // Production frame: the window (and the chain) live on th;
-            // level = the pcallk'd callee's absolute slot.
+            // level = the pcallk'd callee's absolute slot. PUC has ONE
+            // tbclist: finishpcallk's luaF_close(func, status, yy=1)
+            // closes every entry at a slot >= the callee's, whether it
+            // was marked before or after pcallk armed the frame — the
+            // level scan below extends the snapshot region down through
+            // qualifying pre-pcallk arg-marks.
             const level = fr.frameBase() + fr.u.c.aux.pcallk.funcidx;
             while (region_base > 0) {
                 const below = th.c_tbc_chain.items[region_base - 1];
@@ -27018,6 +27031,16 @@ pub const Vm = struct {
         const th_entry = self.activeBytecodeThread();
         const defer_to_precover = th_entry.yieldable();
         var deferred = false;
+        // A suspension exit (error.Yield) restores NOTHING (PUC lapi.c
+        // lua_pcallk yieldable path: luaD_throw(LUA_YIELD) longjmps past
+        // lua_pcallk entirely — the `L->errfunc = old_errfunc` restore
+        // after luaD_call never runs). ERRFUNC_NONE stays armed while the
+        // CIST_YPCALL frame owns the protected call: an error in the
+        // resumed callee runs NO handler (luaG_errormsg sees errfunc 0),
+        // and finishpcallk restores old_errfunc from the frame after the
+        // recovery close. Restoring the caller's errfunc here would let an
+        // outer xpcall's handler steal the inner pcall's errors.
+        var yield_exit = false;
         // P16.24 T4/T5: same unit as the iterative pcall path — ONE
         // YIELDABLE depth unit (PUC pcall-with-continuation → docallK →
         // luaD_call → ccall(ci=1)). The yieldability itself is owned by
@@ -27086,13 +27109,14 @@ pub const Vm = struct {
                 }
             }
         }
-        // PUC lua_pcallk yieldable path: on error NOTHING is restored here
-        // — errfunc stays armed (NONE for pcall) until finishpcallk
-        // restores it from the frame's old_errfunc (lapi.c:1110-1112 runs
-        // only on the normal-return path; the recovery close sees the
+        // PUC lua_pcallk yieldable path: neither a deferred error NOR a
+        // yield suspension restores errfunc here — the frame's YPCALL
+        // state owns it (ERRFUNC_NONE for pcall) until finishpcallk
+        // restores old_errfunc after the recovery close (lapi.c:1110-1112
+        // runs only on the normal-return path; the recovery close sees the
         // pcall's own errfunc, like PUC finishpcallk closing before its
         // own L->errfunc restore). The conventional branch restores here.
-        defer if (!deferred) {
+        defer if (!deferred and !yield_exit) {
             th_pcall_ef.errfunc = saved_errfunc;
         };
         // PUC ldo.c:luaD_pcall calls luaD_shrinkstack on the error path
@@ -27166,7 +27190,10 @@ pub const Vm = struct {
         }.f;
 
         const resolved = self.resolveCallable(callee, call_args, null) catch |e| switch (e) {
-            error.Yield => return e,
+            error.Yield => {
+                yield_exit = true;
+                return e;
+            },
             error.OutOfMemory => {
                 self.setOutOfMemoryError();
                 rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
@@ -27218,7 +27245,10 @@ pub const Vm = struct {
                 defer if (tmp_heap) self.infraAlloc().free(tmp);
 
                 const pcall_bres = self.callBuiltin(id, resolved.args, tmp, .host, resolved.ccmt) catch |e| switch (e) {
-                    error.Yield => return e,
+                    error.Yield => {
+                        yield_exit = true;
+                        return e;
+                    },
                     error.OutOfMemory => {
                         self.setOutOfMemoryError();
                         if (defer_to_precover) {
@@ -27305,7 +27335,10 @@ pub const Vm = struct {
                 const saved_top = th_pcall.top;
                 const saved_frame_count = th_pcall.call_frames.len();
                 const ret = self.runClosure(cl, resolved.args, resolved.ccmt) catch |e| switch (e) {
-                    error.Yield => return e,
+                    error.Yield => {
+                        yield_exit = true;
+                        return e;
+                    },
                     error.OutOfMemory => {
                         self.setOutOfMemoryError();
                         if (defer_to_precover) {
@@ -27401,29 +27434,39 @@ pub const Vm = struct {
         var yield_exit = false;
         const th_xpcall_ef = self.activeBytecodeThread();
         const saved_errfunc = th_xpcall_ef.errfunc;
-        const armed_errfunc = th_xpcall_ef.top;
-        // PUC luaB_xpcall (lbaselib.c): the target and handler are read
-        // BEFORE any stack manipulation, and lua_pcallk receives the
-        // handler as a stack INDEX (errfunc=2) — indices survive stack
-        // reallocation via savestack/restorestack. Here setErrfuncValue
-        // stages the handler ON stack and may grow/realloc it
-        // (reallocBcStackArrays frees the old array), invalidating the
-        // `args` slice when it aliases the caller's register window.
-        // Snapshot the array here and re-base `args` below before the
-        // target read — callBuiltin's args_fresh restorestack idiom.
+        // PUC lua_pcallk errfunc!=0 arm (lapi.c:1081-1087): func =
+        // savestack(index2stack(errfunc)) — luaB_xpcall passes index 2,
+        // the handler's OWN argument slot inside this C-frame's window
+        // ([xpcall][f][h]; the callee runs above the window). No copy is
+        // staged above the window: a copy would sit at the window's
+        // published end, inside the recovery close's blast radius (the
+        // region base is frameBase — the whole window — and the closer
+        // staging plus the closer frames run upward from there), so a
+        // closer error on the resumed drive would read a clobbered handler
+        // slot instead of the handler. The arg slot lies below every
+        // staging zone: the armed handler survives the recovery close, its
+        // suspension and the re-drive, and a closer error during the
+        // recovery close still runs it (PUC finishpcallk runs luaF_close
+        // BEFORE restoring L->errfunc).
+        // pcall/xpcall always enter through a real C-frame with args on
+        // stack (callBuiltin .host staging above the func slot / the
+        // caller's registers on the bytecode-window lane), so the slot
+        // index derives from the args slice; an index survives every later
+        // stack realloc (PUC savestack discipline: index, not pointer).
+        const handler_off: usize = (@intFromPtr(args.ptr) - @intFromPtr(th_xpcall_ef.stack.ptr)) / @sizeOf(Value);
+        std.debug.assert(handler_off + args.len <= th_xpcall_ef.stack.len); // args are this frame's on-stack window
+        const handler_slot: StackOffset = @intCast(handler_off + 1);
+        th_xpcall_ef.errfunc = handler_slot;
         const args_stack_snapshot = th_xpcall_ef.stack;
-        self.setErrfuncValue(args[1]);
         // PUC lua_pcallk yieldable path: on error NOTHING is disarmed or
         // restored here — the armed message handler stays errfunc until
         // finishpcallk restores old_errfunc after the recovery close (a
         // closer error in the region runs the handler, like PUC
         // finishpcallk closing before its own L->errfunc restore). The
-        // conventional branch disarms and restores here.
-        defer if (!deferred and !yield_exit) {
-            if (th_xpcall_ef.errfunc == armed_errfunc) {
-                if (th_xpcall_ef.top > armed_errfunc) th_xpcall_ef.top = armed_errfunc;
-                th_xpcall_ef.errfunc = ERRFUNC_NONE;
-            }
+        // conventional branch restores here; the ownership guard skips the
+        // restore when this frame already finished (precover/finishpcallk
+        // restored old_errfunc from the frame).
+        defer if (!deferred and !yield_exit and th_xpcall_ef.errfunc == handler_slot) {
             th_xpcall_ef.errfunc = saved_errfunc;
         };
         if (self.protected_call_depth >= 128) {
@@ -27502,9 +27545,9 @@ pub const Vm = struct {
             }
         }
 
-        // restorestack: setErrfuncValue (and the C-stack-overflow raise
-        // block above it) may have reallocated stack out from under
-        // the caller's register window. Re-base `args` by its snapshot
+        // restorestack: the C-stack-overflow raise block above may have
+        // reallocated stack out from under the caller's register window
+        // (invokeErrfunc runs the handler). Re-base `args` by its snapshot
         // offset when it aliased the old array; foreign (heap/native)
         // slices pass through untouched. Offsets survive any number of
         // moves — reallocBcStackArrays memcpy-preserves slot contents.
@@ -29576,7 +29619,125 @@ pub const Vm = struct {
                             if (th.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
                                 forced_close_ok = true;
                             } else {
-                                ok = false;
+                                // PUC lua_resume centralizes recovery: every
+                                // error reaching the resume boundary goes
+                                // through precover (ldo.c: after
+                                // rawrunprotected, `status = precover(L,
+                                // status)`), whatever the body kind. A
+                                // builtin body (T.testC's pcallk) leaves its
+                                // CIST_YPCALL frame armed (callBuiltin's
+                                // RuntimeError guard preserves it); without
+                                // precover here the frame is dropped and the
+                                // error escapes the coroutine uncaught.
+                                recovered: {
+                                    const rec = self.precover(th) catch |pe| switch (pe) {
+                                        // A __close in the recovery region
+                                        // yielded (yy=1): standard suspension —
+                                        // the C-frame stays with CIST_CLSRET and
+                                        // the next resume re-drives the recovery.
+                                        error.Yield => {
+                                            yielded = true;
+                                            const ys = th.yieldedValues() orelse &[_]Value{};
+                                            if (ys.len > 0) {
+                                                payload = try self.alloc.alloc(Value, ys.len);
+                                                payload_n = ys.len;
+                                                payload_heap = true;
+                                                for (ys, 0..) |v, i| payload[i] = v;
+                                            }
+                                            th.yielded.deinit(self.alloc);
+                                            break :recovered;
+                                        },
+                                        else => return pe,
+                                    };
+                                    if (!rec) {
+                                        ok = false;
+                                        break :recovered;
+                                    }
+                                    // Recovered: the CIST_YPCALL C-frame is
+                                    // on top — drive its continuation chain
+                                    // (PUC unroll: finishCcall → k → poscall
+                                    // until the frame stack unwinds to the
+                                    // base). Mirrors the resume-entry
+                                    // continuation drive above (the
+                                    // cframe_processed loop), including the
+                                    // stale-frame skip and the nested
+                                    // precover for a continuation that
+                                    // errors under another pcallk.
+                                    while (true) {
+                                        if (framesAtBase(th)) {
+                                            const ri = th.resume_inbox.slice() orelse &[_]Value{};
+                                            payload = try self.alloc.alloc(Value, ri.len);
+                                            payload_n = ri.len;
+                                            payload_heap = true;
+                                            for (ri, 0..) |v, i| payload[i] = v;
+                                            th.resume_inbox.deinit(self.alloc);
+                                            ok = true;
+                                            break;
+                                        }
+                                        const tfr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
+                                        if (!tfr.isC()) {
+                                            // A Lua frame surfaced above the
+                                            // base without a suspension:
+                                            // re-enter it in place (the
+                                            // unroll loop's Lua branch).
+                                            th.bytecode_inplace_suspended = true;
+                                            th.bytecode_resume_boundary = bytecodeOuterBoundary(&th.call_frames);
+                                            break;
+                                        }
+                                        if (tfr.u.c.k == &testcContShim and tfr.u.c.testc_state == null) {
+                                            try self.poscallCFrame(th, 0);
+                                            const ri = th.resume_inbox.slice() orelse &[_]Value{};
+                                            try self.publishCompletionToClientWindow(th, ri);
+                                            continue;
+                                        }
+                                        th.bytecode_inplace_suspended = false;
+                                        const fc = self.finishCcall(th) catch |e2| switch (e2) {
+                                            error.Yield => {
+                                                yielded = true;
+                                                const ys = th.yieldedValues() orelse &[_]Value{};
+                                                if (ys.len > 0) {
+                                                    payload = try self.alloc.alloc(Value, ys.len);
+                                                    payload_n = ys.len;
+                                                    payload_heap = true;
+                                                    for (ys, 0..) |v, i| payload[i] = v;
+                                                }
+                                                th.yielded.deinit(self.alloc);
+                                                break;
+                                            },
+                                            error.OutOfMemory => return self.resumeUncaughtErrorTail(th),
+                                            error.RuntimeError => {
+                                                const rec2 = self.precover(th) catch |pe2| switch (pe2) {
+                                                    error.Yield => {
+                                                        yielded = true;
+                                                        const ys = th.yieldedValues() orelse &[_]Value{};
+                                                        if (ys.len > 0) {
+                                                            payload = try self.alloc.alloc(Value, ys.len);
+                                                            payload_n = ys.len;
+                                                            payload_heap = true;
+                                                            for (ys, 0..) |v, i| payload[i] = v;
+                                                        }
+                                                        th.yielded.deinit(self.alloc);
+                                                        break;
+                                                    },
+                                                    else => return pe2,
+                                                };
+                                                if (rec2) {
+                                                    th.bytecode_inplace_suspended = false;
+                                                    continue;
+                                                }
+                                                ok = false;
+                                                break;
+                                            },
+                                            else => return e2,
+                                        };
+                                        if (yielded) break;
+                                        try self.poscallCFrame(th, fc);
+                                        {
+                                            const ri = th.resume_inbox.slice() orelse &[_]Value{};
+                                            try self.publishCompletionToClientWindow(th, ri);
+                                        }
+                                    }
+                                }
                             }
                         },
                         else => return e,

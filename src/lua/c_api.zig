@@ -2329,6 +2329,21 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
         // overwrite the parked frame's registers). *nresults = nyield
         // (PUC ldo.c:996: L->ci->u2.nyield — NOT a stack-derived count;
         // hook yields report 0 while the window shows the register file).
+        // PUC lua_resume: the caller reads EXACTLY nyield values at the
+        // thread's stack top. A recovery suspension (a yielding closer
+        // parked the pcall frame mid-recovery-close) can leave close-
+        // staging residue ABOVE the parked payload; republish the yielded
+        // values into the top nres slots — a value-identical no-op when
+        // the top already holds them (every other suspension class).
+        const nyield = res.len - 1;
+        if (nyield > 0) {
+            const cnt = Vm.cWindowCount(th);
+            if (cnt >= nyield) {
+                @memcpy(th.stack[th.top - nyield .. th.top], res[1..]);
+            } else {
+                for (res[1..]) |v| vm.cWindowPush(th, v) catch break;
+            }
+        }
         if (nres) |p| p.* = @intCast(res.len - 1);
         return 1; // LUA_YIELD
     }
@@ -2526,9 +2541,13 @@ pub export fn lua_pcallk(
         if (errfunc != 0) {
             const wth0 = Vm.handleThread(h);
             const abs0 = Vm.cWindowSlot(wth0, errfunc) orelse return 2;
-            const errfunc_val = wth0.stack[abs0];
-            vm.setErrfuncValue(errfunc_val);
-            defer vm.setErrfuncValue(null);
+            const saved0 = wth0.errfunc;
+            // PUC savestack discipline: arm the client's own slot index,
+            // not a staged copy (lapi.c:1081-1087 — the index survives
+            // every stack realloc; the slot stays valid for the whole
+            // conventional extent).
+            wth0.errfunc = abs0;
+            defer wth0.errfunc = saved0;
             var s = api.State.fromHandle(h);
             return statusCode(s.pcall(@intCast(@max(nargs, 0)), nresults));
         }
@@ -2538,21 +2557,15 @@ pub export fn lua_pcallk(
 
     if (k == null or !th.yieldable()) {
         // ── Conventional pcall (setjmp/longjmp boundary) ──
-        // PUC: if errfunc != 0, set L->errfunc = func for the duration.
-        // In luazig, th.errfunc is a stack index, so we push the errfunc
-        // Value (read from the window by index) onto stack via
-        // setErrfuncValue.
+        // PUC: if errfunc != 0, set L->errfunc = func (the client's slot
+        // index — savestack, lapi.c:1081-1087) for the duration; the raise
+        // machinery reads the handler straight from that slot.
         if (errfunc != 0) {
             const wth1 = Vm.handleThread(h);
             const abs1 = Vm.cWindowSlot(wth1, errfunc) orelse return 2;
-            const errfunc_val = wth1.stack[abs1];
             const saved_errfunc = th.errfunc;
-            vm.setErrfuncValue(errfunc_val);
-            defer {
-                // Pop the errfunc from stack and restore the old index.
-                vm.setErrfuncValue(null);
-                th.errfunc = saved_errfunc;
-            }
+            wth1.errfunc = abs1;
+            defer th.errfunc = saved_errfunc;
             var s = api.State.fromHandle(h);
             return statusCode(s.pcall(@intCast(@max(nargs, 0)), nresults));
         } else {
@@ -2583,18 +2596,18 @@ pub export fn lua_pcallk(
         vm.setOutOfMemoryError();
         return 4; // LUA_ERRMEM
     };
-    const errfunc_val: ?Value = if (errfunc != 0) blk: {
+    const errfunc_slot: ?usize = if (errfunc != 0) blk: {
         const abs = Vm.cWindowSlot(wth, errfunc) orelse {
             vm.alloc.free(call_args);
             return 2;
         };
-        break :blk wth.stack[abs];
+        break :blk abs;
     } else null;
 
     const kfn: *const fn (?*vm_mod.lua_State, c_int, isize) callconv(.c) c_int =
         @ptrCast(@alignCast(k.?));
 
-    const ret = vm.luaPcallKShared(th, callee, call_args, errfunc_val, fn_idx, nresults, kfn, ctx) catch |err| {
+    const ret = vm.luaPcallKShared(th, callee, call_args, errfunc_slot, fn_idx, nresults, kfn, ctx) catch |err| {
         vm.alloc.free(call_args);
         switch (err) {
             error.Yield => {
@@ -2608,9 +2621,6 @@ pub export fn lua_pcallk(
                 // No C-function boundary — can't yield. Fallback cleanup.
                 const fr2 = th.call_frames.getPtr(th.call_frames.len() - 1);
                 fr2.clearYpcall();
-                if (errfunc_val != null) {
-                    vm.setErrfuncValue(null);
-                }
                 th.errfunc = fr2.u.c.old_errfunc;
                 return 2;
             },
@@ -2623,9 +2633,6 @@ pub export fn lua_pcallk(
                 // No C-function boundary — fallback cleanup.
                 const fr2 = th.call_frames.getPtr(th.call_frames.len() - 1);
                 fr2.clearYpcall();
-                if (errfunc_val != null) {
-                    vm.setErrfuncValue(null);
-                }
                 th.errfunc = fr2.u.c.old_errfunc;
                 return if (vm.errThread().err_is_errerr) 5 else 2;
             },
@@ -2648,9 +2655,6 @@ pub export fn lua_pcallk(
                 // machinery cannot run without one).
                 const fr2 = th.call_frames.getPtr(th.call_frames.len() - 1);
                 fr2.clearYpcall();
-                if (errfunc_val != null) {
-                    vm.setErrfuncValue(null);
-                }
                 th.errfunc = fr2.u.c.old_errfunc;
                 // (b) status-returning: LUA_ERRMEM is the specified OOM status.
                 // Install the FIXED MEMERRMSG object (allocation-free) so the

@@ -45,7 +45,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
-- [ ] **precover region-close: yielding closer протаскивает nil error
+- [x] **precover region-close: yielding closer протаскивает nil error
   object сквозь `coroutine.resume`, VM после этого непригодна (BLOCKER,
   FIX-NOW-кандидат; research pkres, 2026-10-01, к `60a9ee9`).** Форма N:
   yielding closer внутри precover's yieldable region-close —
@@ -76,26 +76,63 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   сайтов достижимость yield из precover требует focused differential;
   implementation обязан проверить и обработать все шесть, не
   ограничиваться числом из research-отчёта.
+  CLOSED (Д1 cut W+N, `27624b0`): все ШЕСТЬ сайтов
+  проинвентаризированы; 4 достижимых (3 trampoline + 29398) конвертируют
+  error.Yield в штатную suspension с сохранённым C-frame; 29128/29349 —
+  структурное доказательство недостижимости yield (consumer-less/
+  recovered-only). Оракул f9b n-режим: контент PUC-идентичен (N_r1
+  suspended, N_r2, nv=boom2); Lua-форма 16118 — byte-identical
+  (координатор лично). Mut-N изолированно load-bearing, revert GREEN.
 
-- [ ] **GY: arg-marks вне chain-региона закрываются truncation-close с
+- [x] **GY: arg-marks вне chain-региона закрываются truncation-close с
   nil-объектом и yy=0 (BLOCKER-класс, research pkres, 2026-10-01).**
   Closer получает nil вместо исходного error object; yield конвертирован
   в ошибку. Расширение (ii) единого recovery-owner (см. F1-обновление
   ниже). Decisive: GY_r1/GY_r2 в `/tmp/opencode/pkres/f9b_window.c`
   (`gy` mode).
+  CLOSED (Д1 финальный блок, `9274967`): precover region level-based
+  (PUC luaF_close(funcidx,...)): TbcEntry.detached.level; funcidx
+  window-relative 0; скан цепи ниже snapshot по уровню
+  frameBase+funcidx — arg-marks >= funcidx включая поставленные до
+  вызова; ошибка closer — исходный объект; marks ниже уровня не
+  тронуты (e2-контроль). Оракулы gy/gyno: контент PUC-идентичен
+  (координатор лично; r1 suspended, closer id=52, identity=1, r2
+  завершает); full f9b GY-семья GREEN; mutation-RED (snapshot-возврат)
+  load-bearing.
 
-- [ ] **P: c_api `lua_pcallk` ловит `OutOfMemory` синхронно —
+- [x] **P: c_api `lua_pcallk` ловит `OutOfMemory` синхронно —
   continuation `k` пропускается (HIGH, research pkres, 2026-10-01).**
   zig: clearYpcall + `return 4` без вызова k; PUC доставляет
   `k(LUA_ERRMEM, "not enough memory")`. Контроль RuntimeError-vs-OOM
   включён в f9b_window.c (статически линкованный oracle, rc=1 vs 0).
+  CLOSED (Д1 финальный блок, `9274967`): err_is_oom kind-bit (аналог
+  luaD_throw status, не text-based) + RECST=4 + yieldable OOM
+  longjmp-маршрут в lua_pcallk + публикация FIXED memerrmsg. Оракул p:
+  k вызван со status=4 и "not enough memory" (координатор лично);
+  conventional no-k branch не затронут; «block too big» остаётся
+  отдельным backlog.
 
-- [ ] **DGC: continuation window `[prefix, fret, r2]` обязан переживать
+- [x] **DGC: continuation window `[prefix, fret, r2]` обязан переживать
   настоящий GC между resume (HIGH, research pkres, 2026-10-01).** PUC
   сохраняет окно; zig-окно пустое. Код GC (atomic clear-dead-stack,
   vm.zig:32410+) ОПРОВЕРГАЕТ починку «пересборка окна из stale-слотов» —
   живой prefix требует опубликованной GC-границы либо иного доказанного
   root-owner. Decisive: `dgc` mode в `/tmp/opencode/pkres/f9b_window.c`.
+  CLOSED (Д1 cut W, `27624b0`): persisted published end на C-кадре —
+  restore/pop/finishpcallk/error+results publication/k видят PUC-окно;
+  prefix и error object rooted через настоящий GC между resume;
+  cWindowSetCount не nil-fill'ит живой prefix. Оракул dgc: контент
+  PUC-идентичен (k window [prefix(60), fret, r2], identity=1;
+  координатор лично); Mut-W load-bearing (7 форм a1=nil).
+
+- [ ] **k-ordering residual: side-effects C-клиентского `k` печатаются
+  ПОСЛЕ возврата `coroutine.resume`, PUC — ДО (MEDIUM, Д1 residual;
+  prf1 §7).** Наблюдается во всех f9b-режимах с CONT-строками (n/dgc/
+  o/gy/gyno/p): контент строк PUC-идентичен, порядок — нет (CONT после
+  N_r2/DGC_r2 вместо до). First-wrong-op — resume-машина (unwind/
+  continuation ordering), НЕ recovery-owner (Д1 закрыт). Отдельный
+  bounded cut по resume-порядку; до него все recovery-формы зелёные по
+  содержанию.
 
 - [ ] **ORDINARY-BACKLOG (research pkres): «block too big» — PUC ERRRUN
   vs zig ERRMEM.** Побочный finding f9b-оракула; отдельный
@@ -2136,7 +2173,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   отдельного `pushResolvedBytecodeClosure` Parity BLOCKER выше.
   Заявление о perf финального дерева также отозвано до повторного A/B.
 
-- [ ] **Parity HIGH (pre-existing, REDESIGN-констрейнт): yieldability
+- [x] **Parity HIGH (pre-existing, REDESIGN-констрейнт): yieldability
   pcall-recovery close (16118-ветка) расходится с PUC finishpcallk**:
   bytecode-lane pcall recovery (finishBytecodeProtectedFailure, close с
   yieldable=false) закрывает non-yieldably, PUC finishpcallk (ldo.c:811) —
@@ -2174,6 +2211,21 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   yy=1 recovery). Дизайн и cut-порядок — см. VERIFICATION UPDATE в
   пункте f9b_window выше (Д1 vs Д2, рекомендация Д2 за owner;
   N+window объединены). Пункт остаётся открытым.
+  CLOSED (milestone Д1, owner-решение, cuts `27624b0`/`996d2ec`/
+  `9274967`): pcall/xpcall/lua_pcallk/generic builtins — один
+  C/YPCALL protected-recovery owner; bytecode fast path
+  (BytecodeProtectedCall и всё его семейство, −1052 строки) УДАЛЕН
+  (rg-proof 0 ссылок). Ошибка/окно/continuation/recovery-close
+  (yy по предикату `k != NULL && yieldable(L)` при входе; E1-контроль
+  conventional yy=0) — PUC-идентичны по семантическим осям во всех
+  оракулах (f9b A-N/full, f1d S1-S5, E1-E4, tbcesc_16118;
+  координатор верифицировал лично). Единственный остаточный diff —
+  известный pre-existing where-attribution текст-класс
+  ("(upvalue 'T')", backlog F4n17/F8n17) и k-ordering residual
+  (отдельный пункт выше). Perf: pcall_ok/xpcall_ok −16% (цена
+  удаления fast path), xpcall_yield +14-16% (кандидат на упрощение
+  внутри модели), GY/P neutral; скорость не gate. Отчёты:
+  /tmp/opencode/{prw1,prf1,prfin}_report.md.
 
 - [x] **P16.50-review correction (REOPENED→CLOSED by review-7)**: rollback ownership + C-closure upvalue semantics — (a) BLOCKER 1: opClosure count-prefix rollback неверен при смешанных дескрипторах (proxy/new instack/уже-boxed) — exact ownership worklist/bitmap, rollback только созданных этим вызовом Cells в reverse-порядке; закрыть post-commit окно (gcStoreCellValue после commit) — либо provably-infallible через preparation/order, либо полный rollback owner для Closure/tree/register/accounting/register-slot; dispatch-driven mixed-upvalue тест ([proxy, new instack] из реального bytecode; existing-boxed; провал на следующем Cell и на Closure alloc; post-commit barrier failure; byte-exact всё + minor collection + repeated + success); negative copy count-prefix rollback детерминированно ловится; (b) BLOCKER 2: lua_newthread errdefer НЕ работает (?*lua_State ≠ error union) — inner error-union transaction / явный cleanup helper, ABI-wrapper маппит в null ПОСЛЕ cleanup; preserve/restore прежний vm.c_api_thread; тест против реального экспортированного lua_newthread (fail на registry prepare / Thread alloc / handle alloc / parent stack growth; registries/stack/handle/counters/live-set + GC после); (c) BLOCKER 3: registerfuncs алиасит C-closure upvalues (общие Cell-объекты: setupvalue(f1) виден f2) — PUC luaL_setfuncs (lauxlib.c:965-978) копирует VALUES на стек + lua_pushcclosure (lapi.c:609+) свежий CClosure с inline slots; один канонический C-closure конструктор для pushcclosure+registerfuncs с per-closure Cells; убрать неверный LClosure rationale; differential-тест (upvalueid differs; setupvalue A не меняет B; сбор в обоих порядках без leaks; OOM на non-preinterned names + table-growth setfield); (d) error propagation: lua_pushcclosure/lua_pushcfunction/luaL_setfuncs/luaL_newlib catch {} — обследовать защищённый механизм (protected call/throw) и маршрутизировать ЛИБО зафиксировать архитектурный blocker (owner решает); (e) HIGH: testcChargeMemory коммитит total_bytes ДО нативных аллокаций — split check/reserve от accounting commit / точный rollback; тест с активным testc_ctrl + провалы registry reserve/Userdata/uservalues/payload; аудит всех testcChargeMemory-сайтов; (f) cleanup: устаревшие BLOCKED/KNOWN-leak комментарии в тестах, skip fail-индексов 2..4 в pushcclosure matrix, smoke provenance prose (84 файла, 85-й номер — один из 84).
 

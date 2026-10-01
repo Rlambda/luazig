@@ -105,6 +105,18 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
    builtinXpcall; E4-дифференциал). Consumer-less precover-сайтов
    четыре (4-й — direct-resume unroll 29398). Cut-порядок переработан
    (pkresv §6): N+window объединены, каждый cut независимо зелёный.
+   CLOSED (milestone Д1, owner-решение; cuts `27624b0` W+N, `996d2ec`
+   F1+route, `9274967` GY+P+delete): pcall/xpcall/lua_pcallk/generic
+   builtins — один C/YPCALL recovery owner; bytecode fast path
+   (BytecodeProtectedCall-семейство, −1052 строки) удалён полностью
+   (rg-proof 0 ссылок); yy по предикату `k != NULL && yieldable(L)`
+   при входе (E1 остаётся conventional); level-based precover region
+   (GY); OOM в k через kind-bit RECST=4 (P); persisted window end на
+   C-кадре (W/DGC). Второго mutable owner нет; Thread-global replay
+   field не вводился. Residual: k-ordering (resume-машина, отдельный
+   пункт STATUS) и where-attribution текст-класс (F4n17/F8n18,
+   backlog). Perf-цена раскрыта (pcall_ok −16% и т.д., скорость не
+   gate). Отчёты: /tmp/opencode/{prw1,prf1,prfin}_report.md.
    REVIEW UPDATE (2026-10-01): Д2 — не существующий общий
    close-workhorse: `continueBytecodeClose` и `closeTbcRegion` имеют
    отдельные циклы/носители; новая bytecode recovery-phase потребует

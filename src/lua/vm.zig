@@ -5826,6 +5826,14 @@ pub const Vm = struct {
         // installs the sentinel + frame. Anchors the C API window for host
         // code that runs between chunks (luaL_newstate → pushes → dofile).
         vm.initThreadBaseFrame(main_th) catch @panic("oom");
+        // PUC lstate.c:349: `incnny(L); /* main thread is always non
+        // yieldable */` — the main thread carries one nny unit that is
+        // never released. Every yieldability decision
+        // (`Thread.yieldable()`, the pcallk branch predicate, direct
+        // yields) sees the main thread as non-yieldable regardless of
+        // which runner drives it (host lua_pcall, or a direct runBytecode
+        // entry without a non-yieldable C unit).
+        main_th.nCcalls = 0x10000;
         // PUC lstate.c:354: g->seed = seed. The hash seed is initialized ONCE
         // from the caller-provided value (entropy via makeRandomSeed for
         // Vm.init, explicit seed for lua_newstate/tests). It is never mutated
@@ -14764,8 +14772,9 @@ pub const Vm = struct {
                 const mm = self.getMetaFieldByObj(args[0], .pairs) orelse return false;
                 return mm == .Closure and mm.Closure.proto != null;
             },
-            .pcall,
-            .xpcall,
+            // pcall/xpcall run through their REAL C-frame (pushBuiltinCFrame
+            // + builtinPcall/builtinXpcall, PUC precallC) — their CALL event
+            // fires on that activation like every sync-bound builtin.
             .string_gsub,
             .coroutine_resume,
             => return true,
@@ -15815,6 +15824,12 @@ pub const Vm = struct {
         const fr = th_bc.getPtr(th_bc.len() - 1);
         std.debug.assert(fr.isC());
         const my_idx = th_bc.len() - 1;
+        // Captured BEFORE finishpcallk clears the flag: a YPCALL frame's
+        // completion is the pcall-family result contract — [true] ++ the
+        // callee's results for a yield completion (PUC luaB_pcall stages
+        // `true` below the callee and finishpcall returns ALL stack
+        // results), [false, err] for an error (formatted below).
+        const was_ypcall = fr.isYpcall();
 
         // (1) CIST_CLSRET: a TBC close suspended mid-way (return_close or
         // error_escape — PUC: luaF_close with yy=1 hit a yielding closer).
@@ -15866,10 +15881,23 @@ pub const Vm = struct {
                         // resume leaves it for coroutine.close).
                         return error.RuntimeError;
                     }
-                    const saved_results = cs.results;
+                    var saved_results = cs.results;
                     self.alloc.destroy(cs);
                     fr.u.c.clsret_state = null;
                     fr.clearClsret();
+                    if (was_ypcall) {
+                        // The suspended return-path close of a pcall frame:
+                        // rebuild [true] ++ results (PUC finishpcall's
+                        // all-stack-results shape).
+                        const formatted = self.alloc.alloc(Value, 1 + saved_results.len) catch {
+                            self.alloc.free(saved_results);
+                            return error.OutOfMemory;
+                        };
+                        formatted[0] = .{ .Bool = true };
+                        @memcpy(formatted[1..], saved_results);
+                        self.alloc.free(saved_results);
+                        saved_results = formatted;
+                    }
                     if (saved_results.len > 0) {
                         th.resume_inbox.setOwned(self.alloc, saved_results);
                     } else {
@@ -15899,13 +15927,30 @@ pub const Vm = struct {
                     // pops this frame (its entries are all closed now) and
                     // continues the recovery. PUC: the closeprotected error
                     // propagates out of the recovery.
-                    const fe = final_err orelse cs.error_value orelse .Nil;
+                    // PUC finishpcallk re-runs wholesale; CIST_RECST
+                    // "preserves the error status across these multiple
+                    // runs, changing only if there is a new error": a
+                    // closer that resumed on this drive may have installed
+                    // a NEW error (last-error-wins) — the live VM error
+                    // state leads then. final_err on an already-empty
+                    // region is closeTbcRegion's ECHO of the incoming
+                    // cs.error_value (PUC luaD_closeprotected returns the
+                    // incoming status when no closer fails), so it cannot
+                    // override the live state either; the parked value is
+                    // the fallback when no live object exists.
+                    const cur = if (self.errThread().err_has_obj) self.errThread().err_obj else null;
+                    const fe = cur orelse final_err orelse cs.error_value orelse .Nil;
                     self.errThread().err_obj = fe;
                     self.errThread().err_has_obj = true;
                     self.err = if (fe == .String) fe.String.bytes() else null;
                     self.errThread().err_source = null;
                     self.errThread().err_line = -1;
-                    self.errThread().err_is_errerr = cs.error_status == 5;
+                    // err_is_errerr is current already when a live object
+                    // leads (installed by the failing close); the parked
+                    // fallback restores its RECST=5 origin.
+                    if (cur == null) {
+                        self.errThread().err_is_errerr = cs.error_status == 5;
+                    }
                     self.alloc.destroy(cs);
                     fr.u.c.clsret_state = null;
                     fr.clearClsret();
@@ -16165,6 +16210,32 @@ pub const Vm = struct {
                         break;
                     }
                 }
+            }
+            // A fixed completion contract packed on the frame (CIST_NRESULTS,
+            // the PUC prepCallInfo analogue for builtins whose suspended
+            // completion must produce an exact count — `pairs` always
+            // returns 4, its __pairs metamethod's count regardless): pad or
+            // truncate the inbox to the wanted count before delivery.
+            {
+                const wanted: usize = @intCast(@max(decodeNresults(th_bc.getConstPtr(my_idx).callstatus), 0));
+                if (wanted > 0) {
+                    const ri = th.resume_inbox.slice() orelse &[_]Value{};
+                    if (ri.len != wanted) {
+                        const formatted = self.alloc.alloc(Value, wanted) catch return error.OutOfMemory;
+                        for (0..wanted) |i| formatted[i] = if (i < ri.len) ri[i] else .Nil;
+                        th.resume_inbox.setOwned(self.alloc, formatted);
+                    }
+                }
+            }
+            if (was_ypcall) {
+                // The yield completion of a pcall/xpcall frame: [true] ++
+                // the callee's results (the sync path's ownedPcallOk shape;
+                // PUC luaB_pcall stages `true` below the callee).
+                const ri = th.resume_inbox.slice() orelse &[_]Value{};
+                const formatted = self.alloc.alloc(Value, 1 + ri.len) catch return error.OutOfMemory;
+                formatted[0] = .{ .Bool = true };
+                @memcpy(formatted[1..], ri);
+                th.resume_inbox.setOwned(self.alloc, formatted);
             }
             const nargs = if (th.resume_inbox.slice()) |ri| @as(i32, @intCast(ri.len)) else 0;
             return nargs;
@@ -16666,7 +16737,32 @@ pub const Vm = struct {
                                 }
                                 break :retblk null;
                             },
-                            error.OutOfMemory => return error.OutOfMemory,
+                            error.OutOfMemory => {
+                                // PUC luaD_throw(ERRMEM) longjmps to the
+                                // resume boundary like any error: a
+                                // deferred-to-precover YPCALL frame (the
+                                // pcall/xpcall defer covers ERRMEM too)
+                                // recovers here — finishpcallk publishes
+                                // the memerrmsg object and the drive loop
+                                // continues past the pcall. Without a
+                                // YPCALL frame the resume fails with
+                                // ERRMEM, as before.
+                                self.setOutOfMemoryError();
+                                if (self.precover(active) catch |pe| switch (pe) {
+                                    // A __close metamethod in the recovery
+                                    // region yielded (yy=1): standard
+                                    // suspension, same shape as the
+                                    // RuntimeError arm above.
+                                    error.Yield => {
+                                        step = try self.bytecodeCoroutineYieldStep(active, active == initial);
+                                        break :retblk null;
+                                    },
+                                    else => return pe,
+                                }) {
+                                    continue :drive;
+                                }
+                                return error.OutOfMemory;
+                            },
                         };
                         break :retblk values;
                     };
@@ -19109,22 +19205,30 @@ pub const Vm = struct {
             // park machinery itself) unwind to prevent stale re-execution.
             //
             // P15.78 Task 13: When callk/pcallk/yieldk pushes C-frames with
-            // testc_state above this boundary, those C-frames MUST be preserved
-            // for finishCcall → testcContShim on resume. The suspension spans
-            // this runBytecodeInternal call (the f-closure that called T.testC
-            // which called callk). Without this check, the errdefer would
-            // unwind the C-frames, losing continuation state.
-            const has_testc_cframes_above = blk: {
+            // continuation state above this boundary, those C-frames MUST be
+            // preserved for finishCcall → testcContShim on resume. The
+            // suspension spans this runBytecodeInternal call (the f-closure
+            // that called T.testC which called callk). Without this check,
+            // the errdefer would unwind the C-frames, losing continuation
+            // state. The same holds for ANY C-frame carrying parked
+            // continuation state — CLSRET (a yy=1 close suspended mid-way)
+            // or a saved k: a yield suspends EVERY CallInfo (PUC luaD_throw
+            // unwinds nothing), so a run whose boundary sits below such a
+            // frame is part of the same suspension (e.g. a pcall C-frame
+            // between the body and the callee: builtinPcall's runClosure
+            // enters with a boundary above the C-frame, and the callee's
+            // yielding closer parks CLSRET on a testC frame above it).
+            const has_continuation_cframes_above = blk: {
                 if (!exec_thread.bytecode_inplace_suspended) break :blk false;
                 var i: usize = boundary_depth;
                 while (i < exec_frames.len()) : (i += 1) {
                     const f = exec_frames.getConstPtr(i);
-                    if (f.isC() and f.u.c.testc_state != null) break :blk true;
+                    if (f.isC() and (f.u.c.testc_state != null or f.isClsret() or f.u.c.k != null)) break :blk true;
                 }
                 break :blk false;
             };
             const is_suspension_owner = exec_thread.bytecode_inplace_suspended and
-                (boundary_depth == bytecodeOuterBoundary(exec_frames) or boundary_depth <= exec_thread.bytecode_resume_boundary or has_testc_cframes_above);
+                (boundary_depth == bytecodeOuterBoundary(exec_frames) or boundary_depth <= exec_thread.bytecode_resume_boundary or has_continuation_cframes_above);
             if (!is_suspension_owner) {
                 // P16.50-review-10 BLOCKER 1: the abort unwind's upvalue
                 // close is infallible (overflow fallback — see
@@ -23715,22 +23819,11 @@ pub const Vm = struct {
         // P16.35 Cut 3: id-class guard hoisting (see the OP_CALL site above)
         // — non-pcall/xpcall and non-trampoline tail calls skip the
         // decline-chain calls entirely (PUC luaD_pretailcall → precallC has
-        // no layered guards).
-        if (callee_val == .Builtin and
-            (callee_val.Builtin == .pcall or callee_val.Builtin == .xpcall) and
-            chain_depth == 0 and
-            try self.tryPushBytecodeProtectedCall(
-                ctx.exec_frames,
-                ctx.frame_index,
-                a,
-                -1,
-                callee_val.Builtin,
-                call_args,
-                true,
-            ))
-        {
-            return .continue_frame_loop;
-        }
+        // no layered guards). pcall/xpcall tail calls fall through to the
+        // generic C-frame path below: pushBuiltinCFrameAt + callBuiltin →
+        // builtinPcall/builtinXpcall, the same real C/YPCALL frame and
+        // recovery owner as every other entry (the bytecode protection fast
+        // path no longer intercepts them).
         if (callee_val == .Builtin and
             self.bytecode_coroutine_trampoline_active and
             chain_depth == 0 and
@@ -24484,26 +24577,12 @@ pub const Vm = struct {
                 // with no layered guards; every non-pcall/xpcall builtin
                 // must skip the decline-chain (incl. the ArrayListUnmanaged
                 // init + defer deinit) entirely. The id-class gate is
-                // generic (protected family), not per-builtin.
-                if ((id == .pcall or id == .xpcall) and chain_depth == 0 and
-                    try self.tryPushBytecodeProtectedCall(
-                        ctx.exec_frames,
-                        ctx.frame_index,
-                        a,
-                        nresults,
-                        id,
-                        rargs,
-                        false,
-                    ))
-                {
-                    return .continue_frame_loop;
-                }
-                // P16.35 Cut 3: same hoisting for the coroutine-switch
-                // request — its first check is the trampoline flag, which
-                // is false in the steady state (trampoline only active
-                // while a nested bytecode coroutine switch is pending).
-                // One load+test here replaces the out-of-line call for
-                // every non-trampoline builtin OP_CALL.
+                // generic (protected family), not per-builtin. pcall/xpcall
+                // fall through to the generic C-frame path below:
+                // pushBuiltinCFrameAt + callBuiltin → builtinPcall/
+                // builtinXpcall — the same real C/YPCALL frame and recovery
+                // owner as every other entry (the bytecode protection fast
+                // path no longer intercepts them).
                 if (self.bytecode_coroutine_trampoline_active and chain_depth == 0 and
                     try self.tryRequestBytecodeCoroutineSwitch(
                         ctx.exec_frames,
@@ -25753,8 +25832,18 @@ pub const Vm = struct {
             break :blk args;
         } else args;
         if (staged_args) {
+            const args_base = th.top;
             @memcpy(th.stack[th.top..][0..args_fresh.len], args_fresh);
             th.top += args_fresh.len;
+            // PUC precallC: the C callee's arguments LIVE on the stack
+            // above ci->func for the whole call. Window consumers (testC
+            // scripts, cWindow* readers, suspendedCWindow) derive the
+            // window from the slice POINTER — rebase it onto the staged
+            // copy so no callee ever indexes the caller's off-stack
+            // buffer (a coroutine-entry resume payload lives on another
+            // thread's stack; pointer arithmetic against this thread's
+            // stack is then meaningless).
+            args_fresh = th.stack[args_base..th.top];
         }
         // PUC precallC ordering (ldo.c:642-656): the C CallInfo exists and
         // its arguments are staged BEFORE the CALL hook fires. Host
@@ -25900,8 +25989,18 @@ pub const Vm = struct {
                 th.top = e;
             }
         }
-        defer if (saved_call_top) |s| {
-            th.top = s;
+        // A suspension exit (error.Yield) keeps th.top where the yield parked
+        // it: PUC's luaD_throw unwinds nothing, and the parked continuation's
+        // frames (the yielding closer's Lua frame, CLSRET C-frames with live
+        // windows) sit ABOVE the call region — restoring the caller's top
+        // here would roll top below live parked windows (the resume entry's
+        // yield_window_base discard re-anchors top on the next resume). The
+        // normal-return and error paths keep the restore.
+        var yield_exit = false;
+        defer if (!yield_exit) {
+            if (saved_call_top) |s| {
+                th.top = s;
+            }
         };
 
         // P15.38i: Helper for builtins with re-entry. After a nested Lua call
@@ -25931,6 +26030,11 @@ pub const Vm = struct {
         }
         const owned = self.callBuiltinSwitch(id, args_fresh, outs_fresh) catch |err| {
             if (err == error.Yield or err == error.ThreadSwitch) {
+                // See the saved_call_top defer: a suspension keeps the
+                // parked top (only error.Yield parks windows; ThreadSwitch
+                // propagates the switch request with its own suspension
+                // shape — the trampoline owns the caller's state).
+                if (err == error.Yield) yield_exit = true;
                 cframe_preserved = true;
             } else if (err == error.RuntimeError) {
                 // P15.82e: Mirror callCFunction's CIST_YPCALL guard (see its
@@ -27522,6 +27626,19 @@ pub const Vm = struct {
         }
         self.protected_call_depth += 1;
         defer self.protected_call_depth -= 1;
+        // PUC lua_pcallk (lapi.c:1097): the branch predicate is captured
+        // AT ENTRY — k != NULL && yieldable(L). luaB_pcall always passes a
+        // continuation, so the discriminator is thread yieldability: in an
+        // ordinary coroutine the error is NOT caught here — the YPCALL
+        // C-frame stays armed and recovery (region close yy=1, error-object
+        // publication, results) is deferred to the resume boundary's
+        // precover → finishCcall → finishpcallk. The main thread and a
+        // coroutine inside a non-yieldable C boundary take the conventional
+        // branch: the local catch below closes the region yy=0 and returns
+        // [false, err] (PUC luaD_pcall → luaD_closeprotected).
+        const th_entry = self.activeBytecodeThread();
+        const defer_to_precover = th_entry.yieldable();
+        var deferred = false;
         // P16.24 T4/T5: same unit as the iterative pcall path — ONE
         // YIELDABLE depth unit (PUC pcall-with-continuation → docallK →
         // luaD_call → ccall(ci=1)). The yieldability itself is owned by
@@ -27585,7 +27702,15 @@ pub const Vm = struct {
                 }
             }
         }
-        defer th_pcall_ef.errfunc = saved_errfunc;
+        // PUC lua_pcallk yieldable path: on error NOTHING is restored here
+        // — errfunc stays armed (NONE for pcall) until finishpcallk
+        // restores it from the frame's old_errfunc (lapi.c:1110-1112 runs
+        // only on the normal-return path; the recovery close sees the
+        // pcall's own errfunc, like PUC finishpcallk closing before its
+        // own L->errfunc restore). The conventional branch restores here.
+        defer if (!deferred) {
+            th_pcall_ef.errfunc = saved_errfunc;
+        };
         // PUC ldo.c:luaD_pcall calls luaD_shrinkstack on the error path
         // to restore stack size after overflow. We call it unconditionally
         // (it's a no-op when the stack isn't oversized).
@@ -27605,7 +27730,7 @@ pub const Vm = struct {
         self.errThread().err_traceback = null;
         defer {
             self.clearErrorTraceback();
-            {
+            if (!deferred) {
                 self.err = prev_err;
                 self.errThread().err_obj = prev_err_obj;
                 self.errThread().err_has_obj = prev_err_has_obj;
@@ -27618,6 +27743,9 @@ pub const Vm = struct {
                 self.errThread().err_source = prev_err_source;
                 self.errThread().err_line = prev_err_line;
             }
+            // The deferred error keeps its object/status/source in the
+            // thread error state — precover's region close and
+            // finishpcallk's window publication read them there.
             self.errThread().err_traceback = prev_err_traceback;
         }
 
@@ -27658,10 +27786,18 @@ pub const Vm = struct {
             error.OutOfMemory => {
                 self.setOutOfMemoryError();
                 rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
+                if (defer_to_precover) {
+                    deferred = true;
+                    return error.OutOfMemory;
+                }
                 return try self.ownedPcallFail();
             },
             else => {
                 rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
+                if (defer_to_precover) {
+                    deferred = true;
+                    return e;
+                }
                 return try self.ownedPcallFail();
             },
         };
@@ -27701,6 +27837,16 @@ pub const Vm = struct {
                     error.Yield => return e,
                     error.OutOfMemory => {
                         self.setOutOfMemoryError();
+                        if (defer_to_precover) {
+                            // ERRMEM defers like any error: the YPCALL frame
+                            // stays for precover; finishpcallk publishes the
+                            // memerrmsg object (PUC: ERRMEM longjmps to the
+                            // resume boundary — k(status=4) for a C client,
+                            // [false, memerrmsg] for Lua-level pcall).
+                            rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
+                            deferred = true;
+                            return error.OutOfMemory;
+                        }
                         // P16.31 Cut 3: pcall recovery-boundary close (PUC
                         // luaD_closeprotected) — before the fail tuple so a
                         // final closer error replaces the failure's error object.
@@ -27709,6 +27855,14 @@ pub const Vm = struct {
                         return try self.ownedPcallFail();
                     },
                     else => {
+                        if (defer_to_precover) {
+                            // No counter rollback for the `error` builtin
+                            // (it constructs no objects) — same exemption
+                            // as the conventional path below.
+                            if (id != .@"error") rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
+                            deferred = true;
+                            return e;
+                        }
                         if (id == .@"error") {
                             // P16.31 Cut 3: pcall recovery-boundary close —
                             // no marks can exist above (the callee IS error),
@@ -27770,31 +27924,43 @@ pub const Vm = struct {
                     error.Yield => return e,
                     error.OutOfMemory => {
                         self.setOutOfMemoryError();
-                        // P16.31 Cut 3: pcall recovery-boundary close (PUC
-                        // luaD_closeprotected) — before the unwind so live
-                        // frame_slot reads still see the frames; for the
-                        // normal error path precover already closed at this
-                        // boundary (empty-region no-op here).
-                        if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_pcall_ef, idx);
-                        // P16.50-review-10 BLOCKER 1: the unwind close is
-                        // infallible (overflow fallback) — the frame suffix
-                        // is fully released here; the in-flight OOM error
-                        // is preserved and surfaces the protected call.
+                        if (defer_to_precover) {
+                            // The callee's frames were already unwound by
+                            // the dispatch error machinery down to this
+                            // C-frame; the YPCALL frame stays for precover.
+                            // Do NOT unwind/restore top here — the recovery
+                            // owns the window from here (finishpcallk
+                            // publishes at funcidx).
+                            rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
+                            deferred = true;
+                            return error.OutOfMemory;
+                        }
+                        // PUC luaD_pcall's catch restores L->ci/L->top to the
+                        // pcall entry BEFORE luaD_closeprotected: the close
+                        // runs with the stack already rolled back, so every
+                        // slot above the callee's staging (a stale value
+                        // parked at the callee's ci->top included) is dead
+                        // to the GC marking inside a __close
+                        // (weak-observable). The boundary close follows the
+                        // unwind — marks were pop-detached with their values,
+                        // the close sees the same region.
                         self.unwindBytecodeExecFrames(&th_pcall.call_frames, saved_frame_count);
                         th_pcall.top = saved_top;
+                        if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_pcall_ef, idx);
                         rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
                         return try self.ownedPcallFail();
                     },
                     else => {
-                        // P16.31 Cut 3: pcall recovery-boundary close — see
-                        // the OOM arm above.
-                        if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_pcall_ef, idx);
-                        // P16.50-review-10 BLOCKER 1: the unwind close is
-                        // infallible (overflow fallback) — the frame suffix
-                        // is fully released; the in-flight runtime error is
-                        // preserved and surfaces the protected call.
+                        if (defer_to_precover) {
+                            rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
+                            deferred = true;
+                            return e;
+                        }
+                        // PUC luaD_pcall's catch: L->ci/L->top restore before
+                        // luaD_closeprotected — see the OOM arm above.
                         self.unwindBytecodeExecFrames(&th_pcall.call_frames, saved_frame_count);
                         th_pcall.top = saved_top;
+                        if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_pcall_ef, idx);
                         rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
                         return try self.ownedPcallFail();
                     },
@@ -27839,6 +28005,16 @@ pub const Vm = struct {
         // frames intact — before any unwinding. The handler slot lives on
         // stack just above xpcall's args and is popped when the
         // protected call completes (lua_pcallk restores the old errfunc).
+        // PUC lua_pcallk (lapi.c:1097): branch predicate captured AT ENTRY
+        // (see the frame-marking comment below for the full contract).
+        const th_xpcall_entry = self.activeBytecodeThread();
+        const defer_to_precover = th_xpcall_entry.yieldable();
+        var deferred = false;
+        // A suspension exit (error.Yield) restores NOTHING (PUC luaD_throw
+        // unwinds nothing): the handler stays armed and the parked
+        // continuation's windows stay above the handler slot — rolling top
+        // back to armed_errfunc would drop them below top.
+        var yield_exit = false;
         const th_xpcall_ef = self.activeBytecodeThread();
         const saved_errfunc = th_xpcall_ef.errfunc;
         const armed_errfunc = th_xpcall_ef.top;
@@ -27853,13 +28029,19 @@ pub const Vm = struct {
         // target read — callBuiltin's args_fresh restorestack idiom.
         const args_stack_snapshot = th_xpcall_ef.stack;
         self.setErrfuncValue(args[1]);
-        defer {
+        // PUC lua_pcallk yieldable path: on error NOTHING is disarmed or
+        // restored here — the armed message handler stays errfunc until
+        // finishpcallk restores old_errfunc after the recovery close (a
+        // closer error in the region runs the handler, like PUC
+        // finishpcallk closing before its own L->errfunc restore). The
+        // conventional branch disarms and restores here.
+        defer if (!deferred and !yield_exit) {
             if (th_xpcall_ef.errfunc == armed_errfunc) {
                 if (th_xpcall_ef.top > armed_errfunc) th_xpcall_ef.top = armed_errfunc;
                 th_xpcall_ef.errfunc = ERRFUNC_NONE;
             }
             th_xpcall_ef.errfunc = saved_errfunc;
-        }
+        };
         if (self.activeProtectedCallDepth() >= 128) {
             // PUC lua_pcallk → docallK → ccall: the C-stack depth check
             // fails inside the protected extent, so the armed message
@@ -27906,18 +28088,31 @@ pub const Vm = struct {
         // C-frame (pushed by callBuiltin) is now REAL and VISIBLE.
         defer self.shrinkBcStack();
 
-        // P16.31 Cut 3: remember the xpcall C-frame's index — every catch
-        // below closes its TBC region (PUC luaD_pcall error path →
-        // luaD_closeprotected at the pcall boundary, ldo.c:1092). Unlike
-        // builtinPcall, this frame is NOT marked CIST_YPCALL (a pre-existing
-        // divergence: PUC luaB_xpcall also goes through lua_pcallk), so for
-        // Closure-lane errors precover may already have popped it —
-        // closePcallBoundaryRegion's frame-still-present guard handles that.
+        // PUC luaB_xpcall also runs through lua_pcallk (lbaselib.c:504)
+        // with the message handler as the errfunc parameter: the C-frame
+        // carries CIST_YPCALL + the full recovery state, and the branch
+        // predicate is captured AT ENTRY (k != NULL && yieldable(L)) — in
+        // an ordinary coroutine the error defers to precover (recovery
+        // close yy=1 with the handler still armed), the main thread and a
+        // coroutine inside a non-yieldable C boundary take the
+        // conventional local catch (yy=0 close) below.
         var pcall_frame_idx: ?usize = null;
         const th_xpcall_cf = self.activeBytecodeThread();
-        if (th_xpcall_cf.call_frames.len() > 0) {
-            const idx = th_xpcall_cf.call_frames.len() - 1;
-            if (th_xpcall_cf.call_frames.getPtr(idx).isC()) pcall_frame_idx = idx;
+        {
+            if (th_xpcall_cf.call_frames.len() > 0) {
+                const idx = th_xpcall_cf.call_frames.len() - 1;
+                const cfr = th_xpcall_cf.call_frames.getPtr(idx);
+                if (cfr.isC()) {
+                    pcall_frame_idx = idx;
+                    cfr.setYpcall();
+                    cfr.u.c.old_errfunc = saved_errfunc;
+                    cfr.u.c.aux.pcallk = .{
+                        .funcidx = @intCast(cfr.frameBase()),
+                        .chain_base = @intCast(cfr.tbc_chain_base),
+                    };
+                    cfr.callstatus = setoah(cfr.callstatus, th_xpcall_cf.allowhook);
+                }
+            }
         }
 
         // restorestack: setErrfuncValue (and the C-stack-overflow raise
@@ -27949,7 +28144,7 @@ pub const Vm = struct {
         self.errThread().err_traceback = null;
         defer {
             self.clearErrorTraceback();
-            {
+            if (!deferred) {
                 self.err = prev_err;
                 self.errThread().err_obj = prev_err_obj;
                 self.errThread().err_has_obj = prev_err_has_obj;
@@ -27959,6 +28154,8 @@ pub const Vm = struct {
                 self.errThread().err_source = prev_err_source;
                 self.errThread().err_line = prev_err_line;
             }
+            // The deferred error keeps its object/status/source in the
+            // thread error state for precover/finishpcallk.
             self.errThread().err_traceback = prev_err_traceback;
         }
 
@@ -27971,8 +28168,26 @@ pub const Vm = struct {
         // luaG_errormsg) and its result replaced the error object, so
         // protectedErrorValue() IS the handler-transformed object (or the
         // "error in error handling" object when the handler kept failing).
-        const resolved = self.resolveCallable(f, call_args, null) catch {
-            return try self.ownedPcallFail();
+        const resolved = self.resolveCallable(f, call_args, null) catch |e| switch (e) {
+            error.Yield => {
+                yield_exit = true;
+                return e;
+            },
+            error.OutOfMemory => {
+                self.setOutOfMemoryError();
+                if (defer_to_precover) {
+                    deferred = true;
+                    return error.OutOfMemory;
+                }
+                return try self.ownedPcallFail();
+            },
+            else => {
+                if (defer_to_precover) {
+                    deferred = true;
+                    return e;
+                }
+                return try self.ownedPcallFail();
+            },
         };
         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
 
@@ -27991,6 +28206,10 @@ pub const Vm = struct {
                     tmp = self.infraAlloc().alloc(Value, nouts) catch |e| switch (e) {
                         error.OutOfMemory => {
                             self.setOutOfMemoryError();
+                            if (defer_to_precover) {
+                                deferred = true;
+                                return error.OutOfMemory;
+                            }
                             return try self.ownedPcallFail();
                         },
                     };
@@ -27999,8 +28218,29 @@ pub const Vm = struct {
                 defer if (tmp_heap) self.infraAlloc().free(tmp);
 
                 const xpcall_bres = self.callBuiltin(id, resolved.args, tmp, .host, resolved.ccmt) catch |e| switch (e) {
-                    error.Yield => return e,
+                    error.Yield => {
+                        yield_exit = true;
+                        return e;
+                    },
+                    error.OutOfMemory => {
+                        self.setOutOfMemoryError();
+                        if (defer_to_precover) {
+                            // ERRMEM defers like any error (see builtinPcall).
+                            deferred = true;
+                            return error.OutOfMemory;
+                        }
+                        // P16.31 Cut 3: xpcall recovery-boundary close (PUC
+                        // luaD_closeprotected) — before the fail tuple so a
+                        // final closer error replaces the failure's error
+                        // object.
+                        if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_xpcall_cf, idx);
+                        return try self.ownedPcallFail();
+                    },
                     else => {
+                        if (defer_to_precover) {
+                            deferred = true;
+                            return e;
+                        }
                         // P16.31 Cut 3: xpcall recovery-boundary close (PUC
                         // luaD_closeprotected) — before the fail tuple so a
                         // final closer error replaces the failure's error
@@ -28036,22 +28276,43 @@ pub const Vm = struct {
                 const saved_top = th_xpcall.top;
                 const saved_frame_count = th_xpcall.call_frames.len();
                 const ret = self.runClosure(cl, resolved.args, resolved.ccmt) catch |e| switch (e) {
-                    error.Yield => return e,
-                    else => {
-                        // P16.31 Cut 3: xpcall recovery-boundary close —
-                        // before the unwind so live frame_slot reads still
-                        // see the frames; precover may already have popped
-                        // the frame (no YPCALL mark) and closed at the outer
-                        // boundary (the guard makes this a no-op then).
-                        if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_xpcall_cf, idx);
-                        // PUC luaD_pcall: L->ci = old_ci; restore stack
-                        // pointer and unwind call frames.
-                        // P16.50-review-10 BLOCKER 1: the unwind close is
-                        // infallible (overflow fallback) — the frame suffix
-                        // is fully released; the in-flight error is
-                        // preserved and surfaces the protected call.
+                    error.Yield => {
+                        yield_exit = true;
+                        return e;
+                    },
+                    error.OutOfMemory => {
+                        self.setOutOfMemoryError();
+                        if (defer_to_precover) {
+                            // See builtinPcall: the YPCALL frame stays for
+                            // precover; no unwind/top restore on this path.
+                            deferred = true;
+                            return error.OutOfMemory;
+                        }
+                        // PUC luaD_pcall's catch restores L->ci/L->top to the
+                        // pcall entry BEFORE luaD_closeprotected (see
+                        // builtinPcall's Closure-lane arms): the close runs
+                        // with the stack already rolled back, so stale slots
+                        // above the callee's staging are dead to GC marking
+                        // inside a __close. Marks were pop-detached with
+                        // their values; the close sees the same region.
                         self.unwindBytecodeExecFrames(&th_xpcall.call_frames, saved_frame_count);
                         th_xpcall.top = saved_top;
+                        if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_xpcall_cf, idx);
+                        return try self.ownedPcallFail();
+                    },
+                    else => {
+                        if (defer_to_precover) {
+                            deferred = true;
+                            return e;
+                        }
+                        // PUC luaD_pcall's catch: L->ci/L->top restore before
+                        // luaD_closeprotected — see the OOM arm above. The
+                        // frame-still-present guard stays: precover may
+                        // already have popped this frame and closed at the
+                        // outer boundary (the guard makes this a no-op then).
+                        self.unwindBytecodeExecFrames(&th_xpcall.call_frames, saved_frame_count);
+                        th_xpcall.top = saved_top;
+                        if (pcall_frame_idx) |idx| self.closePcallBoundaryRegion(th_xpcall_cf, idx);
                         return try self.ownedPcallFail();
                     },
                 };
@@ -29720,6 +29981,29 @@ pub const Vm = struct {
                         }
                         break :unroll_loop;
                     },
+                    error.OutOfMemory => {
+                        // PUC luaD_throw(ERRMEM) longjmps to the resume
+                        // boundary like any error: a deferred-to-precover
+                        // YPCALL frame (the pcall/xpcall defer covers
+                        // ERRMEM too) recovers here — finishpcallk
+                        // publishes the memerrmsg object and the unroll
+                        // loop continues at (B). Without a YPCALL frame
+                        // the resume fails with ERRMEM, as before.
+                        self.setOutOfMemoryError();
+                        if (self.precover(th) catch |pe| switch (pe) {
+                            // A __close metamethod in the recovery region
+                            // yielded (yy=1): standard suspension, same
+                            // shape as the RuntimeError arm above.
+                            error.Yield => {
+                                yielded = true;
+                                break :unroll_loop;
+                            },
+                            else => return pe,
+                        }) {
+                            continue :unroll_loop;
+                        }
+                        return error.OutOfMemory;
+                    },
                     else => return e,
                 };
 
@@ -29805,9 +30089,23 @@ pub const Vm = struct {
 
                 // Plain C-frame (k==null): PUC poscall — the callee's
                 // results become the C call's return values. Feed them to
-                // the frame below via resume_inbox and loop.
-                try self.setThreadResumeInbox(th, ret);
-                self.alloc.free(ret);
+                // the frame below via resume_inbox and loop. A frame with a
+                // packed CIST_NRESULTS contract (`pairs` — the lua_callk
+                // nresults analog) is adjusted to that count here.
+                {
+                    const cfr_mut = th.call_frames.getPtr(th.call_frames.len() - 1);
+                    const wanted: usize = @intCast(@max(decodeNresults(cfr_mut.callstatus), 0));
+                    if (wanted > 0 and ret.len != wanted) {
+                        const formatted = try self.alloc.alloc(Value, wanted);
+                        for (0..wanted) |i| formatted[i] = if (i < ret.len) ret[i] else .Nil;
+                        try self.setThreadResumeInbox(th, formatted);
+                        self.alloc.free(formatted);
+                        self.alloc.free(ret);
+                    } else {
+                        try self.setThreadResumeInbox(th, ret);
+                        self.alloc.free(ret);
+                    }
+                }
                 self.popBuiltinCFrame();
                 {
                     var fi: usize = th.call_frames.len();
@@ -38643,6 +38941,16 @@ pub const Vm = struct {
         hook_state_for_flag.in_debug_hook = true;
         defer hook_state_for_flag.in_debug_hook = false;
 
+        // PUC ldblib.c hookf invokes the Lua hook body via `lua_call(L, 2, 0)`
+        // → lua_callk(k==NULL) → luaD_callnoyield: the whole hook body runs
+        // under one nny unit (yieldable(L) == false inside it). A yield
+        // attempt is denied, and a pcall/xpcall INSIDE the hook body takes
+        // lua_pcallk's conventional branch (local yy=0 catch), so a
+        // yield-denial error is observed by that pcall, not deferred to a
+        // resume boundary.
+        const hook_th = self.activeBytecodeThread();
+        try self.ccallEnter(hook_th, .nonyieldable);
+        defer hook_th.ccallExit(.nonyieldable);
         switch (hook) {
             .Builtin => |id| {
                 // P16.50-review-6: 0-window — hook results are discarded;
@@ -39329,6 +39637,20 @@ pub const Vm = struct {
             var mm_args = [_]Value{args[0]};
             const resolved = try self.resolveCallable(mmv, mm_args[0..], .{ .namewhat = "metamethod", .name = "__pairs" });
             defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+            // PUC luaB_pairs calls __pairs via lua_callk(..., 4, pairscont):
+            // the metamethod's results are ALWAYS adjusted to 4 (the callk's
+            // nresults). Pack that contract on this builtin's own C-frame so
+            // a suspended completion (a yielding __pairs in a coroutine)
+            // re-applies it on resume (finishCcall's k==null delivery).
+            {
+                const th_p = self.activeBytecodeThread();
+                if (th_p.call_frames.len() > 0) {
+                    const top_fr = th_p.call_frames.getPtr(th_p.call_frames.len() - 1);
+                    if (top_fr.isC()) {
+                        top_fr.callstatus = (top_fr.callstatus & ~CIST_NRESULTS) | encodeNresults(4);
+                    }
+                }
+            }
             switch (resolved.callee) {
                 .Builtin => |id| {
                     const pairs_bres = try self.callBuiltin(id, resolved.args, outs, .host, resolved.ccmt);
@@ -47304,6 +47626,42 @@ pub const Vm = struct {
                 };
                 if (need > th.top) th.top = need;
             }
+            // PUC prepcallclosemth's error case (lfunc.c): seterrorobj
+            // writes the error object into slot level+1 (top = level+2)
+            // and callclosemethod stages the metamethod from level+2 up —
+            // BOTH slots clobber whatever stale value sits there, so a dead
+            // object planted at either one cannot survive the close as a
+            // stack GC root (weak-table observable). The closer receives
+            // the same values from registers (val / cur_err); these writes
+            // are stack-slot discipline only (three spare slots above
+            // level = luaD_checkstack(L, 3) parity).
+            if (cur_err != null) {
+                switch (entry) {
+                    .frame_slot => |fs| {
+                        try self.ensureBcStackCap(th, fs.slot_idx + 3);
+                        th.stack[fs.slot_idx + 1] = cur_err.?;
+                        th.stack[fs.slot_idx + 2] = val;
+                        // PUC seterrorobj REWRITES L->top = level+2 (then
+                        // callclosemethod stages func/obj/err upward) —
+                        // everything above the close staging is dead to the
+                        // marker, so a stale value parked at the caller's
+                        // ci->top (above level+2) must not survive as a GC
+                        // root (weak-table observable). The descent stops at
+                        // the highest open upvalue cell: the boxed[] shadow
+                        // roots open cells only below th.top.
+                        var new_top = fs.slot_idx + 3;
+                        var i = th.top;
+                        while (i > new_top) : (i -= 1) {
+                            if (th.boxed[i - 1] != null) {
+                                new_top = i;
+                                break;
+                            }
+                        }
+                        th.top = new_top;
+                    },
+                    .detached => {},
+                }
+            }
             // P16.31 Cut 3: the testc close-metamethod depth (formerly
             // runTestcCloseMetamethod's wrapper, used by every testC/c_api
             // close lane before the unification) — a coroutine.yield from
@@ -47470,6 +47828,14 @@ pub const Vm = struct {
     fn forcedCloseResetCChain(self: *Vm, th: *Thread, err: ?Value) DispatchError!?Value {
         var cur_err = err;
         th.bytecode_inplace_suspended = false;
+        // PUC resetCI (lstate.c:154) clears L->errfunc BEFORE
+        // luaD_closeprotected runs — "stack unwind can 'throw away' the
+        // error function": a handler armed by a suspended xpcall below the
+        // discarded frames must not run for closer errors (its slot may
+        // already be clobbered by the unwind staging). PUC luaG_errormsg
+        // asserts the slot still holds a function precisely because
+        // resetCI guarantees no stale armed handler survives a reset.
+        th.errfunc = ERRFUNC_NONE;
         while (th.call_frames.len() > 0) {
             const top = th.call_frames.getConstPtr(th.call_frames.len() - 1);
             // The base frame is never discarded; its region closes below.

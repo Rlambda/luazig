@@ -105,7 +105,7 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
    builtinXpcall; E4-дифференциал). Consumer-less precover-сайтов
    четыре (4-й — direct-resume unroll 29398). Cut-порядок переработан
    (pkresv §6): N+window объединены, каждый cut независимо зелёный.
-   IMPLEMENTED, REVIEW CORRECT pending (milestone Д1, owner-решение;
+   IMPLEMENTED, ACCEPTED after correction (milestone Д1, owner-решение;
    cuts `27624b0` W+N, `996d2ec`
    F1+route, `9274967` GY+P+delete): pcall/xpcall/lua_pcallk/generic
    builtins — один C/YPCALL recovery owner; bytecode fast path
@@ -125,7 +125,15 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
    при `error.Yield`, пока вложенный YPCALL-кадр ещё жив; PUC и baseline
    внешний `xpcall` handler при последующей ошибке не вызывают. Также
    обязательные канонические C API/smoke differential-тесты milestone
-   не добавлены. До correction+гейтов итоговый Д1 не принят.
+   не добавлены. Correction `4d468e0` исправила errfunc-lifetime,
+   добавила suite 37 и smoke 91; nested-репродюсер и основные C API
+   формы независимо совпали с PUC. Correction `e6b58d9` устранила
+   нормализацию хронологии `k` в suite 37: статически линкованный
+   Debug/ReleaseFast differential независимо совпал с PUC, а gate
+   чувствителен к перестановке continuation. **Д1 принят после
+   correction.** testC `edge_a4` классифицирован как валидный,
+   pre-existing Safety-BLOCKER (`f74a1ea`); он остаётся отдельным
+   открытым пунктом `STATUS.md`, а не регрессией Д1.
    REVIEW UPDATE (2026-10-01): Д2 — не существующий общий
    close-workhorse: `continueBytecodeClose` и `closeTbcRegion` имеют
    отдельные циклы/носители; новая bytecode recovery-phase потребует
@@ -148,7 +156,24 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
    `C2,C1,Lua`. Correction `9b1bad7` восстановила глобальный порядок
    через frame-ordered сегменты без расширения split model. Перед полной
    migration нужен inventory всех writers/readers и дизайн одного ordered
-   owner для Lua/C/hook obligations.
+   owner для Lua/C/hook obligations. Валидный `edge_a4` (`f74a1ea`,
+   `STATUS.md`) доказывает C-slot aliasing/crash на recovery; является ли
+   он следствием split representation или отдельной publication/resume
+   ошибки, должен установить следующий research, а не предполагать.
+   RESEARCH UPDATE (tbcres, 2026-10-02, к `f74a1ea`): research выполнен
+   — edge_a4 ≠ split representation. Три независимых корня (stale
+   resume flag / slot identity через staging-копию / yy+error transport
+   в testC-кадрах), ни один не требует миграции к единому owner для
+   исправления; декомпозиция подтверждена /tmp-клоном (сброс флага:
+   rc=0, сюиты IDENTICAL, production-расхождения не изменились).
+   Обоснование варианта B (единый ordered owner) сужено до
+   interleaving + level-семантики (suite 26 FC-10/11 стабильно
+   IDENTICAL на split-модели) — owner-decision, не предпосылка
+   edge_a4-fix. Ось slot identity (staging) выделена в отдельный
+   milestone «staging identity» (C→Lua вызовы стейджат копию на
+   th.top — регистры callee не алиасят слоты окна; pa_min-оракул в
+   /tmp/opencode/tbcres/). Полный inventory writers/readers обеих
+   структур — tbcres_report §3.
 3. **Цепочка C error boundaries — research candidate.** PUC `errorJmp` и
    `luaD_throwbaselevel` могут пройти мимо вложенных protected calls;
    luazig хранит один `c_error_jmp`. Известный риск —

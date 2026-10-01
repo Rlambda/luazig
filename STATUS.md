@@ -65,6 +65,51 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   где PUC нет) и truncation-close без error-объекта (e=nil vs e=boom).
   Нужен отдельный bounded cut по slot-semantic + suspended-flag owner;
   репродюсеры и ltlua_dbg-трасса — `/tmp/opencode/d1cc_report.md` §2.
+  RESEARCH UPDATE (tbcres, 2026-10-02, к `f74a1ea`; отчёт
+  `/tmp/opencode/tbcres_report.md`, raw `/tmp/opencode/tbcres/`;
+  product не менялся): edge_a4 ≠ split TBC representation — три
+  независимых механизма, доказаны динамически. (a) crash: writer
+  vm.zig:52502 (testC pcallk error-arm) → trampoline 16397 finishCcall
+  без сброса (зеркало 28984 отсутствует) → предикат 18523 не проверяет
+  тип top-кадра → resume_in_place на C-кадре; BLOCKER-класс ШИРЕ
+  0-param формы — падает и 1-param контроль с легитимным closer'ом
+  (координатор верифицировал raw: zig panic vs PUC `log cl:boom`).
+  (b) slot identity: C→Lua вызовы стейджат копию на th.top (lua_pcallk
+  дублирует args) — регистры callee не алиасят слоты окна;
+  подтверждено в production C API В ОБЕ СТОРОНЫ (error-path и
+  normal-path: pa_min). (c) yy/err transport: testC-кадры исключены из
+  level-скана precover (15621, snapshot-only) + finishpcallk закрывает
+  pre-pcallk arg-marks через CLOSEKTOP-truncation (e=nil, yy=0) вместо
+  PUC luaF_close(func, status, yy=1). Candidate-fix (сброс bips на
+  16397) верифицирован в /tmp-клоне: rc=0 во всех формах, сюиты
+  22/24/25/26/37 IDENTICAL, smoke-91 byte-identical; production-
+  расхождения не изменились — декомпозиция подтверждена. Рекомендация:
+  bounded cut-серия A1 (crash: сброс флага + предикат top-кадра) →
+  A2 (P-1, см. отдельный пункт) → A3 (testC region/yy) → C-S3-fix.
+  Вариант B (единый ordered TBC owner) НЕ требуется для edge_a4 —
+  остаётся долгом с уточнённым обоснованием (interleaving +
+  level-семантика), owner-decision; ось (b) staging identity —
+  отдельный milestone (шире bounded).
+
+- [ ] **P-1 (production BLOCKER, найден tbcres 2026-10-02): C-closure,
+  resumed напрямую как тело корутины, + ошибка → ветка 29788-29817 не
+  вызывает precover — recovery/k/TBC-close потеряны, поток dead.** PUC
+  восстанавливается полностью (closer + k status=2 с исходным объектом);
+  zig печатает только PA-строку и умирает (координатор верифицировал
+  raw_prod_diff). Suite 37 этот путь НЕ покрывает; production C API
+  (lua_resume C-closure-body). FIX-NOW-кандидат в cut A2; репродюсеры
+  prod_oracle.c + pa_min в `/tmp/opencode/tbcres/`.
+
+- [ ] **suite 23 C-S3/C-S4 red (`metamethod 'close' is nil`) —
+  dead-thread error-publication затирает помеченный слот (tbcres,
+  2026-10-02; FIX-NOW-кандидат cut C-S3-fix).** Probe: fs(slot=6)
+  возвращает String (объект ошибки записан в TBC-слот) вместо
+  функции-closer. Ранее краснота 23 классифицировалась «pre-existing»
+  без корня; tbcres связал её с error-publication порядком. 14
+  (count-hook window assert) — независимый t2/hook-window класс;
+  big.lua — идентичный отказ обоих движков (harness). F2: подтверждено,
+  глотает ошибку только apiSettop call-site (семантика close верна) —
+  сужение существующего пункта F2, не новый корень.
 
 - [x] **precover region-close: yielding closer протаскивает nil error
   object сквозь `coroutine.resume`, VM после этого непригодна (BLOCKER,
@@ -172,7 +217,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   smoke-91 побайтово совпал с PUC 5.5 в Debug, C API suite 37 — в
   Debug и ReleaseFast.
 
-- [ ] **Д1 canonical differential gate неполон: suite 37 откладывает
+- [x] **Д1 canonical differential gate неполон: suite 37 откладывает
   события `k` до конца кейса (BLOCKER, FIX-NOW, ревью `4d468e0`).**
   `37_pcallk_recovery.c` пишет continuation и post-pcallk события в
   `klog`, а вызывает `klog_flush` только ПОСЛЕ `resume1/resume2`,
@@ -183,8 +228,13 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   deferred-печать на единый хронологический event-log/немедленный
   вывод, сохранив byte-identical PUC. Это дефект обязательного gate,
   а не доказанный product-баг.
+  CLOSED (`e6b58d9`): `klog` и отложенный Lua `LOG` удалены; все
+  события печатаются в момент исполнения в одном потоке. Независимый
+  статически линкованный differential suite 37 побайтово совпал с
+  PUC 5.5 в Debug и ReleaseFast. Chronology-mutation сделала новый
+  gate RED (отчёт d1cc).
 
-- [ ] **testC C/YPCALL `edge_a4`: yielding closer на восстановлении
+- [x] **testC C/YPCALL `edge_a4`: yielding closer на восстановлении
   приводит к panic/segfault (MEDIUM, UNCONFIRMED validity, ревью `4d468e0`).**
   `/tmp/opencode/edge_a4.lua`: PUC 5.5+ltests завершает `ERRRUN` без
   crash; luazig `--testc` на `4d468e0` падает в Debug
@@ -197,6 +247,9 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   помеченный слот и первую ошибочную операцию в обоих движках.
   При валидной форме crash становится Safety-BLOCKER; при нарушении
   API-предусловия — документировать и не использовать как parity gate.
+  CLASSIFIED (`f74a1ea`): форма валидна и не требует yielding closer;
+  crash существует до Д1. Открытый Safety-BLOCKER с first-wrong-op и
+  остаточными слоями parity записан отдельным пунктом в начале списка.
 
 - [ ] **ORDINARY-BACKLOG (research pkres): «block too big» — PUC ERRRUN
   vs zig ERRMEM.** Побочный finding f9b-оракула; отдельный

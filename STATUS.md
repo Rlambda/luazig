@@ -45,6 +45,27 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
+- [ ] **edge_a4: stale `bytecode_inplace_suspended` на trampoline-пути —
+  Debug panic / RF segfault на ВАЛИДНОЙ pcallk+toclose форме
+  (Safety-BLOCKER, pre-existing; классификация d1cc, 2026-10-02, к
+  `e6b58d9`).** Форма (edge_a4.lua): testC `toclose 6` + `pcallk 1 0 4`
+  при фактических stack effects — ВАЛИДНА (lua_toclose запрещает только
+  removal слота; помеченный слот аргументом pcallk легален). PUC+ltests:
+  tbc-entry привязывает СЛОТ — 0-param callee перезаписывает его
+  регистром error, recovery закрывает функцию без __close, вложенная
+  ошибка, второй recover-проход, k(2), contRan rc=0. zig: Debug panic /
+  RF segfault через finishpcallk → truncateToPcallkFuncidx →
+  cWindowSetCount → closeTbcRegion. ПРЕ-СУЩЕСТВУЮЩИЙ (воспроизведён на
+  immutable `60a9ee9` и `d109a31` — НЕ Д1-регрессия). First-wrong-op:
+  stale `bytecode_inplace_suspended` (vm.zig:16397; зеркало очистки
+  28984 отсутствует) → nested `__close`-run уходит в resume_in_place на
+  C-frame → dispatch мусорного proto; пустой closer тоже падает.
+  Candidate-fix (1 строка, очистка флага) проверен и ОТКАЧЕН: crash
+  уходит, но parity НЕ достигается — slot-aliasing (zig зовёт closer,
+  где PUC нет) и truncation-close без error-объекта (e=nil vs e=boom).
+  Нужен отдельный bounded cut по slot-semantic + suspended-flag owner;
+  репродюсеры и ltlua_dbg-трасса — `/tmp/opencode/d1cc_report.md` §2.
+
 - [x] **precover region-close: yielding closer протаскивает nil error
   object сквозь `coroutine.resume`, VM после этого непригодна (BLOCKER,
   FIX-NOW-кандидат; research pkres, 2026-10-01, к `60a9ee9`).** Форма N:
@@ -133,7 +154,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   как PUC 5.5 в тех же режимах (n/dgc/gy/gyno/p/o). Отдельный cut
   resume-машины по этому evidence не нужен.
 
-- [ ] **Д1 REGRESSION: внутренний `pcall` после yield пропускает ошибку
+- [x] **Д1 REGRESSION: внутренний `pcall` после yield пропускает ошибку
   через внешний `xpcall` handler (BLOCKER, FIX-NOW, ревью `d109a31`).**
   Форма `/tmp/opencode/review_d1_nested.lua`: `xpcall` оборачивает
   `pcall(function() coroutine.yield('pause'); error('inner', 0) end)`.
@@ -146,6 +167,36 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   `ERRFUNC_NONE` до `finishpcallk`/нормального завершения (PUC
   `lua_pcallk`, lapi.c:1097–1112). Исправить в том же C/YPCALL owner,
   включая terminal cleanup и nested yield/error контроль.
+  CLOSED (`4d468e0`): все три yield-exit arm удерживают внутренний
+  errfunc до завершения YPCALL; независимый запуск репродюсера и
+  smoke-91 побайтово совпал с PUC 5.5 в Debug, C API suite 37 — в
+  Debug и ReleaseFast.
+
+- [ ] **Д1 canonical differential gate неполон: suite 37 откладывает
+  события `k` до конца кейса (BLOCKER, FIX-NOW, ревью `4d468e0`).**
+  `37_pcallk_recovery.c` пишет continuation и post-pcallk события в
+  `klog`, а вызывает `klog_flush` только ПОСЛЕ `resume1/resume2`,
+  `print_log` и `lua_closethread`. Так сравнение побайтово одинаково
+  даже при перестановке вызова `k` относительно `lua_resume` —
+  наблюдаемой части контракта, которую предыдущий prompt запрещал
+  нормализовать. `setvbuf(stdout, _IONBF)` уже есть; заменить
+  deferred-печать на единый хронологический event-log/немедленный
+  вывод, сохранив byte-identical PUC. Это дефект обязательного gate,
+  а не доказанный product-баг.
+
+- [ ] **testC C/YPCALL `edge_a4`: yielding closer на восстановлении
+  приводит к panic/segfault (MEDIUM, UNCONFIRMED validity, ревью `4d468e0`).**
+  `/tmp/opencode/edge_a4.lua`: PUC 5.5+ltests завершает `ERRRUN` без
+  crash; luazig `--testc` на `4d468e0` падает в Debug
+  `runBytecodeDispatch:unreachable` через `finishpcallk →
+  truncateToPcallkFuncidx → cWindowSetCount → closeTbcRegion`, в
+  ReleaseFast — exit 139. То же есть на immutable product baseline
+  `60a9ee9`, поэтому происхождение pre-existing. Следующий решающий
+  эксперимент: доказать допустимость пометки `toclose 6` перед
+  `pcallk 1 0 4` по PUC C API/testC stack contract, затем сравнить
+  помеченный слот и первую ошибочную операцию в обоих движках.
+  При валидной форме crash становится Safety-BLOCKER; при нарушении
+  API-предусловия — документировать и не использовать как parity gate.
 
 - [ ] **ORDINARY-BACKLOG (research pkres): «block too big» — PUC ERRRUN
   vs zig ERRMEM.** Побочный finding f9b-оракула; отдельный

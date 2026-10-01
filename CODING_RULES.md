@@ -45,9 +45,6 @@
 // The base frame remains the thread's stable API anchor across an unwind.
 ```
 
-## Язык комментариев и коммитов
-
-- Используй английский язык для комментирования кодов и сообщений git commit
 
 ## Tests и диагностика
 

@@ -125,14 +125,27 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   PUC-идентичен (k window [prefix(60), fret, r2], identity=1;
   координатор лично); Mut-W load-bearing (7 форм a1=nil).
 
-- [ ] **k-ordering residual: side-effects C-клиентского `k` печатаются
-  ПОСЛЕ возврата `coroutine.resume`, PUC — ДО (MEDIUM, Д1 residual;
-  prf1 §7).** Наблюдается во всех f9b-режимах с CONT-строками (n/dgc/
-  o/gy/gyno/p): контент строк PUC-идентичен, порядок — нет (CONT после
-  N_r2/DGC_r2 вместо до). First-wrong-op — resume-машина (unwind/
-  continuation ordering), НЕ recovery-owner (Д1 закрыт). Отдельный
-  bounded cut по resume-порядку; до него все recovery-формы зелёные по
-  содержанию.
+- [x] **Предположение о k-ordering residual ОПРОВЕРГНУТО ревью Д1.**
+  Разный порядок строк в сохранённом выводе f9b вызван смешением
+  буферизованного C `printf` и Lua `print`, а не порядком исполнения.
+  Независимый запуск финальной Debug- и ReleaseFast-библиотеки со
+  `stdbuf -o0` показывает `CONT` ДО `N_r2`/`DGC_r2`/`GY_r2`, побайтово
+  как PUC 5.5 в тех же режимах (n/dgc/gy/gyno/p/o). Отдельный cut
+  resume-машины по этому evidence не нужен.
+
+- [ ] **Д1 REGRESSION: внутренний `pcall` после yield пропускает ошибку
+  через внешний `xpcall` handler (BLOCKER, FIX-NOW, ревью `d109a31`).**
+  Форма `/tmp/opencode/review_d1_nested.lua`: `xpcall` оборачивает
+  `pcall(function() coroutine.yield('pause'); error('inner', 0) end)`.
+  PUC 5.5 и immutable product baseline `60a9ee9`: второй resume
+  возвращает `true, true, false, inner`, внешний handler не вызывается;
+  финальный Д1 Debug и ReleaseFast: `true, true, false, H:inner`, handler
+  вызван. Первая неверная операция: `builtinPcall` выходит с
+  `error.Yield`, но `defer if (!deferred)` восстанавливает сохранённый
+  `Thread.errfunc`; YPCALL-кадр ещё жив и должен удерживать своё
+  `ERRFUNC_NONE` до `finishpcallk`/нормального завершения (PUC
+  `lua_pcallk`, lapi.c:1097–1112). Исправить в том же C/YPCALL owner,
+  включая terminal cleanup и nested yield/error контроль.
 
 - [ ] **ORDINARY-BACKLOG (research pkres): «block too big» — PUC ERRRUN
   vs zig ERRMEM.** Побочный finding f9b-оракула; отдельный
@@ -2221,9 +2234,10 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   оракулах (f9b A-N/full, f1d S1-S5, E1-E4, tbcesc_16118;
   координатор верифицировал лично). Единственный остаточный diff —
   известный pre-existing where-attribution текст-класс
-  ("(upvalue 'T')", backlog F4n17/F8n17) и k-ordering residual
-  (отдельный пункт выше). Perf: pcall_ok/xpcall_ok −16% (цена
-  удаления fast path), xpcall_yield +14-16% (кандидат на упрощение
+  ("(upvalue 'T')", backlog F4n17/F8n17); предположение о k-ordering
+  опровергнуто ревью (см. пункт выше). Perf: pcall_ok/xpcall_ok
+  −16% времени и −14–15% инструкций (ускорение после удаления fast path),
+  xpcall_yield +14-16% (кандидат на упрощение
   внутри модели), GY/P neutral; скорость не gate. Отчёты:
   /tmp/opencode/{prw1,prf1,prfin}_report.md.
 

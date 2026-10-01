@@ -6634,6 +6634,28 @@ pub const Vm = struct {
         }
     }
 
+    /// Frame-window capacity with the PUC `luaD_growstack` overflow contract:
+    /// a successful return guarantees the range [0, needed) exists.
+    /// `ensureBcStackCap` alone clamps growth at MAXSTACK and still returns
+    /// success without covering an oversized request (pushBytecodeExecFrame
+    /// pre-checks overflow itself and owns the ERRORSTACKSIZE machinery);
+    /// every caller that derives a register window from `needed` must use
+    /// this form so an oversized window raises the PUC "stack overflow"
+    /// error instead of slicing past the arrays.
+    fn ensureBcWindowOrOverflow(self: *Vm, th: *Thread, needed: usize) DispatchError!void {
+        try self.ensureBcStackCap(th, needed);
+        if (needed > th.stack.len) {
+            @branchHint(.cold);
+            // growBcStackCapSlow clamped the growth at MAXSTACK: the request
+            // is past LUAI_MAXSTACK. A thread already running on the
+            // ERRORSTACKSIZE headroom (a message handler) is in
+            // luaD_errerr territory; otherwise grow to the physical limit so
+            // the handler can run, then raise "stack overflow".
+            if (th.stack.len > 1_000_000) return self.raiseErrerr();
+            return self.raiseFrameOverflow(th);
+        }
+    }
+
     fn growBcStackCapSlow(self: *Vm, th: *Thread, needed: usize) DispatchError!void {
         const old_len = th.stack.len;
         // PUC luaD_growstack: newsize = size + size/2 (1.5x growth),
@@ -6826,6 +6848,14 @@ pub const Vm = struct {
         }
     }
 
+    /// Contract: on return (success or error) the relationship between
+    /// `base`, `cap.*` and the stack is never partially advanced — the
+    /// reserve runs first, every mutation after it is infallible. The
+    /// no-growth entry re-derives `regs` for the CURRENT base and relies
+    /// on the caller's proof that `base + cap.*` already fits the stack
+    /// (a caller that switched base since the cap was established must
+    /// reserve the new range itself — a numerically unchanged cap proves
+    /// nothing about a different base).
     fn bcGrowFrame(
         self: *Vm,
         th: *Thread,
@@ -6836,9 +6866,10 @@ pub const Vm = struct {
     ) DispatchError!void {
         const old_cap = cap.*;
         if (needed_local > cap.*) {
-            cap.* = @intCast(needed_local);
-            try self.ensureBcStackCap(th, base + cap.*);
-            th.top = @max(th.top, base + cap.*);
+            const needed: usize = needed_local;
+            try self.ensureBcWindowOrOverflow(th, base + needed);
+            cap.* = @intCast(needed);
+            th.top = @max(th.top, base + needed);
         }
 
         // A nested call can grow and reallocate the shared bytecode stack even
@@ -22485,12 +22516,19 @@ pub const Vm = struct {
         if (nresults >= 0) {
             const nr: usize = @intCast(nresults);
             try self.growCtxFrame(ctx, a + nr);
+            // The growth above may have reallocated the value stack — the
+            // captured va_slice views the freed buffer. Re-derive it before
+            // copying (the named-table arm reads a heap Table and is stable).
+            const va_fresh: []Value = self.frameVarargs(
+                ctx.exec_frames.getPtr(ctx.frame_index),
+                null,
+            );
             const ncopy2 = @min(nr, source_len);
             for (0..ncopy2) |i| {
                 ctx.regs[a + i] = if (named_varargs) |src|
                     self.tableGetRawValue(src.table, .{ .Int = @intCast(i + 1) })
                 else
-                    va_slice[i];
+                    va_fresh[i];
             }
             for (ncopy2..nr) |i| ctx.regs[a + i] = .Nil;
             // Keep-live raise (@max): fixed-count vararg results must
@@ -22499,11 +22537,17 @@ pub const Vm = struct {
         } else {
             // All varargs — grow frame, then copy.
             try self.growCtxFrame(ctx, a + source_len);
+            // Same as above: re-derive the hidden-args slice after the
+            // growth's potential stack reallocation.
+            const va_fresh: []Value = self.frameVarargs(
+                ctx.exec_frames.getPtr(ctx.frame_index),
+                null,
+            );
             for (0..source_len) |i| {
                 ctx.regs[a + i] = if (named_varargs) |src|
                     self.tableGetRawValue(src.table, .{ .Int = @intCast(i + 1) })
                 else
-                    va_slice[i];
+                    va_fresh[i];
             }
             // Multret producer publication (PUC OP_VARARG: L->top = ra + n):
             // the occupied bound OVERWRITES the window so the following
@@ -23509,18 +23553,12 @@ pub const Vm = struct {
                 // OOM (`catch {}`).
                 self.closeBoxedUpvaluesReserved(ctx.th.boxed[ctx.base .. ctx.base + ctx.cap]);
 
-                // 2. Grow frame if needed.
+                // 2. Compute the callee's activation layout (plain reads).
+                // PUC luaD_pretailcall LUA_VLCL: checkstackp covers the NEW
+                // frame's extent BEFORE the func+args move, then
+                // ci->top = func + 1 + fsize — the REUSED frame's window is
+                // the callee's, never the max of both frames' extents.
                 const new_max = new_proto.maxstacksize;
-                const new_cap: usize = new_max;
-                try self.growCtxFrame(ctx, new_cap);
-
-                // 3. PUC-faithful tail-call: reuse frame, re-setup varargs.
-                //    Step 1: copy func+args from R[A..] down to the original
-                //    func_slot (the ORIGINAL position, before any previous
-                //    buildhiddenargs shift). This prevents cumulative shifting
-                //    across repeated tail calls.
-                //    Step 2: if new proto is VAHID, buildhiddenargs shifts
-                //    func+params UP past the extra args.
                 const np = new_proto.numparams;
                 const new_nextra: usize = if (new_proto.flags.is_vararg and effective_nargs > np)
                     effective_nargs - np
@@ -23532,10 +23570,38 @@ pub const Vm = struct {
                 // Reset to the original (unshifted) func_slot.
                 const reset_slot = ctx.exec_frames.getPtr(ctx.frame_index).originalFuncSlot();
                 const reset_base = reset_slot + 1;
-                try self.ensureBcStackCap(ctx.th, reset_base + @max(new_cap, effective_nargs + 1));
+                var new_func_slot = reset_slot;
+                var new_base = reset_base;
+                if (new_is_vahid) {
+                    new_func_slot = reset_slot + effective_nargs + 1;
+                    new_base = new_func_slot + 1;
+                }
+                // Registers need maxstacksize plus the per-frame multret
+                // margin every pushed frame carries. A VATAB callee's raw
+                // extra args stay INSIDE the window at [numparams ..
+                // numparams+nextra) until OP_VARARGPREP folds them into the
+                // vararg table, and GC marks stack[0..top] with the window
+                // checker bounding top by windowTop — so the window itself
+                // must cover them. A VAHID callee's extras sit below the
+                // new func slot instead and need no window room.
+                const extras_end: usize = if (new_is_vahid) 0 else np + new_nextra;
+                const frame_cap_new: u32 = @intCast(@max(new_max + EXTRA_MARGIN, extras_end));
 
-                // Copy func + args from regs[a..a+1+effective_nargs] down to
-                // [reset_slot..reset_slot+1+effective_nargs].
+                // 3. Reserve every range the activation writes BEFORE any
+                // write: the down-copied func+args region
+                // [reset_slot .. reset_base + effective_nargs) and the new
+                // window [new_base .. new_base + frame_cap_new). From here
+                // to the window commit below the activation is infallible;
+                // a failure above leaves the caller's frame untouched.
+                try self.ensureBcWindowOrOverflow(
+                    ctx.th,
+                    @max(reset_base + effective_nargs + 1, new_base + frame_cap_new),
+                );
+
+                // 4. Copy func + args from regs[a..a+1+effective_nargs] down
+                // to [reset_slot..reset_slot+1+effective_nargs] (the ORIGINAL
+                // position, before any previous buildhiddenargs shift —
+                // prevents cumulative shifting across repeated tail calls).
                 const total_move = effective_nargs + 1;
                 std.mem.copyForwards(
                     Value,
@@ -23548,53 +23614,48 @@ pub const Vm = struct {
                     ctx.th.stack[reset_slot + 1 + i] = .Nil;
                 }
 
-                // VAHID buildhiddenargs: shift func+params up past extra args.
-                var new_func_slot = reset_slot;
-                var new_base = new_func_slot + 1;
+                // 5. VAHID buildhiddenargs: shift func+params up past the
+                // extra args. Infallible — the ranges were reserved above;
+                // PUC buildhiddenargs (ltm.c:255) writes each shifted value
+                // AT top with top++, so publish the shifted region's end as
+                // it is built.
                 if (new_is_vahid) {
-                    new_func_slot = reset_slot + effective_nargs + 1;
-                    new_base = new_func_slot + 1;
-                    try self.ensureBcStackCap(ctx.th, new_base + new_cap);
                     ctx.th.stack[new_func_slot] = ctx.th.stack[reset_slot];
                     for (0..np) |i| {
                         ctx.th.stack[new_base + i] = ctx.th.stack[reset_slot + 1 + i];
                         ctx.th.stack[reset_slot + 1 + i] = .Nil;
                     }
-                    // PUC buildhiddenargs (ltm.c:255): the bound follows the
-                    // shifted writes (each value written AT top with top++),
-                    // ending at new_base + nparams. The shifted func+params
-                    // sit ABOVE the caller-side bound (top still reflects
-                    // the pre-shift operand end), so publish the shifted
-                    // region's end BEFORE the frame growth below — its
-                    // allocation failure runs an emergency collection that
-                    // would otherwise sweep the just-shifted values.
                     if (ctx.th.top < new_base + np) ctx.th.top = new_base + np;
                 }
 
-                // Grow frame to new proto's register needs.
-                try self.bcGrowFrame(ctx.th, new_base, new_cap, &ctx.cap, &ctx.regs); // published below after base switch
+                // 6. Commit the reused frame's new window (infallible):
+                // cap is the callee's exact extent, top and the register
+                // slice follow it.
+                ctx.cap = frame_cap_new;
                 ctx.base = new_base;
-                // P15.51l: func_slot is a rare field, written to CallFrame below.
-                ctx.th.top = new_base + ctx.cap;
-
-                // Re-derive register slices after potential base change.
+                ctx.th.top = new_base + frame_cap_new;
                 ctx.regs = ctx.th.stack[ctx.base .. ctx.base + ctx.cap];
 
                 // P15.51l: nextraargs is a rare field, write to CallFrame.
                 const new_nextra_u16: u16 = @intCast(new_nextra);
                 ctx.exec_frames.getPtr(ctx.frame_index).u.lua.nextraargs = new_nextra_u16;
-                // Publish the grown window as the unified limit (= cap + 1).
-                ctx.exec_frames.getPtr(ctx.frame_index).limit = ctx.cap + 1;
+                // Publish the window as the unified limit (= cap + 1).
+                ctx.exec_frames.getPtr(ctx.frame_index).limit = frame_cap_new + 1;
 
-                // Nil-fill remaining registers.
-                for (ctx.regs[np..new_max]) |*r| r.* = .Nil;
+                // 7. Nil-fill the dead register file, preserving the live
+                // region: a VATAB callee's raw extras at [numparams ..
+                // numparams+nextra) are arguments in flight, not dead
+                // registers.
+                const live_end: usize = if (new_is_vahid) np else np + new_nextra;
+                const fill_from = @min(live_end, new_max);
+                for (ctx.regs[fill_from..new_max]) |*r| r.* = .Nil;
                 for (ctx.th.boxed[new_base .. new_base + new_max]) |*bc_slot| bc_slot.* = null;
 
-                // 6. Update frame state.
+                // 8. Update frame state.
                 ctx.cur_proto = new_proto;
                 ctx.cur_upvalues = cl.upvalues;
 
-                // 7. Update Frame struct on exec_frames.
+                // 9. Update Frame struct on exec_frames.
                 const fr2 = ctx.exec_frames.getPtr(ctx.exec_frames.len() - 1);
                 fr2.u.lua.proto = new_proto;
                 // P15.51n: upvalues derived from stack[func_slot], not stored in frame.
@@ -23609,7 +23670,7 @@ pub const Vm = struct {
                 fr2.setTailCall();
                 fr2.u.lua.nextraargs = new_nextra_u16;
 
-                // 8. Reset dispatch state. pc=0; skip dispatcher's pc+=1.
+                // 10. Reset dispatch state. pc=0; skip dispatcher's pc+=1.
                 // No reg_top init write: B==0 readers are
                 // top-derived; the debug temp bound is structural (see
                 // debugTempScanTop).

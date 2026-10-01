@@ -605,8 +605,12 @@ pub export fn lua_callk(
         @ptrCast(@alignCast(kf))
     else
         null;
+    // The callee's window-relative slot (PUC lua_callk: the callee sits at
+    // L->top - (nargs+1); funcidx for the resume-side completion
+    // publication — see luaCallKShared).
+    const fn_idx = func_slot - Vm.cWindowBase(wth);
 
-    const ret = vm.luaCallKShared(th, callee, call_args, kfn, ctx) catch |err| {
+    const ret = vm.luaCallKShared(th, callee, call_args, nresults, fn_idx, kfn, ctx) catch |err| {
         vm.alloc.free(call_args);
         switch (err) {
             error.Yield => {
@@ -2587,7 +2591,7 @@ pub export fn lua_pcallk(
     const kfn: *const fn (?*vm_mod.lua_State, c_int, isize) callconv(.c) c_int =
         @ptrCast(@alignCast(k.?));
 
-    const ret = vm.luaPcallKShared(th, callee, call_args, errfunc_val, fn_idx, kfn, ctx) catch |err| {
+    const ret = vm.luaPcallKShared(th, callee, call_args, errfunc_val, fn_idx, nresults, kfn, ctx) catch |err| {
         vm.alloc.free(call_args);
         switch (err) {
             error.Yield => {

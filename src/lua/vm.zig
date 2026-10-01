@@ -1900,10 +1900,19 @@ pub const CallFrame = extern struct {
     /// (`th.top - frameBase()`). Invariant: `limit == frame_cap_old + 1`
     /// (the +1 is the callee slot below base), so frameCap() = limit - 1
     /// and windowTop() = frameBase() + frameCap(). Checked conversion at
-    /// growth paths: cap ≤ ~1M so `cap + 1` never overflows u32. Valid
-    /// only for Lua frames (CIST_C clear); C frames keep the default 0 —
-    /// their stack extent is the staged callee slot (func_slot + 1,
-    /// restored via frameBase()) and no C path reads limit.
+    /// growth paths: cap ≤ ~1M so `cap + 1` never overflows u32.
+    /// For Lua frames (CIST_C clear) this is the register-window extent.
+    /// For staged C frames (CIST_C set, not base/view) it is the PERSISTED
+    /// PUBLISHED WINDOW END: `func_slot + limit` is the stack top the
+    /// frame's own pushes reached before the latest staging above it
+    /// (PUC invariant: L->top is never lowered below a running C
+    /// function's window — the frame's values survive every nested
+    /// call's poscall). Written by the staging sites that push above a
+    /// staged C frame (pushBuiltinCFrame / pushStagedBytecodeExecFrame —
+    /// both stage at the pre-push top, which IS the below C frame's
+    /// window end); initBuiltinCFrame seeds it with 1 (the bare
+    /// [func_slot, func_slot+1) window). Base and view frames never read
+    /// it (their restore arithmetic is frameBase()/below.windowTop()).
     limit: u32 = 0,
     // P15.51i: is_debug_hook moved to CIST_HOOKED bit in callstatus.
     // P15.51i: hide_from_debug moved to CIST_HIDE bit in callstatus.
@@ -7676,6 +7685,8 @@ pub const Vm = struct {
         th: *Thread,
         callee: Value,
         args: []const Value,
+        nresults: i32,
+        funcidx: usize,
         k: ?*const fn (?*lua_State, c_int, isize) callconv(.c) c_int,
         ctx: isize,
     ) Error![]Value {
@@ -7685,6 +7696,11 @@ pub const Vm = struct {
         // frame state is saved — a violation must not leave k/ctx
         // half-installed.
         try self.apiCheckHookContinuationInvariant(th, k != null, false, 0);
+        // PUC checkresults (lapi.c:1029-1035): LUA_MULTRET <= nresults <=
+        // MAXRESULTS — the packed CIST_NRESULTS bits must not silently
+        // wrap on the resume-side decode.
+        if (nresults != -1 and nresults > MAXRESULTS)
+            return self.failRunerror("invalid number of results", .{});
         // PUC lapi.c:1047-1053: if k != NULL and yieldable, save k/ctx on
         // L->ci (the current top C-frame); else callnoyield (incnny).
         if (k) |kf| {
@@ -7694,6 +7710,23 @@ pub const Vm = struct {
                     if (fr.isC()) {
                         fr.u.c.k = kf;
                         fr.u.c.ctx = ctx;
+                        // Persist the completion-publication anchor for a
+                        // suspended callk client (PUC: the callee's ci gets
+                        // nresults packed by luaD_call, and its func slot —
+                        // where the client staged the callee — is where
+                        // poscall moves the results on resume; funcidx is
+                        // that slot, window-relative like pcallk's). The
+                        // aux union slot is free here: the frame cannot be
+                        // YPCALL at callk entry (a pcallk either completed
+                        // — flag cleared — or the frame is suspended
+                        // inside it, not running a new callk), and CLSRET
+                        // only engages during the frame's own return
+                        // close, after k has returned.
+                        fr.u.c.aux.pcallk = .{
+                            .funcidx = @intCast(funcidx),
+                            .chain_base = @intCast(th.c_tbc_chain.items.len),
+                        };
+                        fr.callstatus = (fr.callstatus & ~CIST_NRESULTS) | encodeNresults(nresults);
                     }
                 }
             }
@@ -7731,6 +7764,7 @@ pub const Vm = struct {
         args: []const Value,
         errfunc_val: ?Value,
         funcidx: usize,
+        nresults: i32,
         k: *const fn (?*lua_State, c_int, isize) callconv(.c) c_int,
         ctx: isize,
     ) Error![]Value {
@@ -7739,6 +7773,12 @@ pub const Vm = struct {
         // before any state is saved. Checked before reading/writing the
         // C-frame so a violation leaves no k/ctx/funcidx/errfunc residue.
         try self.apiCheckHookContinuationInvariant(th, true, false, 0);
+        // PUC checkresults (lapi.c:1029-1035): LUA_MULTRET <= nresults <=
+        // MAXRESULTS. The resume-side poscall decodes nresults from the
+        // callstatus low bits, so an out-of-range value would silently
+        // wrap (e.g. 255 decodes as MULTRET) — reject loudly instead.
+        if (nresults != -1 and nresults > MAXRESULTS)
+            return self.failRunerror("invalid number of results", .{});
         if (th.call_frames.len() == 0) return error.RuntimeError;
         const fr = th.call_frames.getPtr(th.call_frames.len() - 1);
         if (!fr.isC()) return error.RuntimeError;
@@ -7755,6 +7795,11 @@ pub const Vm = struct {
             .funcidx = @intCast(funcidx),
             .chain_base = @intCast(th.c_tbc_chain.items.len),
         };
+        // PUC prepCallInfo packs the caller's nresults into the callee's
+        // ci (CIST_NRESULTS bits); the resume-side completion publication
+        // (publishCompletionToClientWindow) decodes it — the same packing
+        // PUC's poscall reads via get_nresults.
+        fr.callstatus = (fr.callstatus & ~CIST_NRESULTS) | encodeNresults(nresults);
         fr.u.c.old_errfunc = th.errfunc;
         if (errfunc_val) |ef| {
             self.setErrfuncValue(ef);
@@ -9374,6 +9419,21 @@ pub const Vm = struct {
             @memset(th.boxed[func_slot..], null);
             grew = true;
         }
+        // Persist the below frame's published window end: this staging
+        // slot (the pre-push top) IS the below staged C-frame's window
+        // end (PUC: L->top is never lowered below a running C function's
+        // window — precall stages callees at L->top). Lua callers are
+        // covered by windowTop on restore; base (unbounded sentinel
+        // window) and view (no own slots) frames keep their own restore
+        // arithmetic. Infallible and rollback-safe: on a later OOM
+        // rollback of this push the written extent equals the unchanged
+        // pre-push top, i.e. the then-current truth.
+        if (th.call_frames.len() > 0) {
+            const below = th.call_frames.getPtr(th.call_frames.len() - 1);
+            if (below.isC() and !below.isBase() and !below.isView() and func_slot > below.func_slot) {
+                below.limit = @intCast(func_slot - below.func_slot);
+            }
+        }
         th.stack[func_slot] = callee;
         th.top = func_slot + 1;
         // addOne may fail with OOM — rollback top on failure.
@@ -9425,13 +9485,19 @@ pub const Vm = struct {
             // on pop, so a C frame's attributed range [tbc_mark, next_mark)
             // is always empty.
             .tbc_mark = th.bytecode_tbc_regs.items.len,
-            // P16.31 Cut 3: snapshot the TBC-chain depth at push — the
+            // Snapshot the TBC-chain depth at push — the
             // frame's REGION base (see the CallFrame field doc). Same
             // rationale as tbc_mark above: the depth is restored on pop
             // by pop-detach (entries above the base are detached, not
             // dropped), so a C frame's region is exactly the entries
             // marked while it (or a frame above it) was live.
             .tbc_chain_base = @intCast(th.c_tbc_chain.items.len),
+            // Published window end seed: the bare window holds just the
+            // callee slot ([func_slot, func_slot+1)). The first staging
+            // above this frame (pushBuiltinCFrame /
+            // pushStagedBytecodeExecFrame) overwrites it with the real
+            // extent; restoreTopAtFrame reads it (see the field doc).
+            .limit = 1,
         };
         // P15.78: Mark this as a C function frame (PUC CIST_C). The frame
         // has no proto (no bytecode), so the CIST_C bit is the explicit
@@ -15478,6 +15544,32 @@ pub const Vm = struct {
     /// (yieldable, with the error) BEFORE the recovery frame's k runs —
     /// same set, same order, same error argument. The frame's OWN entries
     /// close later, at the k-return return_close in `finishCcall`.
+    /// Truncate the window to `funcidx` (window-relative) for
+    /// finishpcallk's error-object placement (PUC luaD_seterrorobj:
+    /// the object goes to the callee's slot with `L->top = func + 1`
+    /// UNCONDITIONALLY). The truncation close may run pre-pcallk marks
+    /// (made below the pcallk chain snapshot — precover's region close
+    /// misses them); a closer error cannot propagate out of
+    /// finishpcallk (its signature returns a status), and the error
+    /// unwind's window-end restore re-raises top past the truncation
+    /// point. PUC lets the closer error escape and the recovery
+    /// re-drives finishpcallk until the region is clear — loop the
+    /// truncation the same way: a RuntimeError means a closer ran and
+    /// errored (its mark popped before the closer ran — progress
+    /// guaranteed; the error object replaced, last-error-wins), so
+    /// retry; anything else (OOM before a closer ran — no progress)
+    /// gives up and leaves top where the failed close put it, matching
+    /// the old swallow behavior.
+    fn truncateToPcallkFuncidx(self: *Vm, th: *Thread, funcidx: usize) void {
+        while (true) {
+            self.cWindowSetCount(th, funcidx) catch |terr| switch (terr) {
+                error.RuntimeError => continue,
+                else => return,
+            };
+            return;
+        }
+    }
+
     fn finishpcallk(self: *Vm, th: *Thread) i32 {
         const th_bc = &th.call_frames;
         const fr = th_bc.getPtr(th_bc.len() - 1);
@@ -15513,7 +15605,7 @@ pub const Vm = struct {
                     // error at the callee's old slot: the continuation shim
                     // sees [prefix..., error] (PUC: L->top = func + 1).
                     const wth = if (fr.u.c.testc_state) |tcs| (tcs.target orelse th) else th;
-                    self.cWindowSetCount(wth, funcidx) catch {};
+                    self.truncateToPcallkFuncidx(wth, funcidx);
                     self.cWindowPush(wth, self.errThread().err_obj) catch {};
                 } else {
                     // Production frame: the window lives on th.stack.
@@ -15523,7 +15615,7 @@ pub const Vm = struct {
                     // marks at/above funcidx were already closed by
                     // precover's region close — the truncation close inside
                     // cWindowSetCount finds nothing (defensive).
-                    self.cWindowSetCount(th, funcidx) catch {};
+                    self.truncateToPcallkFuncidx(th, funcidx);
                     self.cWindowPush(th, self.errThread().err_obj) catch {};
                 }
             }
@@ -16083,8 +16175,15 @@ pub const Vm = struct {
     /// `caller_idx` becomes the top of the frame stack again (the frame
     /// above it was just popped/finished). One arithmetic per frame class:
     ///   - Lua frame:    its window top (frameBase + frame_cap);
-    ///   - staged C frame: func_slot + 1 (the synthetic callee slot the
-    ///     staged push wrote stays on the stack — it IS the frame's top);
+    ///   - base frame:   frameBase (the slot-0 sentinel floor — nothing
+    ///     is ever staged above it through the C-API lanes it anchors);
+    ///   - staged C frame: the PERSISTED published window end
+    ///     (func_slot + limit — see the limit field doc): PUC never
+    ///     lowers L->top below a running C function's window, so the
+    ///     frame's own pushes (prefix values) survive every nested
+    ///     call's poscall; limit holds the extent published by the last
+    ///     staging above this frame (seed 1 = the bare callee-slot
+    ///     window when nothing was ever staged above);
     ///   - view C frame: the below Lua frame's window top — the view frame
     ///     owns no slots; the window it views (the caller's CALL window)
     ///     is its stack extent. View frames always sit directly on the
@@ -16097,7 +16196,8 @@ pub const Vm = struct {
             const below = frames.getConstPtr(caller_idx - 1);
             return below.windowTop();
         }
-        return caller.frameBase();
+        if (caller.isBase()) return caller.frameBase();
+        return caller.func_slot + caller.limit;
     }
 
     /// PUC `luaD_poscall` for C-frames: move n results and pop the C-frame.
@@ -16145,6 +16245,37 @@ pub const Vm = struct {
         } else {
             th.top = 0;
         }
+    }
+
+    /// PUC `luaD_poscall`'s moveresults for a suspended callk/pcallk CLIENT:
+    /// publish the completing callee's results onto the client's window at
+    /// the persisted callee slot, with the client's packed nresults — so
+    /// the continuation k sees the PUC window [prefix..., results...] when
+    /// it runs (PUC: the callee's ci, packed with the client's nresults by
+    /// luaD_call, gets poscall'd on resume; results land at the callee's
+    /// func slot, which is the client's funcidx — the same anchor
+    /// finishpcallk uses for the error object).
+    ///
+    /// Called at every completion boundary where a callee finishes above a
+    /// potentially-suspended client: the Lua-callee completion lanes (the
+    /// resume unroll and the trampoline's post_runclosure) and after every
+    /// poscallCFrame of a completed C callee (the resume-entry lanes — a
+    /// k==null C callee's resume args publish too, exactly PUC resume's
+    /// poscall of nargs). No-op for frames that own no completion
+    /// publication: testc lanes (testcContShim rebuilds its window from
+    /// the inbox and would wipe the publication), CLSRET frames (their
+    /// completion is the close completion, delivered via the inbox), view
+    /// frames (bytecode builtins — never callk/pcallk clients), the base
+    /// frame, and k==null frames (plain yields resume through
+    /// finishCcall's k==null path without a client publication promise).
+    fn publishCompletionToClientWindow(self: *Vm, th: *Thread, results: []const Value) DispatchError!void {
+        const th_bc = &th.call_frames;
+        if (th_bc.len() == 0) return;
+        const fr = th_bc.getPtr(th_bc.len() - 1);
+        if (!fr.isC() or fr.isBase() or fr.isView() or fr.isClsret()) return;
+        if (fr.u.c.k == null or fr.u.c.testc_state != null) return;
+        const dst = fr.frameBase() + fr.u.c.aux.pcallk.funcidx;
+        try self.cWindowMoveResults(th, dst, results, decodeNresults(fr.callstatus));
     }
 
     /// Discard a C-frame WITHOUT calling its continuation (k).
@@ -16292,6 +16423,22 @@ pub const Vm = struct {
                             const fc_result = self.finishCcall(active);
                             if (fc_result) |n| {
                                 try self.poscallCFrame(active, n);
+                                // PUC poscall for the frame below the popped
+                                // C-frame: if it is itself a suspended
+                                // callk/pcallk client, publish the completed
+                                // callee's results (the inbox) onto ITS
+                                // window at the persisted callee slot with
+                                // the client's packed nresults — the
+                                // client's k sees the PUC window
+                                // [prefix..., results...] when it runs.
+                                // Covers k==null C callees (PUC resume
+                                // poscalls the resume args as results) and
+                                // CLSRET completions (the saved results,
+                                // PUC finishCcall's redo-poscall) alike.
+                                {
+                                    const ri = active.resume_inbox.slice() orelse &[_]Value{};
+                                    try self.publishCompletionToClientWindow(active, ri);
+                                }
                                 // After poscall, the C-frame is popped. The frame
                                 // below may be Lua (continue bytecode via
                                 // runClosure) or another C-frame (finishCcall
@@ -16372,12 +16519,31 @@ pub const Vm = struct {
                                     // loop — finishCcall will handle it via
                                     // finishpcallk → k. This mirrors the
                                     // runClosure RuntimeError path below.
-                                    if (try self.precover(active)) {
-                                        continue :drive;
+                                    precover_yield: {
+                                        if (self.precover(active) catch |pe| switch (pe) {
+                                            // A __close metamethod in the
+                                            // recovery region yielded (yy=1):
+                                            // standard suspension — the
+                                            // C-frame stays with CIST_CLSRET
+                                            // (error_escape) and the next
+                                            // resume re-drives the recovery
+                                            // through finishCcall (PUC: the
+                                            // yield longjmps to the resume
+                                            // boundary; the ci chain keeps
+                                            // the closing state).
+                                            error.Yield => {
+                                                step = try self.bytecodeCoroutineYieldStep(active, active == initial);
+                                                have_step = true;
+                                                break :precover_yield;
+                                            },
+                                            else => return pe,
+                                        }) {
+                                            continue :drive;
+                                        }
+                                        // Not recovered: unrecoverable error
+                                        step = .{ .failed = try self.currentRuntimeErrorValue() };
+                                        have_step = true;
                                     }
-                                    // Not recovered: unrecoverable error
-                                    step = .{ .failed = try self.currentRuntimeErrorValue() };
-                                    have_step = true;
                                 },
                                 else => return e,
                             }
@@ -16470,7 +16636,21 @@ pub const Vm = struct {
                                 // save the error status, pop frames above it, and
                                 // continue the drive loop — the C-frame on top will
                                 // be handled by finishCcall → finishpcallk → k.
-                                if (try self.precover(active)) {
+                                if (self.precover(active) catch |pe| switch (pe) {
+                                    // A __close metamethod in the recovery
+                                    // region yielded (yy=1): standard
+                                    // suspension — the C-frame stays with
+                                    // CIST_CLSRET (error_escape) and the next
+                                    // resume re-drives the recovery through
+                                    // finishCcall (PUC: the yield longjmps to
+                                    // the resume boundary; the ci chain keeps
+                                    // the closing state).
+                                    error.Yield => {
+                                        step = try self.bytecodeCoroutineYieldStep(active, active == initial);
+                                        break :retblk null;
+                                    },
+                                    else => return pe,
+                                }) {
                                     // Recovered: continue the drive loop. The
                                     // C-frame with CIST_YPCALL is on top;
                                     // finishCcall will handle it.
@@ -16507,6 +16687,17 @@ pub const Vm = struct {
                                 if (top_fr.isC() and !top_fr.isBase()) {
                                     // Put callee's return values in resume_inbox.
                                     try self.setThreadResumeInbox(active, values);
+                                    // PUC poscall for a suspended callk/pcallk
+                                    // client: also publish the results onto
+                                    // the client's window at the persisted
+                                    // callee slot with the client's packed
+                                    // nresults, so k sees the PUC window
+                                    // [prefix..., results...]. The inbox copy
+                                    // set above roots the values.
+                                    self.publishCompletionToClientWindow(active, values) catch |perr| {
+                                        self.alloc.free(values);
+                                        return perr;
+                                    };
                                     self.alloc.free(values);
 
                                     // P15.78: Clear bytecode_inplace_suspended before
@@ -16559,7 +16750,25 @@ pub const Vm = struct {
                                         error.RuntimeError => {
                                             // PUC precover: find the innermost
                                             // CIST_YPCALL frame for error recovery.
-                                            if (try self.precover(active)) {
+                                            if (self.precover(active) catch |pe| switch (pe) {
+                                                // A __close metamethod in the
+                                                // recovery region yielded
+                                                // (yy=1): standard suspension —
+                                                // the C-frame stays with
+                                                // CIST_CLSRET (error_escape)
+                                                // and the next resume re-drives
+                                                // the recovery through
+                                                // finishCcall (PUC: the yield
+                                                // longjmps to the resume
+                                                // boundary; the ci chain keeps
+                                                // the closing state).
+                                                error.Yield => {
+                                                    step = try self.bytecodeCoroutineYieldStep(active, active == initial);
+                                                    have_step = true;
+                                                    break :post_runclosure;
+                                                },
+                                                else => return pe,
+                                            }) {
                                                 continue :drive;
                                             }
                                             // Not recovered: unrecoverable error
@@ -17881,6 +18090,25 @@ pub const Vm = struct {
         nresults: i32,
         ccmt: u4,
     ) DispatchError!void {
+        // Persist the below frame's published window end: the staged
+        // callee region starts at the old top, which IS the below staged
+        // C-frame's window end (PUC: staging above a running C function
+        // happens at L->top, never inside its window). Every staging
+        // site with a staged C-frame below passes func_slot_in = the
+        // pre-stage top (runBytecodeInternal, __close children,
+        // pending-call metamethods, hooks, the coroutine trampoline);
+        // bytecode-dispatch sites with a Lua frame below pass a register
+        // slot and are covered by windowTop on restore. Base and view
+        // frames keep their own restore arithmetic. Rollback-safe: on a
+        // staging OOM the written extent equals the unchanged pre-stage
+        // top. The `>` guard keeps test-lane stagings at slot 0 above a
+        // base frame (func_slot == below.func_slot == 0) out.
+        if (exec_frames.len() > 0) {
+            const below = exec_frames.getPtr(exec_frames.len() - 1);
+            if (below.isC() and !below.isBase() and !below.isView() and func_slot_in > below.func_slot) {
+                below.limit = @intCast(func_slot_in - below.func_slot);
+            }
+        }
         // P16.29: shared inline fast path first (single source of truth
         // with the dispatch OP_CALL handler). On success the activation is
         // complete; on null fall through to the general body below.
@@ -29036,6 +29264,15 @@ pub const Vm = struct {
                     // clear resume_inbox, destroying the 4th continuation's results).
                     if (top_fr.u.c.k == &testcContShim and top_fr.u.c.testc_state == null) {
                         try self.poscallCFrame(th, 0);
+                        // The stale frame's completion results (already in
+                        // the inbox from the finishCcall that consumed its
+                        // state) publish to its caller's window if that
+                        // caller is a suspended callk/pcallk client — same
+                        // poscall semantics as the normal completion below.
+                        {
+                            const ri = th.resume_inbox.slice() orelse &[_]Value{};
+                            try self.publishCompletionToClientWindow(th, ri);
+                        }
                         continue;
                     }
                     // Clear bytecode_inplace_suspended before calling finishCcall,
@@ -29125,7 +29362,30 @@ pub const Vm = struct {
                             // frames above it, and set up for finishCcall →
                             // finishpcallk → testcContShim with error status.
                             // This mirrors PUC Lua's luaD_throw → precover chain.
-                            if (try self.precover(th)) {
+                            if (self.precover(th) catch |pe| switch (pe) {
+                                // A __close metamethod in the recovery region
+                                // yielded (yy=1): standard suspension — the
+                                // C-frame stays with CIST_CLSRET
+                                // (error_escape) and the next resume re-drives
+                                // the recovery through finishCcall (PUC: the
+                                // yield longjmps to the resume boundary; the
+                                // ci chain keeps the closing state). Same
+                                // suspension shape as the finishCcall
+                                // error.Yield arm above.
+                                error.Yield => {
+                                    yielded = true;
+                                    const ys = th.yieldedValues() orelse &[_]Value{};
+                                    if (ys.len > 0) {
+                                        payload = try self.alloc.alloc(Value, ys.len);
+                                        payload_n = ys.len;
+                                        payload_heap = true;
+                                        for (ys, 0..) |v, i| payload[i] = v;
+                                    }
+                                    th.yielded.deinit(self.alloc);
+                                    break;
+                                },
+                                else => return pe,
+                            }) {
                                 // precover found the CIST_YPCALL C-frame.
                                 // Continue the while loop — the CIST_YPCALL
                                 // C-frame is now on top, and finishCcall will
@@ -29157,6 +29417,20 @@ pub const Vm = struct {
 
                     // finishCcall returned normally. Pop the C-frame.
                     try self.poscallCFrame(th, fc_result);
+                    // PUC poscall for the frame below the popped C-frame
+                    // (the resume-entry completion lane): if it is a
+                    // suspended callk/pcallk client, publish the completed
+                    // callee's results (the inbox) onto ITS window at the
+                    // persisted callee slot with the client's packed
+                    // nresults — the client's k sees the PUC window
+                    // [prefix..., results...] when finishCcall runs it on
+                    // the next loop turn. Covers k==null C callees (PUC
+                    // resume poscalls the resume args) and CLSRET
+                    // completions (the saved results) alike.
+                    {
+                        const ri = th.resume_inbox.slice() orelse &[_]Value{};
+                        try self.publishCompletionToClientWindow(th, ri);
+                    }
                     // bytecode_inplace_suspended will be set explicitly below
                     // (line ~15678) if there are Lua frames to resume. Do NOT
                     // restore the old value — it may be stale.
@@ -29346,7 +29620,23 @@ pub const Vm = struct {
                             // PUC precover: re-enter unroll from the
                             // innermost CIST_YPCALL frame (finishpcallk → k
                             // with the error status).
-                            if (try self.precover(th)) continue :unroll_loop;
+                            if (self.precover(th) catch |pe| switch (pe) {
+                                // A __close metamethod in the recovery region
+                                // yielded (yy=1): standard suspension — the
+                                // C-frame stays with CIST_CLSRET
+                                // (error_escape) and the next resume re-drives
+                                // the recovery through finishCcall (PUC: the
+                                // yield longjmps to the resume boundary; the
+                                // ci chain keeps the closing state). Same
+                                // suspension shape as the finishCcall
+                                // error.Yield arm above (values in th.yielded,
+                                // the common yield tail consumes them).
+                                error.Yield => {
+                                    yielded = true;
+                                    break :unroll_loop;
+                                },
+                                else => return pe,
+                            }) continue :unroll_loop;
                             ok = false;
                             break :unroll_loop;
                         },
@@ -29360,6 +29650,17 @@ pub const Vm = struct {
                         else => return e2,
                     };
                     try self.poscallCFrame(th, fc_result);
+                    // PUC poscall for the frame below the popped C-frame
+                    // (the unroll (B) completion lane): if it is a suspended
+                    // callk/pcallk client, publish the completed callee's
+                    // results (the inbox) onto ITS window at the persisted
+                    // callee slot with the client's packed nresults — the
+                    // client's k sees the PUC window [prefix..., results...]
+                    // when the loop's next finishCcall runs it.
+                    {
+                        const ri = th.resume_inbox.slice() orelse &[_]Value{};
+                        try self.publishCompletionToClientWindow(th, ri);
+                    }
                     continue :unroll_loop;
                 }
 
@@ -29395,7 +29696,22 @@ pub const Vm = struct {
                             !self.isStackOverflowRuntimeError())
                         {
                             forced_close_ok = true;
-                        } else if (try self.precover(th)) {
+                        } else if (self.precover(th) catch |pe| switch (pe) {
+                            // A __close metamethod in the recovery region
+                            // yielded (yy=1): standard suspension — the
+                            // C-frame stays with CIST_CLSRET (error_escape)
+                            // and the next resume re-drives the recovery
+                            // through finishCcall (PUC: the yield longjmps
+                            // to the resume boundary; the ci chain keeps the
+                            // closing state). Same suspension shape as the
+                            // error.Yield arm above (values in th.yielded,
+                            // the common yield tail consumes them).
+                            error.Yield => {
+                                yielded = true;
+                                break :unroll_loop;
+                            },
+                            else => return pe,
+                        }) {
                             // Recovered: the CIST_YPCALL C-frame is on top —
                             // loop back to (B) for finishpcallk → k.
                             continue :unroll_loop;
@@ -29440,6 +29756,17 @@ pub const Vm = struct {
                     // resume_inbox (the testC shim reconstructs its stack
                     // as prefix + resume values) and loop to (B).
                     try self.setThreadResumeInbox(th, ret);
+                    // PUC poscall for a suspended callk/pcallk client: also
+                    // publish the results onto the client's window at the
+                    // persisted callee slot (aux.pcallk.funcidx) with the
+                    // client's packed nresults, so k sees the PUC window
+                    // [prefix..., results...]. The inbox copy set above
+                    // roots the values; publishing from the heap copy is
+                    // safe across the window growth inside.
+                    self.publishCompletionToClientWindow(th, ret) catch |perr| {
+                        self.alloc.free(ret);
+                        return perr;
+                    };
                     self.alloc.free(ret);
                     continue :unroll_loop;
                 }
@@ -50770,7 +51097,7 @@ pub const Vm = struct {
                 // apiCall invocation live in the shared helper — the SAME
                 // implementation c_api lua_callk uses. The branch below only
                 // handles testC payload (continuation state) around it.
-                const ret = self.luaCallKShared(th, callee, call_args, &testcContShim, 0) catch |e| switch (e) {
+                const ret = self.luaCallKShared(th, callee, call_args, nresults, fn_idx, &testcContShim, 0) catch |e| switch (e) {
                     error.Yield => {
                         // C-frame stays; the new continuation state stays
                         // (prev_state, if any, is freed by the running
@@ -52285,7 +52612,7 @@ pub const Vm = struct {
                 // always 0 for testC pcallk (ltests passes errfunc=0), so
                 // errfunc_val = null (th.errfunc := ERRFUNC_NONE for the
                 // duration, exactly PUC's `L->errfunc = func` with func = 0).
-                const ret = self.luaPcallKShared(th, callee, call_args, null, call_idx, &testcContShim, 0) catch |e| switch (e) {
+                const ret = self.luaPcallKShared(th, callee, call_args, null, call_idx, nresults, &testcContShim, 0) catch |e| switch (e) {
                     error.Yield => {
                         th.bytecode_inplace_suspended = true;
                         last_status.* = "YIELD";

@@ -106,7 +106,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   течёт каждая [[ ]]-константа; short-ветка имеет defer buf.deinit) —
   ORDINARY-BACKLOG, отдельный cut; raw /tmp/opencode/a1_test_dbg2.txt.
 
-- [ ] **P-1 (production BLOCKER, найден tbcres 2026-10-02): C-closure,
+- [x] **P-1 (production BLOCKER, найден tbcres 2026-10-02): C-closure,
   resumed напрямую как тело корутины, + ошибка → ветка 29788-29817 не
   вызывает precover — recovery/k/TBC-close потеряны, поток dead.** PUC
   восстанавливается полностью (closer + k status=2 с исходным объектом);
@@ -114,6 +114,24 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   raw_prod_diff). Suite 37 этот путь НЕ покрывает; production C API
   (lua_resume C-closure-body). FIX-NOW-кандидат в cut A2; репродюсеры
   prod_oracle.c + pa_min в `/tmp/opencode/tbcres/`.
+  CLOSED (A2, `e9dd1fa`): first-wrong-op — fresh-body ветка
+  .Closure(proto == null) в builtinCoroutineResume уходила в
+  resumeUncaughtErrorTail при живом YPCALL-кадре (precover пропущен).
+  Fix: единый recovery contract для всех body kinds через существующие
+  precover/finishCcall/poscallCFrame; extraction удалила дублирование
+  .Builtin/.Closure; error kind/object и k status переживают close/
+  повторный error/yield/resume. Постоянный suite
+  38_pcallk_cbody_recovery (9 кейсов, direct C-closure-body,
+  byte-identical PUC D+RF; negative-before через stash-cycle:
+  pre-fix падал BE/YC/CE/KE/OM/NESTK/GR ровно по P-1). Координатор
+  верифицировал лично (38/37/22 IDENTICAL, battery 359/359, smoke
+  91/91, matrix zig_fail=0). Perf: coroutine_yield −0.44%,
+  lua_calls шум. Попутный finding (MEDIUM, ORDINARY-BACKLOG, не
+  маскирован): general C-raise error-window gap — PUC держит окно
+  поднимающего C-кадра целиком под error object ([A1,A2,err,err]),
+  zig реконструирует [residue?,err,err] и отбрасывает (c_api.zig:2308
+  truncation); воспроизводится без pcallk/recovery на pre-fix;
+  отдельная итерация multi-value window capture при frame-pop.
 
 - [ ] **suite 23 C-S3/C-S4 red (`metamethod 'close' is nil`) —
   помеченный слот содержит объект ошибки к моменту close (tbcres,

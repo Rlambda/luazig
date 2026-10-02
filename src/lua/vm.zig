@@ -2468,6 +2468,27 @@ const ResumeResult = union(enum) {
     span: ResumeSpan,
 };
 
+/// C-S3: the C-API raise window latch — the frozen geometry of the
+/// raising C frame at the moment a C-API `lua_error` (or the testC
+/// `error` command, same contract) installed the in-flight error and
+/// threw. Read-and-cleared ONCE by `Vm.resumeErrorWindowIntact` at the
+/// `lua_resume` error publication: when the raiser's frame and window
+/// survived the unwind unchanged (PUC keeps `L->ci` in place across
+/// `luaD_throw`, so `luaD_seterrorobj` at the resume boundary appends
+/// the error at the live top instead of collapsing the window), the
+/// publication duplicates the error object at the current top — PUC
+/// parity — instead of reconstructing `[residue?, err, err]` over the
+/// window base (which clobbers TBC-marked slots and detaches the
+/// marked objects from their close-at-`lua_closethread` contract).
+const ErrCWindow = struct {
+    /// The raiser's window base (`cWindowBase` at raise time).
+    base: usize,
+    /// The raiser's `top` at raise time (the error object at top-1).
+    top: usize,
+    /// The installed error object (post message-handler).
+    obj: Value,
+};
+
 pub const Thread = struct {
     /// GC header (marked/age/tag + the allgc lifetime link).
     gc: GcHeader = .{ .tag = .thread },
@@ -2592,6 +2613,15 @@ pub const Thread = struct {
     /// message. At a lua_resume error boundary, PUC's visible window is
     /// that whole C-frame area; this field transcribes the `orig` slot.
     err_cframe_residue: ?Value = null,
+    /// C-S3: the C-API raise window latch (see ErrCWindow). Set ONLY at
+    /// C-API raise sites (`lua_error` after the message handler, the
+    /// testC `error` command) — never on VM-internal raises (OOM and
+    /// bytecode errors are ineligible by design: their publication
+    /// window is the reconstruction). Cleared at every recovery
+    /// (`precover` after the YPCALL frame is found), at every fresh
+    /// resume entry (next to the other err-field resets), and by the
+    /// publication's single read. Cold-path only (raise/publication).
+    err_c_window: ?ErrCWindow = null,
     /// PUC LUA_ERRERR signal (luaD_rawrunprotected, ldo.c): set by
     /// invokeErrfunc when the message handler itself errors. Reset to
     /// false at every error-throw site BEFORE invokeErrfunc.
@@ -4234,7 +4264,7 @@ comptime {
     std.debug.assert(@sizeOf(Closure) == 48);
     std.debug.assert(@sizeOf(Cell) == 48);
     std.debug.assert(@sizeOf(Userdata) == 56);
-    std.debug.assert(@sizeOf(Thread) == 3816);
+    std.debug.assert(@sizeOf(Thread) == 3856);
 }
 
 /// Result of compiling a text chunk through the host-selected bytecode
@@ -7959,6 +7989,29 @@ pub const Vm = struct {
     /// visible slots in the anchored window.
     pub fn cWindowCount(th: *Thread) usize {
         return th.top - cWindowBase(th);
+    }
+
+    /// C-S3: read-and-clear the C-API raise latch and decide whether the
+    /// raiser's C window survived the unwind intact — the PUC
+    /// `luaD_seterrorobj`-at-live-top precondition (PUC never pops the
+    /// raising frame on `luaD_throw`, so `L->ci`/`L->top` at the resume
+    /// boundary are exactly what `lua_error` left). Eligible iff the
+    /// latch is set, neither the window top nor its base anchor moved
+    /// (a popped raw C frame or a Lua-frame raise moves both), and the
+    /// in-flight error object is still the latched one (thread-held
+    /// state identity — never a stack-slot comparison). On success the
+    /// caller appends the error object ONCE at the current top (PUC
+    /// duplicates top-1); otherwise the caller keeps the existing
+    /// `[residue?, err, err]` reconstruction at the window base.
+    /// Single read: the latch is consumed here regardless of the
+    /// verdict (a published error never re-publishes).
+    pub fn resumeErrorWindowIntact(th: *Thread) bool {
+        const lw = th.err_c_window orelse return false;
+        th.err_c_window = null;
+        if (th.top != lw.top) return false;
+        if (cWindowBase(th) != lw.base) return false;
+        if (!th.err_has_obj) return false;
+        return valuesEqual(th.err_obj, lw.obj);
     }
 
     /// PUC `index2value` slot resolution for the anchored window. Returns
@@ -15549,6 +15602,13 @@ pub const Vm = struct {
         const ci_idx = self.findpcall(th) orelse {
             return false;
         };
+        // C-S3: a found recovery consumes the in-flight error — its
+        // C-API raise latch dies here (the error never reaches a resume
+        // publication; finishpcallk rebuilds the window at the pcall
+        // boundary). Cleared only on the recovery path: with no YPCALL
+        // frame the error flows on to the publication, where the latch
+        // is the eligibility witness.
+        th.err_c_window = null;
         // PUC: L->ci = ci — go down to the recovery function.
         // Pop all frames above the CIST_YPCALL frame. This mirrors PUC's
         // `L->ci = ci` which effectively discards all CallInfo records above
@@ -28812,6 +28872,7 @@ pub const Vm = struct {
         th.err_obj = .Nil;
         th.err_has_obj = false;
         th.err_cframe_residue = null;
+        th.err_c_window = null;
         th.err_is_errerr = false;
         th.err_is_oom = false;
         th.err_source = null;
@@ -34249,6 +34310,17 @@ pub const Vm = struct {
                 if (th.err_cframe_residue) |rv| {
                     if (GcObject.fromValue(rv) != null) {
                         try self.gcMarkValue(rv);
+                    }
+                }
+                // C-S3: the raise-latch object is a thread-held Value
+                // for the window between the raise and the publication
+                // read — mark it like the in-flight error object (the
+                // raising frame's window below top is marked wholesale;
+                // the latch keeps the object reachable even if that
+                // frame is popped before the publication).
+                if (th.err_c_window) |lw| {
+                    if (GcObject.fromValue(lw.obj) != null) {
+                        try self.gcMarkValue(lw.obj);
                     }
                 }
                 // The latched close error (dead-thread close replay) is a
@@ -51459,6 +51531,15 @@ pub const Vm = struct {
                 self.errThread().err_has_obj = true;
                 self.errThread().err_source = null;
                 self.errThread().err_line = -1;
+                // C-S3: same raise-latch contract as lua_error — the
+                // error object sits at the testC window top-1, and the
+                // latch freezes the raiser's window geometry for the
+                // resume publication (win.base(): the PUC-equivalent
+                // ci->func+1 anchor including the lane prefix; closure
+                // lanes with a prefix never match cWindowBase at the
+                // publication and keep the reconstruction). Latched on
+                // win.th — the window's owner thread.
+                win.th.err_c_window = .{ .base = win.base(), .top = win.th.top, .obj = v };
                 self.captureErrorTraceback();
                 return error.RuntimeError;
             },
@@ -52027,14 +52108,23 @@ pub const Vm = struct {
                         // result_base arm below, the same [prefix..., body,
                         // msg] shape PUC's top -= narg + push produces.)
                         th.top -= narg;
+                        try self.cWindowPushSlice(th, rres[1..]);
+                    } else if (Vm.resumeErrorWindowIntact(th)) {
+                        // C-S3: eligible C-API raise (lua_error / testC
+                        // error latch): the raiser's C window survived the
+                        // unwind — PUC luaD_seterrorobj appends the error
+                        // object at the live top (the raise's copy at top-1
+                        // plus this append = the PUC duplicate), keeping the
+                        // whole frozen window observable. No collapse.
+                        try self.cWindowPushSlice(th, rres[1..]);
                     } else {
                         // Runtime error: the unwind popped the frames; the
                         // error object lands at the body's result base
                         // (PUC seterrorobj pushing at the unwound top —
                         // the body frame's region).
                         th.top = result_base;
+                        try self.cWindowPushSlice(th, rres[1..]);
                     }
-                    try self.cWindowPushSlice(th, rres[1..]);
                 } else if (th.status != .suspended) {
                     // Completion: PUC's final poscall moves the results to
                     // the body frame's func slot. builtinCoroutineResume

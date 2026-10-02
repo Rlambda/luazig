@@ -531,6 +531,16 @@ pub export fn lua_error(L: ?*lua_State) noreturn {
     // only the message handler and the SAME object still longjmps below,
     // which is exactly what PUC throws when its (infallible) setup exists.
     vm.invokeErrfunc() catch {};
+    // C-S3: latch the raise window AFTER the message handler (its
+    // transform is final now) and BEFORE the longjmp — the geometry the
+    // throw leaves behind. The resume publication reads it back via
+    // Vm.resumeErrorWindowIntact: an unchanged base/top pair means the
+    // raising C frame survived the unwind (PUC keeps L->ci in place),
+    // so the publication appends the error at the live top (PUC
+    // luaD_seterrorobj) instead of collapsing the window onto
+    // TBC-marked slots. eth == the raising thread == the window owner
+    // (verified: handleThread(h) == h.thread orelse main here).
+    eth.err_c_window = .{ .base = Vm.cWindowBase(eth), .top = eth.top, .obj = eth.err_obj };
     if (vm.c_error_jmp) |jb| {
         _longjmp(jb, 1);
     }
@@ -2261,7 +2271,17 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
         // staging and install the FIXED pre-interned MEMERRMSG (PUC
         // luaD_seterrorobj with status ERRMEM; the intern is a no-alloc
         // lookup, only the window growth can fail — best-effort).
-        th.top = func_slot;
+        // C-S3 crash fix (pre-existing, exposed by the suite-39 ERRMEM
+        // control): anchor at the TOP frame's base, like the main arm's
+        // reconstruction — the old func_slot anchor sits BELOW the
+        // surviving top frame's base whenever the raiser's frame is
+        // still on the stack (a C continuation), leaving top < base and
+        // underflowing every later window count.
+        th.top = Vm.cWindowBase(th);
+        // C-S3 hygiene: the resume's error tail already ran inside
+        // apiResumeThread — whatever latch it left is stale (this arm
+        // IS the publication; it never reads the latch).
+        co.err_c_window = null;
         if (vm.oom_msg_str) |ms| vm.cWindowPush(th, .{ .String = ms }) catch {};
         if (nres) |p| p.* = @intCast(Vm.cWindowCount(th));
         return 4; // LUA_ERRMEM
@@ -2271,6 +2291,9 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
 
     if (!ok) {
         if (res.len < 2) {
+            // C-S3 hygiene: a malformed failure tuple never reaches the
+            // publication below — drop any latch the resume left.
+            co.err_c_window = null;
             if (nres) |p| p.* = @intCast(Vm.cWindowCount(th));
             return 2;
         }
@@ -2284,33 +2307,41 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
             vm.cWindowPush(th, res[1]) catch {};
             return 2;
         }
-        // Real error inside the coroutine: PUC error window (luaD_seterrorobj
-        // duplicates the top-1 error object) = [residue?, err, err], where
-        // `residue` is the value the raising C function left below the error
-        // object on its frame — error()/assert() with a string message and
-        // level >= 1 leave the ORIGINAL unprefixed string there (PUC
-        // lbaselib luaB_error pushes where + a copy of the argument, then
-        // concatenates). builtinCoroutineResume snapshots it onto the thread
-        // as api_err_residue. Raw top — the thread is dead; PUC never closes
-        // TBC at the error boundary (verified against PUC 5.5.0 probes:
-        // plain, deeper-Lua-call, table error object, and
-        // pcall-recovered-then-error variants; known divergence documented
-        // in STATUS.md P15.83q: errors raised from a LUA frame via
-        // luaG_runerror expose the [err, err] pair only).
-        // The window anchors at the TOP frame's base
-        // (PUC *nresults = L->top - (L->ci->func + 1) with L->ci = the
-        // frame the throw left in place). A C-continuation error keeps
-        // k's C-frame on top, so the anchor is ITS func slot + 1 — not
-        // the body's func slot F (which sits one below and hid the first
-        // err under the window base). For Lua-body errors the unwind
-        // leaves the base frame, whose base == F: the probed shapes are
-        // preserved.
-        th.top = Vm.cWindowBase(th);
-        // (b): the [residue?, err, err] window appends — the status below
-        // survives an append OOM; only the observable window is lost.
-        if (co.api_err_residue) |r| vm.cWindowPush(th, r) catch {};
-        vm.cWindowPush(th, res[1]) catch {};
-        vm.cWindowPush(th, res[1]) catch {};
+        // Real error inside the coroutine. PUC lua_resume's error arm
+        // (ldo.c:991): luaD_seterrorobj APPENDS the error object at the
+        // CURRENT top of the coroutine's frozen window — the window
+        // [ci->func+1, top) the throw left behind survives until
+        // lua_closethread (luaE_resetthread closes TBC marks on the
+        // ORIGINAL objects with the original error; a closer error is
+        // last-error-wins). Two publication shapes:
+        //
+        // - Eligible C-API raise (lua_error / testC error, latch intact:
+        //   the raiser's C frame and window survived the unwind): append
+        //   res[1] ONCE — the PUC duplicate of top-1. The full window
+        //   (marked objects included) stays observable for
+        //   lua_gettop/-1 indexing until the close.
+        //
+        // - Ineligible (Lua-frame raise via luaG_runerror — the [err, err]
+        //   pair only, raw C body whose frame the error return popped
+        //   (P1), handler-transformed geometry, or a moved window):
+        //   reconstruct [residue?, err, err] at the TOP frame's base
+        //   (PUC *nresults = top - (ci->func+1) with L->ci = the frame
+        //   the throw left; a C-continuation error keeps k's C-frame on
+        //   top, a Lua-body error leaves the base frame). Known
+        //   divergence documented in STATUS.md P15.83q.
+        if (Vm.resumeErrorWindowIntact(co)) {
+            // (b): the append is best-effort under OOM — the status
+            // below survives; only the observable window is lost.
+            vm.cWindowPush(th, res[1]) catch {};
+        } else {
+            th.top = Vm.cWindowBase(th);
+            // (b): the [residue?, err, err] window appends — the status
+            // below survives an append OOM; only the observable window
+            // is lost.
+            if (co.api_err_residue) |r| vm.cWindowPush(th, r) catch {};
+            vm.cWindowPush(th, res[1]) catch {};
+            vm.cWindowPush(th, res[1]) catch {};
+        }
         // PUC: *nresults = L->top - (L->ci->func + 1) — the visible window
         // (== lua_gettop(L) after the return; the class-6 pin is tolerant:
         // nres >= 2 with the top two values equal).

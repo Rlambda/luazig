@@ -794,10 +794,12 @@ pub const State = struct {
     ///
     /// Error windows (verified against PUC 5.5.0 — class 6): a rejection of
     /// a non-resumable thread pops the arguments and appends the message
-    /// once (PUC resume_error); a real error leaves [residue?, err, err] —
-    /// the error object duplicated on top of the raiser's residue
-    /// (PUC luaD_seterrorobj at the resume boundary). Yield: the yielded
-    /// values are already parked at the suspended frame's window top.
+    /// once (PUC resume_error); a real error appends the error object at
+    /// the live top when the raiser's C window survived the unwind (PUC
+    /// luaD_seterrorobj; C-S3 latch via resumeErrorWindowIntact), else
+    /// reconstructs [residue?, err, err] — the error object duplicated on
+    /// top of the raiser's residue. Yield: the yielded values are already
+    /// parked at the suspended frame's window top.
     pub fn @"resume"(self: *State, thread_idx: i32, nargs: usize) Status {
         const th = self.threadAt(thread_idx) orelse return .runtime_error;
         const vm = self.vm;
@@ -839,15 +841,25 @@ pub const State = struct {
             // apiResumeThread itself failed (owned-slice OOM): consume the
             // staging. PUC would install the fixed MEMERRMSG here — an
             // allocation we cannot trust on this path; the window stays
-            // empty at F.
-            th.top = func_slot;
+            // empty at the top frame's base. (C-S3 crash fix: the old
+            // func_slot anchor can sit below the surviving top frame's
+            // base — a C continuation — leaving top < base, a corrupt
+            // window that underflows every later count.)
+            th.top = vm_mod.Vm.cWindowBase(th);
+            // C-S3 hygiene: this arm IS the publication — the latch the
+            // resume's error tail left is stale, never read.
+            th.err_c_window = null;
             return .memory_error;
         };
         defer vm.alloc.free(res);
         const ok = res.len > 0 and res[0] == .Bool and res[0].Bool;
 
         if (!ok) {
-            if (res.len < 2) return .runtime_error;
+            if (res.len < 2) {
+                // C-S3 hygiene: malformed failure tuple — no publication.
+                th.err_c_window = null;
+                return .runtime_error;
+            }
             if (reject_before_call) {
                 // PUC resume_error: pop the arguments, append the message
                 // once (plain pop — the engine rejected before running).
@@ -855,12 +867,19 @@ pub const State = struct {
                 vm.cWindowPush(th, res[1]) catch return .memory_error;
                 return .runtime_error;
             }
-            // Real error: [residue?, err, err] anchored at F. Raw top — the
-            // thread is dead; PUC never closes TBC at the error boundary.
-            th.top = func_slot;
-            if (th.api_err_residue) |r| vm.cWindowPush(th, r) catch return .memory_error;
-            vm.cWindowPush(th, res[1]) catch return .memory_error;
-            vm.cWindowPush(th, res[1]) catch return .memory_error;
+            // Real error. PUC luaD_seterrorobj appends the error at the
+            // coroutine's live top when the raiser's C window survived
+            // the unwind (C-S3 latch); otherwise reconstruct
+            // [residue?, err, err] anchored at F. Raw top — the thread
+            // is dead; PUC never closes TBC at the error boundary.
+            if (vm_mod.Vm.resumeErrorWindowIntact(th)) {
+                vm.cWindowPush(th, res[1]) catch return .memory_error;
+            } else {
+                th.top = func_slot;
+                if (th.api_err_residue) |r| vm.cWindowPush(th, r) catch return .memory_error;
+                vm.cWindowPush(th, res[1]) catch return .memory_error;
+                vm.cWindowPush(th, res[1]) catch return .memory_error;
+            }
             return .runtime_error;
         }
 

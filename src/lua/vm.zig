@@ -16394,6 +16394,19 @@ pub const Vm = struct {
                             // in that case; we create a yield step (like
                             // runClosure's error.Yield path) and leave the
                             // C-frame in place for the next resume.
+                            //
+                            // Clear bytecode_inplace_suspended before calling
+                            // finishCcall: the continuation (or a TBC close it
+                            // runs) may enter Lua through runBytecodeInternal,
+                            // which must stage a fresh frame. The flag may
+                            // mark a park from the suspended drive (an error
+                            // unwind that preserved this C-frame), and with it
+                            // set, a nested Lua call would resume the C-frame
+                            // in place as bytecode. Do NOT save/restore the
+                            // old value: a yield inside finishCcall parks the
+                            // nested Lua frame and sets the flag for THAT
+                            // park; restoring would break its next resume.
+                            active.bytecode_inplace_suspended = false;
                             const fc_result = self.finishCcall(active);
                             if (fc_result) |n| {
                                 try self.poscallCFrame(active, n);
@@ -18522,7 +18535,14 @@ pub const Vm = struct {
         const exec_frames = &exec_thread.call_frames;
         const resume_in_place = exec_thread.in_resume and
             exec_thread.bytecode_inplace_suspended and
-            exec_frames.len() != 0;
+            exec_frames.len() != 0 and
+            // In-place resume is valid only when the TOP frame is the parked
+            // Lua continuation. A C-frame on top means the flag is an
+            // unwind-preservation mark (an error/yield that kept C-frames
+            // alive) or stale after a recovery pop: the C-frame must be
+            // dispatched by finishCcall, never interpreted as bytecode —
+            // PUC unroll distinguishes C and Lua frames the same way.
+            !exec_frames.getConstPtr(exec_frames.len() - 1).isC();
         // P15.65: When resuming a parked bytecode yield, use the boundary
         // depth saved at park time. For top-level yields (the thread's
         // outer boundary — 0 pre-base-frame, 1 with the base frame) this is
@@ -71602,4 +71622,165 @@ test "builtin yield closer: local alias shape keeps the callee above live close 
     try testing.expect(r3.len == 2);
     try testing.expect(r3[0] == .Bool and r3[0].Bool);
     try testing.expect(r3[1] == .String and std.mem.eql(u8, r3[1].String.bytes(), "done"));
+}
+
+// =========================================================================
+// testC `toclose` + `pcallk` recovery: the parked-frame invariant across a
+// C continuation.
+//
+// When a testC pcallk'd callee errors, the error unwind parks the frames
+// (bytecode_inplace_suspended = true) to preserve the YPCALL C-frame, and
+// the recovery then runs the marked slot's __close from INSIDE finishCcall
+// (finishpcallk's truncation close). The nested closer enters
+// runBytecodeInternal with the C-frame on top: in-place resume must be
+// rejected there — the flag's park is not the top frame — so the closer
+// stages as a fresh Lua frame. Dispatching the C-frame's union as bytecode
+// was a Debug panic / ReleaseFast crash.
+//
+// The asserted output is the CURRENT contract, with the known divergences
+// vs PUC kept visible on purpose (they are separate open axes, not
+// normalized here):
+//   - error/yy transport: PUC passes the original error object to the
+//     closer (cl:boom) and a yielding closer suspends the recovery; the
+//     truncation close passes e=nil (cl:nil) and a yield inside it errors,
+//     so resume #1 completes the whole form and the thread is dead.
+//   - slot identity: for the 0-param form PUC's callee frame aliases the
+//     marked slot (the closer never runs, log empty); the staged callee
+//     copy keeps the slot value, so the closer runs with e=nil.
+// The yield form (no error) is byte-identical to PUC and pins the
+// park-consumption path: the parked callee resumes in place, then the k
+// continuation's nested Lua call stages fresh while the YPCALL C-frame is
+// on top.
+// =========================================================================
+test "testC pcallk recovery: TBC close inside the C continuation keeps the parked-frame invariant" {
+    const testing = std.testing;
+
+    const Form = struct {
+        name: []const u8,
+        src: []const u8,
+        want: []const []const u8,
+    };
+
+    // Each form returns: log | resume1 | status1 | resume2-ok | status2.
+    const forms = [_]Form{
+        // 1-param control: the callee keeps the marked slot's value intact;
+        // the closer is real and yields after logging.
+        .{
+            .name = "ctrl-1param-yield-closer",
+            .src =
+            \\local LOG = {}
+            \\local f_1p = function(a) error("boom", 0) end
+            \\local closer = setmetatable({}, { __close = function(o, e)
+            \\  LOG[#LOG + 1] = "cl:" .. tostring(e)
+            \\  local y = coroutine.yield("inclose")
+            \\  LOG[#LOG + 1] = "after:" .. tostring(y)
+            \\end })
+            \\local co = coroutine.create(function()
+            \\  return T.testC("pushvalue 2; pushvalue 3; toclose 6; pcallk 1 0 4; pushstring afterK; return 2",
+            \\    f_1p, closer, "pushstring contRan; return 1")
+            \\end)
+            \\local r1 = { coroutine.resume(co) }
+            \\local s1 = coroutine.status(co)
+            \\local r2 = { coroutine.resume(co, "R2") }
+            \\return table.concat(LOG, ","),
+            \\  tostring(r1[1]) .. "," .. tostring(r1[2] or "nil"),
+            \\  s1, tostring(r2[1]), coroutine.status(co)
+            ,
+            .want = &.{ "cl:nil", "true,contRan", "dead", "false", "dead" },
+        },
+        // 0-param callee: the marked slot sits above the callee's frame.
+        // PUC's closer never runs here (slot identity divergence, see the
+        // header) — the safe-completion contract is what this asserts.
+        .{
+            .name = "edge-0param-yield-closer",
+            .src =
+            \\local LOG = {}
+            \\local f_err = function() error("boom", 0) end
+            \\local closer = setmetatable({}, { __close = function(o, e)
+            \\  LOG[#LOG + 1] = "cl:" .. tostring(e)
+            \\  local y = coroutine.yield("inclose")
+            \\  LOG[#LOG + 1] = "after:" .. tostring(y)
+            \\end })
+            \\local co = coroutine.create(function()
+            \\  return T.testC("pushvalue 2; pushvalue 3; toclose 6; pcallk 1 0 4; pushstring afterK; return 2",
+            \\    f_err, closer, "pushstring contRan; return 1")
+            \\end)
+            \\local r1 = { coroutine.resume(co) }
+            \\local s1 = coroutine.status(co)
+            \\local r2 = { coroutine.resume(co, "R2") }
+            \\return table.concat(LOG, ","),
+            \\  tostring(r1[1]) .. "," .. tostring(r1[2] or "nil"),
+            \\  s1, tostring(r2[1]), coroutine.status(co)
+            ,
+            .want = &.{ "cl:nil", "true,contRan", "dead", "false", "dead" },
+        },
+        // Erroring closer inside the recovery close: last-error-wins, the
+        // continuation still runs, the thread completes dead.
+        .{
+            .name = "ctrl-1param-error-closer",
+            .src =
+            \\local LOG = {}
+            \\local f_1p = function(a) error("boom", 0) end
+            \\local closer = setmetatable({}, { __close = function(o, e)
+            \\  LOG[#LOG + 1] = "cl:" .. tostring(e)
+            \\  error("cerr", 0)
+            \\end })
+            \\local co = coroutine.create(function()
+            \\  return T.testC("pushvalue 2; pushvalue 3; toclose 6; pcallk 1 0 4; pushstring afterK; return 2",
+            \\    f_1p, closer, "pushstring contRan; return 1")
+            \\end)
+            \\local r1 = { coroutine.resume(co) }
+            \\return table.concat(LOG, ","),
+            \\  tostring(r1[1]) .. "," .. tostring(r1[2] or "nil"),
+            \\  coroutine.status(co)
+            ,
+            .want = &.{ "cl:nil", "true,contRan", "dead" },
+        },
+        // Yield form (no error): PUC-identical. The parked callee resumes
+        // in place; the k continuation then calls a Lua function while the
+        // YPCALL C-frame is on top — the nested call must stage fresh.
+        .{
+            .name = "yield-park-k-calls-lua",
+            .src =
+            \\local LOG = {}
+            \\local f_yield = function() local y = coroutine.yield("y1"); return "fret", y end
+            \\local f_logged = function() LOG[#LOG + 1] = "kran"; return "kret" end
+            \\local co = coroutine.create(function()
+            \\  return T.testC("pushvalue 2; pcallk 0 0 4; pushstring afterK; return 2",
+            \\    f_yield, f_logged, "pushvalue 3; call 0 1; return 1")
+            \\end)
+            \\local r1 = { coroutine.resume(co) }
+            \\local s1 = coroutine.status(co)
+            \\local r2 = { coroutine.resume(co, "R2") }
+            \\return table.concat(LOG, ","),
+            \\  tostring(r1[1]) .. "," .. tostring(r1[2] or "nil"),
+            \\  s1, tostring(r2[1]) .. "," .. tostring(r2[2] or "nil"),
+            \\  coroutine.status(co)
+            ,
+            .want = &.{ "kran", "true,y1", "suspended", "true,kret", "dead" },
+        },
+    };
+
+    for (forms) |form| {
+        var vm: Vm = .init(testing.allocator, false);
+        defer vm.deinit();
+        const main_h = try vm.setupMainHandle();
+        defer vm.freeStateHandle(main_h);
+        vm.setDynamicBytecodeCompiler(defaultBytecodeCompiler);
+        try vm.enableTestcModule();
+
+        const chunk_v = try vm.compileChunkValue(form.src, form.name);
+        var scope = try vm.openRootScope(1, 0);
+        defer scope.close();
+        _ = scope.protectValueAssumeCapacity(chunk_v);
+        const cl = chunk_v.Closure;
+
+        const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
+        defer vm.alloc.free(results);
+        try testing.expectEqual(form.want.len, results.len);
+        for (form.want, results) |want, got| {
+            try testing.expect(got == .String);
+            try testing.expectEqualStrings(want, got.String.bytes());
+        }
+    }
 }

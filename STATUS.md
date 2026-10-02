@@ -90,6 +90,21 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   остаётся долгом с уточнённым обоснованием (interleaving +
   level-семантика), owner-decision; ось (b) staging identity —
   отдельный milestone (шире bounded).
+  A1 UPDATE (2026-10-02, cut `6cf8044`): crash-класс (ось a) ЗАКРЫТ.
+  Fix A: зеркальная очистка bytecode_inplace_suspended перед
+  finishCcall в trampoline (последний из 5 sites; зеркало 28984/16719)
+  + Fix B: общий reader resume_in_place требует !top.isC() (покрывает
+  re-park -> error -> precover путь, недоступный очисткам). Постоянный
+  тест в battery (358->359, 4 формы). Координатор верифицировал:
+  negative-before Debug panic rc=134/RF 139 → positive-after rc=0
+  D+RF все формы; residual parity ОСТАВЛЕН видимым (zig cl:nil/dead vs
+  PUC cl:boom/suspended — оси b/c, cut A3). Perf: lua_calls +0.00005%
+  (шум), coroutine_yield +0.354% (цена top-кадр-проверки; safety).
+  Пункт остаётся открытым до полного parity (A3). Попутный finding:
+  MEDIUM pre-existing утечка codegen decodeStringLexeme
+  (codegen_bc.zig:4243 — long-string ветка toOwnedSlice без владельца,
+  течёт каждая [[ ]]-константа; short-ветка имеет defer buf.deinit) —
+  ORDINARY-BACKLOG, отдельный cut; raw /tmp/opencode/a1_test_dbg2.txt.
 
 - [ ] **P-1 (production BLOCKER, найден tbcres 2026-10-02): C-closure,
   resumed напрямую как тело корутины, + ошибка → ветка 29788-29817 не
@@ -101,11 +116,12 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   prod_oracle.c + pa_min в `/tmp/opencode/tbcres/`.
 
 - [ ] **suite 23 C-S3/C-S4 red (`metamethod 'close' is nil`) —
-  dead-thread error-publication затирает помеченный слот (tbcres,
+  помеченный слот содержит объект ошибки к моменту close (tbcres,
   2026-10-02; FIX-NOW-кандидат cut C-S3-fix).** Probe: fs(slot=6)
-  возвращает String (объект ошибки записан в TBC-слот) вместо
-  функции-closer. Ранее краснота 23 классифицировалась «pre-existing»
-  без корня; tbcres связал её с error-publication порядком. 14
+  возвращает String вместо функции-closer. Вероятная причина —
+  dead-thread error-publication после collapse окна; точный writer ещё
+  не локализован (следующий эксперимент: top/slot на входе finishCcall-k).
+  Ранее краснота 23 классифицировалась «pre-existing» без механизма. 14
   (count-hook window assert) — независимый t2/hook-window класс;
   big.lua — идентичный отказ обоих движков (harness). F2: подтверждено,
   глотает ошибку только apiSettop call-site (семантика close верна) —

@@ -45,6 +45,16 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
+- [ ] **F1(cs3): cross-thread `lua_settop(co,0)` close — closers
+  работают на identity вызывающего (HIGH; найден cs3-cut, механизм
+  pre-existing).** zig печатает `|MAIN`, PUC `|CO`; нужен switchThread
+  в truncation close; репродюсер в cs3_report §7.
+
+- [ ] **F3(cs3): smoke gc.lua step-dots расхождение на HEAD (HIGH,
+  pre-existing).** Обнаружено при гейтах cs3-cut; НЕ вызван им
+  (воспроизводится на 9057be2-pre); обязательный smoke_compare lane
+  PASS. Решающий эксперимент и класс — следующий cut.
+
 - [ ] **edge_a4: stale `bytecode_inplace_suspended` на trampoline-пути —
   Debug panic / RF segfault на ВАЛИДНОЙ pcallk+toclose форме
   (Safety-BLOCKER, pre-existing; классификация d1cc, 2026-10-02, к
@@ -194,6 +204,28 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   публикации — нужен capture-at-pop, отдельная итерация); (d) LOW —
   testC-lane api.zig @"resume" publication получить тот же контракт
   при порте.
+  CLOSED (C-S3 cut, `9057be2`, 2026-10-02): структурный eligibility
+  вместо equality-эвристики клона V2a — err_c_window raise-latch
+  (метка на raise/unwind boundary, один владелец) +
+  Vm.resumeErrorWindowIntact (геометрия+идентичности, read-and-clear)
+  + eligibility-split на всех трёх publication sites (c_api
+  lua_resume, api.zig @"resume", testC resume); clears
+  precover/fresh-resume-entry/read; GC mark; destructive collapse для
+  живого окна удалён. Постоянный suite 39_resume_error_window (10
+  кейсов, incl. coincidence-edge) IDENTICAL PUC D+RF. Координатор
+  верифицировал лично: suite 23 IDENTICAL D+RF (было red),
+  suites 10/11/13/22/24/25/26/37/38 IDENTICAL, battery 359/359,
+  smoke PASS, matrix zig_fail=0, api580 GREEN (Thread 3856). Perf:
+  coroutine_yield +0.15%, lua_calls +0.06% — без регрессии.
+  Бонус-закрытие: a2 §6.1 P2 KE-shape window gap (suite 38
+  [boom,kerr,kerr] PUC-parity). Новые findings: (F1) HIGH —
+  cross-thread lua_settop(co,0) close запускает closers на identity
+  вызывающего (|MAIN vs PUC |CO); механизм pre-existing, стал достижим
+  этим cut'ом; отдельный cut (switchThread в truncation close) — НОВЫЙ
+  пункт ниже. (F3) HIGH pre-existing — smoke gc.lua step-dots на HEAD
+  (не этим cut'ом; обязательный smoke_compare lane PASS) — НОВЫЙ пункт
+  ниже. (F4) MEDIUM pre-existing — perf baseline drift
+  coroutine_yield +12% на HEAD — backlog.
 
 - [x] **precover region-close: yielding closer протаскивает nil error
   object сквозь `coroutine.resume`, VM после этого непригодна (BLOCKER,

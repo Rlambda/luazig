@@ -8359,13 +8359,25 @@ pub const Vm = struct {
     /// semantics on it — close the WHOLE remaining chain with the error,
     /// newest first, last-error-wins (luaD_closeprotected over level 1) —
     /// and latch the death state (a later lua_closethread reports the
-    /// status and the error object). Then the error re-raises on the
-    /// CALLER: PUC copies the error object onto the main thread's top and
-    /// re-throws on the main thread's armed boundary — the caller IS the
-    /// main thread in the synchronous C API shapes probed (a coroutine
-    /// caller diverges here: PUC unwinds past the caller's resume straight
-    /// to main's boundary; luazig raises on the caller's own boundary,
-    /// preserving the error object and status either way).
+    /// status and the error object). PUC then copies the error object onto
+    /// the MAIN thread's top and re-throws on the MAIN thread's armed
+    /// boundary (mainthread(g)->errorJmp), bypassing every intermediate
+    /// frame — including a coroutine caller's own resume boundary and its
+    /// active pcalls (the re-throw is on main, never on the caller; the
+    /// caller is left mid-frame with status OK). luazig has no per-thread
+    /// boundary ownership — the single c_error_jmp is the innermost
+    /// C-function pad — so this re-raise lands on the CALLER's nearest
+    /// boundary instead. When the caller is the main thread the
+    /// observables coincide (the error still surfaces at main's pcall).
+    /// When the caller is a coroutine they diverge: the caller's resume
+    /// machinery or its own pcall catches the error (a driving C function
+    /// returns instead of being abandoned, main's pcall reports success,
+    /// coroutine.resume returns false+err instead of the protected chunk
+    /// dying, and the caller is finalized dead instead of left status-OK
+    /// mid-frame). Known divergence: a fix requires a general per-thread
+    /// boundary model (owner-tagged boundary chain or a main-destined
+    /// transport class respected by every protected catch), not a local
+    /// reroute of this raise.
     pub fn crossCloseErrorRaise(
         self: *Vm,
         ctx: SyncCloseContext,

@@ -69,6 +69,32 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   status-returners. Анализ/affected sites/probes: f1cc_report.md.
   Milestone по boundary model; локальная эмуляция (убийство caller/
   глотание) запрещена.
+  RESEARCH VERDICT (f1res, 2026-10-02, к `9b004d3`; отчёт
+  /tmp/opencode/f1res_report.md, клон /tmp/opencode/f1res/clone):
+  гипотеза typed main-destined transport ПОДТВЕРЖДЕНА решающим
+  прототипом — P1-P5b все 12 (6 probes x D/RF) IDENTICAL к PUC
+  (координатор сверил P1 лично: zombie-caller parity `main-pcall st=2
+  err=closer-boom target-status=2 caller-status=0`); структурные
+  контроли C1-C8 полный PARITY кроме C7; полный unit battery клона
+  rc=0; c_api 38/39 (14_state_handles — pre-existing на pristine).
+  Механизм: typed error kind (MainDestined) в error-set — компилятор
+  принуждает каскад (18 sites найдены zig build test: testc .pcall,
+  State.yield apiYield switch, mapCompileError, unit-callers);
+  единственный longjmp — cRelayMainDestined через РОВНО ОДИН C-кадр
+  (shim -> собственный landing pad), все промежуточные Zig defer
+  исполняются; owner err-state = main. typed доминирует над A
+  (owner-tagged longjmp) по всем осям (defer-безопасность структурна,
+  missed-signal = compile error). Рекомендация: GO; data flow
+  raise->propagate->relay->consume + terminal arms и cut-порядок
+  CUT1->4 — в отчёте (§4.2-4.3), ревьювер представляет владельцу до
+  implementation prompt. Обязательный gate следующего milestone:
+  F-S4-3 закрыть (BLOCKER prototype-regression: GC-arm
+  gcRunOneFinalizer -> gcWarnFinalizerError без frame/window restore —
+  D паника/RF тихая коррупция; C7 зелёный на D+RF). Попутные findings:
+  F-S4-1 lua_toclose без mark-time checkclosemth (pre-existing);
+  F-S4-2 lua_error без memerrmsg-промоушена (pre-existing);
+  residuals: IF-1 unprobed, checkpanic lane, perf-измерение
+  (milestone scope).
 
 - [x] **C-S3 correction: ERRMEM из живой C-continuation портит TBC slot
   при `lua_resume` (BLOCKER, FIX-NOW; review `9057be2`).** Suite 39

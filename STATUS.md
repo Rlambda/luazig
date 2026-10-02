@@ -88,6 +88,25 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   `closeWindowTruncationMarks` вызывает `closeTbcRegion(th, th, ...)`
   без установки `Vm.current_thread`/`cur_handle` на `th`; PUC
   `lua_settop(L,...)` вызывает `luaF_close(L,...)` на переданном `L`.
+  CLOSED (F1 cut, `1963ee7`, 2026-10-02; follow-up-коммит фиксирует
+  пропущенный из-за anchor-miss текст): vm.zig SyncCloseContext +
+  enterSyncCloseContext/restoreSyncCloseContext/crossCloseErrorRaise;
+  cross-thread arms в closeWindowTruncationMarks и testC .closeslot;
+  lua_closeslot resolution -> handleThread(h) + cross-thread context/
+  error arm; lua_settop/lua_pop больше НЕ глотают Runtime (InvalidIndex
+  lenient). Same-thread/empty-run fast paths без switch. Suite 39:
+  identity-exclusion удалён, +9 кейсов (W-SETSAME/SETSERR/SETERR/
+  SETYLD/SETCALLER/SETM2M/SETSUSP/CSLOT/CSLOTERR) — full
+  byte-identical PUC D+RF (координатор верифицировал лично:
+  W-SETTOP `|CO/nil`, W-SETSAME `|MAIN/nil`, обе сборки; suites
+  22/26/37/38 IDENTICAL; battery 359/359; smoke PASS; matrix
+  zig_fail=0; fmt/diff-check). Perf: паритет 98-100.4% median
+  (interleaved paired A/B; session drift — machine artifact, исключён;
+  pre-existing F4 baseline fail неизменен). Попутный finding
+  (кандидат следующего cut): lua_toclose cross-thread mark-placement —
+  тот же resolution-bug класс (inventory item F в f1_report);
+  coroutine-caller raise-target divergence недостижим в proofed
+  shapes, задокументирован в коде.
   Следующий bounded cut: coherent close-context для чужого `L` с
   восстановлением caller на всех выходах; проверить также соседний
   `lua_closeslot` и `api.State` entry.

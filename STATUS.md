@@ -45,6 +45,31 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
+- [ ] **F1-correction BLOCKER: cross-thread closer error обязан
+  маршрутизировать на armed boundary MAIN (PUC ldo.c luaD_throw
+  rethrow мимо resume/pcall границ caller-корутины) — не представимо в
+  текущем c_error_jmp-дизайне; STOP, выбор дизайна за ревьювером
+  (f1cc, 2026-10-02, к `523f683`).** Decisive: /tmp/reviewer_f1_
+  corocaller_{puc,zig} — PUC driver не возвращается, main-pcall st=2,
+  caller-status=0; zig driver возвращается, main-pcall st=0,
+  caller-status=2 (координатор верифицировал лично). Механизм: errorJmp
+  per-lua_State, выбор boundary по ownership рейзера; у Zig-границ нет
+  владельца-потока, armed-boundary MAIN не имеет jmp_buf
+  (conventional pcall = Zig catch). First-wrong-op: crossCloseErrorRaise
+  ставит ошибку на caller -> cThrowOn longjmp на ближайший pad ->
+  resume финализирует caller dead -> main-pcall OK. Дополнительные
+  классы (координатор верифицировал СВЕЖЕЙ пересборкой из исходника —
+  /tmp/opencode/f1cc_p{2,4}.c против zig-out/lib/liblua.a и PUC
+  static): P2 pcall-on-caller (PUC обходит, zig ловит), P4 unprotected
+  main (PUC abort rc=134, zig продолжает rc=0); P3 nested resume, P5
+  pure-Lua — raw в отчёте (p*_zig бинари в /tmp частично устарели —
+  сверяй пересборкой). Дизайны: A owner-tagged boundary chain +
+  walk-to-main + snapshot-restore; B main-destined transport class +
+  ownership-check на protected catch + hop только на C-ABI
+  status-returners. Анализ/affected sites/probes: f1cc_report.md.
+  Milestone по boundary model; локальная эмуляция (убийство caller/
+  глотание) запрещена.
+
 - [x] **C-S3 correction: ERRMEM из живой C-continuation портит TBC slot
   при `lua_resume` (BLOCKER, FIX-NOW; review `9057be2`).** Suite 39
   W-OOM проверяет только status и top error, поэтому пропускает close:
@@ -107,9 +132,39 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   тот же resolution-bug класс (inventory item F в f1_report);
   coroutine-caller raise-target divergence недостижим в proofed
   shapes, задокументирован в коде.
-  Следующий bounded cut: coherent close-context для чужого `L` с
-  восстановлением caller на всех выходах; проверить также соседний
-  `lua_closeslot` и `api.State` entry.
+  Reviewer qualification: successful-close identity is fixed, but the
+  changed error-channel path fails the independently verified nested
+  coroutine-caller shape below; the full F1 invariant remains open.
+
+- [ ] **F1 review correction: cross-thread closer error from a coroutine
+  caller reaches the wrong protected boundary (BLOCKER, FIX-NOW).**
+  Independent C API differential `/tmp/reviewer_f1_corocaller.c` on
+  `c99a151`: a suspended target coroutine owns a TBC mark; a second
+  coroutine calls `lua_settop(target, 0)` from its C body under a
+  main-thread `lua_pcall`/`lua_resume` driver. PUC `luaD_throw` resets the
+  target and rethrows on main: `main-pcall st=2`, driver never returns,
+  caller coroutine remains status 0. Zig `crossCloseErrorRaise` writes
+  the error to `ctx.prev_thread`, then `lua_settop`/`cThrowOn` jumps to
+  the caller coroutine's C boundary: `drive-return st=2`, `main-pcall
+  st=0`, caller becomes dead. First wrong operation is selecting the
+  immediate caller rather than PUC's main-thread armed boundary in
+  `vm.zig:crossCloseErrorRaise`; the product comment already documents
+  the divergence. The F1 cut's error-channel invariant and acceptance
+  are unfulfilled. Correction prompt: root `prompt.md`; retain the
+  accepted successful-close behavior and suite 39 coverage. The
+  pre-existing `lua_toclose` cross-thread mark-placement defect remains
+  outside this correction.
+
+- [ ] **Cross-thread `lua_toclose(L, idx)` mark placement (BLOCKER,
+  ORDINARY-BACKLOG; pre-existing).** `c_api.zig:lua_toclose` resolves
+  `th` through `vm.current_thread`/main instead of the passed handle
+  `L`, while PUC `lapi.c:lua_toclose` marks `L->tbclist` and `L->ci`.
+  The F1 inventory identified this adjacent class; F1 changes
+  `lua_closeslot` resolution but leaves mark placement untouched.
+  Next decisive experiment: call `lua_toclose` on a suspended target
+  handle from another C callback, then close/resume both threads and
+  compare mark owner, close count and identity with PUC. Do not fold
+  this into the F1 error-boundary correction.
 
 - [ ] **F3(cs3): smoke gc.lua step-dots расхождение на HEAD (HIGH,
   pre-existing).** Обнаружено при гейтах cs3-cut; НЕ вызван им

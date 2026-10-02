@@ -173,13 +173,24 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
    milestone «staging identity» (C→Lua вызовы стейджат копию на
    th.top — регистры callee не алиасят слоты окна; pa_min-оракул в
    /tmp/opencode/tbcres/). Полный inventory writers/readers обеих
-   структур — tbcres_report §3.
+   структур — `/tmp/opencode/tbcres_report.md` §6.1.
 3. **Цепочка C error boundaries — research candidate.** PUC `errorJmp` и
    `luaD_throwbaselevel` могут пройти мимо вложенных protected calls;
    luazig хранит один `c_error_jmp`. Известный риск —
    `lua_closethread(L, L)` внутри C/Lua `pcall` может попасть не на
    base boundary. Решающий C differential должен предшествовать
    дизайну.
+   RESEARCH VERDICT (f1res, 2026-10-02, к `9b004d3`; отчёт
+   /tmp/opencode/f1res_report.md, клон /tmp/opencode/f1res/clone):
+   решающий прототип выполнен — typed main-destined transport
+   (error-set kind `MainDestined`, один longjmp через ровно один
+   C-кадр, все промежуточные Zig defer исполняются, owner err-state =
+   main) даёт P1-P5b 12/12 IDENTICAL PUC D+RF и доминирует над
+   owner-tagged longjmp (A) по всем осям. GO за владельцем; data flow +
+   acceptance + cuts 1-4 в отчёте §4.2-4.3. Обязательный gate
+   implementation-milestone: F-S4-3 (GC-arm frame/window restore, C7
+   зелёный D+RF). Пункт STATUS F1-correction остаётся открытым до
+   миграции.
 
 F2 (`lua_settop`/`lua_closeslot` error transport) остаётся открытым bounded
 parity-дефектом; F3 (forced-close region ownership) закрыт `9b1bad7`.
@@ -199,18 +210,40 @@ parity-дефектом; F3 (forced-close region ownership) закрыт `9b1bad
 
 ## Embedding и stdlib ownership
 
-1. **Настоящий `lua_Alloc` bridge — confirmed design divergence, research
-   before migration.** `lua_newstate`/`lua_setallocf` сохраняют callback и `ud`,
-   но реальные `vm.alloc` allocations продолжают идти через
-   `c_allocator`. PUC маршрутизирует все state allocations через текущий
-   `lua_Alloc`. Нужен inventory allocator identity, live-block migration
-   semantics `lua_setallocf`, OOM/status и accounting до implementation.
-2. **`string.gmatch` per-iterator state — UNCONFIRMED M18.** Сейчас
-   `Vm.gmatch_state` — один mutable slot на VM, тогда как PUC возвращает
-   closure с независимым state. Decisive experiment: два чередующихся
-   iterator, nested iterator и iterator across coroutine yield/GC. При
-   подтверждении — per-closure/upvalue owner, не VM-global replay slot.
-3. **C API pseudo-index + registry/globals ownership — research подтверждён,
+1. **Полный `lua_Alloc` owner — confirmed design divergence, research
+   before migration.** `lua_newstate(f, ud)` уже устанавливает
+   `CAllocBridge` как `std.mem.Allocator` для post-init `vm.alloc` и
+   emergency-GC retry; прежняя запись об отсутствии моста была устаревшей.
+   Но `Vm` и ранний `Vm.initWithSeed` создаются через `c_allocator` до
+   установки callback (PUC вызывает `f` уже для `global_State`), а
+   `lua_setallocf` меняет только `c_alloc_fn`/`c_alloc_ud`: действующий
+   bridge и `vm.alloc` остаются прежними. `lua_getallocf` после setter
+   возвращает новый callback, хотя дальнейшие аллокации идут через
+   прежний. `CAllocBridge.allocFn` передаёт `osize=0` при новом
+   выделении, тогда как PUC `luaM_malloc_` передаёт type tag;
+   `resize/remap` отклоняются, поэтому рост идёт через alloc+copy+free.
+   Комментарии на этих sites также устарели. Нужен inventory
+   allocator identity с bootstrap/teardown, live-block semantics setter,
+   OOM/status и accounting до implementation; PUC маршрутизирует state
+   allocations через текущий `lua_Alloc`.
+2. **`string.gmatch` per-iterator state — подтверждено
+   differential-эвиденцией.** `Vm.gmatch_state` — один mutable slot,
+   iterator — общий `.Builtin`; PUC `lstrlib.c:gmatch` создаёт closure
+   с отдельным `GMatchState` userdata и держит строки в upvalues.
+   Два чередующихся iterator: PUC `a,1,b,2`, Zig `1,2,nil,nil`
+   (`/tmp/reviewer_langfull2.lua`, `STATUS.md`). Нужен per-iterator
+   owner/roots с проверкой nested use, coroutine yield и GC; не
+   расширять VM-global replay slot.
+3. **`package.searchers`/`require` owner — подтверждённый stdlib
+   completeness gap.** PUC `loadlib.c:createsearcherstable` публикует
+   изменяемую ordered таблицу searchers и `findloader` вызывает её
+   текущее содержимое. Zig не создаёт поле `package.searchers`,
+   `builtinRequire` жёстко выбирает preload/Lua/C пути. Custom searcher
+   differential: PUC возвращает 73, Zig module-not-found
+   (`/tmp/reviewer_langfull.lua`, `STATUS.md`); preload-control
+   совпадает. Для миграции нужны единый owner loader chain, loader data,
+   порядок сообщений, re-entry и GC-root lifetime.
+4. **C API pseudo-index + registry/globals ownership — research подтверждён,
    PUC-подобное направление утверждено владельцем.** Cidx/cidx2/cidx3
    (`STATUS.md`, `/tmp/opencode/cidx{,2,3}_report.md`) доказали:
    `LUA_REGISTRYINDEX` и upvalue-индексы требуют общего typed resolver;

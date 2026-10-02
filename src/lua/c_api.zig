@@ -1269,9 +1269,10 @@ pub export fn lua_toclose(L: ?*lua_State, idx: c_int) void {
 pub export fn lua_closeslot(L: ?*lua_State, idx: c_int) void {
     const h = L orelse return;
     const vm = h.vm;
-    // Window slot on Thread.stack (same resolution as
-    // lua_toclose — the current execution's topmost C frame's window).
-    const th = vm.current_thread orelse vm.main_thread orelse return;
+    // PUC lua_closeslot resolves everything on the PASSED L (index2stack,
+    // L->ci, L->tbclist): the thread a handle's C API ops address — not
+    // the currently running thread (a cross-thread L closes L's own mark).
+    const th = Vm.handleThread(h);
     const abs = Vm.cWindowSlot(th, idx) orelse return;
     const th_bc = th.call_frames;
     // The current C activation: the topmost C-frame of this thread.
@@ -1311,6 +1312,40 @@ pub export fn lua_closeslot(L: ?*lua_State, idx: c_int) void {
     // push (which itself could OOM; P16.50-review-5 B2 removed the old
     // append-swallow-then-lua_error detour).
     var call_args = [_]Value{val};
+    // PUC lua_closeslot(L, ...) runs the closer ON L: a cross-thread L (a
+    // suspended/dead coroutine's handle driven from another thread) gets
+    // the target's own close context (coroutine.running, the C API handle,
+    // hooks). The same-thread fast path keeps the caller's context.
+    if (th != vm.activeBytecodeThread()) {
+        const ctx = vm.enterSyncCloseContext(th) catch {
+            cThrowOn(vm, h, error.OutOfMemory);
+            return;
+        };
+        var throw: ?api.ApiError = null;
+        {
+            defer vm.restoreSyncCloseContext(ctx);
+            _ = vm.apiCall(.nonyieldable, mm.?.*, call_args[0..]) catch |e| switch (e) {
+                // .nonyieldable contract: apiCall never reports error.Yield here.
+                error.Yield => unreachable,
+                else => {
+                    // PUC luaD_throw on the target (no armed boundary of
+                    // its own): resetthread semantics + re-raise on the
+                    // caller. The arm's normal exit IS the re-raise; a
+                    // machinery OOM inside it overrides the transport kind.
+                    const fe: Value = if (th.err_has_obj) th.err_obj else .Nil;
+                    const arm_err = if (vm.crossCloseErrorRaise(ctx, th, fe)) error.RuntimeError else |re| re;
+                    throw = if (arm_err == error.OutOfMemory or e == error.OutOfMemory)
+                        error.OutOfMemory
+                    else
+                        error.Runtime;
+                },
+            };
+        }
+        // Caller context restored: cThrowOn reads the caller's error object
+        // (installed by crossCloseErrorRaise above).
+        if (throw) |te| cThrowOn(vm, h, te);
+        return;
+    }
     _ = vm.apiCall(.nonyieldable, mm.?.*, call_args[0..]) catch |e| switch (e) {
         // .nonyieldable contract: apiCall never reports error.Yield here.
         error.Yield => unreachable,
@@ -1518,8 +1553,11 @@ pub export fn lua_settop(L: ?*lua_State, idx: c_int) void {
     var s = api.State.fromHandle(L orelse return);
     s.settop(idx) catch |e| switch (e) {
         // Growing the stack (idx above top) → PUC luaD_growstack →
-        // LUA_ERRMEM. InvalidIndex is PUC api_check — lenient.
-        error.OutOfMemory => cThrowOn(s.vm, L.?, e),
+        // LUA_ERRMEM; lowering past a TBC mark runs __close on the handle's
+        // thread (PUC luaF_close(L, level, CLOSEKTOP, 0)) and a closer
+        // error escapes lua_settop to the enclosing boundary (LUA_ERRRUN).
+        // InvalidIndex is PUC api_check — lenient.
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
         else => {},
     };
 }
@@ -1527,7 +1565,13 @@ pub export fn lua_settop(L: ?*lua_State, idx: c_int) void {
 pub export fn lua_pop(L: ?*lua_State, n: c_int) void {
     var s = api.State.fromHandle(L orelse return);
     if (n <= 0) return;
-    s.pop(@intCast(n)) catch {}; // (c): InvalidIndex-only (see block note)
+    // Same channel as lua_settop (PUC lua_pop = lua_settop(-n-1)): the
+    // truncation close may raise LUA_ERRMEM/LUA_ERRRUN. InvalidIndex-only
+    // otherwise (see block note).
+    s.pop(@intCast(n)) catch |e| switch (e) {
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => {},
+    };
 }
 
 pub export fn lua_rotate(L: ?*lua_State, idx: c_int, n: c_int) void {

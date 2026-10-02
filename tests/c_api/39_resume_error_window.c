@@ -84,17 +84,69 @@
 **
 **   W-SETTOP lua_settop(co, 0) between resume and closethread: the
 **           truncation closes the mark EARLY with err=nil (PUC
-**           luaF_close(newtop, CLOSEKTOP, yy=0)); the subsequent
-**           closethread reports st=2 (status only: PUC's error object
-**           there is the stale func-slot closure, a non-string, while
-**           zig reports the latched original error — a documented
-**           split-stack divergence; the close LOG is the contract).
-**           The closer's running-thread identity is NOT asserted: the
-**           cross-thread settop close runs it on the caller's identity
-**           in zig vs the coroutine in PUC — a documented divergence
-**           newly reachable through the preserved window (finding F1
-**           in the cut report; this case's setup logs the error
-**           argument only).
+**           luaF_close(newtop, CLOSEKTOP, yy=0)) ON the coroutine — the
+**           closer's running-thread identity is CO (PUC lapi.c
+**           lua_settop -> luaF_close(L=co): coroutine.running inside a
+**           cross-thread close resolves to the TARGET thread); the
+**           subsequent closethread reports st=2 (status only: PUC's
+**           error object there is the stale func-slot closure, a
+**           non-string, while zig reports the latched original error —
+**           a documented split-stack divergence; the close LOG is the
+**           contract).
+**
+**   W-SETSAME same-thread control: a C function on MAIN marks and
+**           settops its OWN window — the close runs with MAIN identity
+**           (the same-thread fast path keeps the caller's context;
+**           pcall st=0, log |MAIN/nil).
+**
+**   W-SETSERR same-thread erroring closer: the closer's error escapes
+**           lua_settop to the enclosing pcall boundary (st=2
+**           closer-boom); the close log keeps the identity+err line
+**           (|MAIN/nil — the settop close is an err=nil close).
+**
+**   W-SETERR cross-thread erroring closer (dead co): lua_settop(co, 0)
+**           from a pcall-protected C function on MAIN runs the erroring
+**           closer ON the coroutine (log |CO/nil); the error re-raises
+**           on the CALLER's boundary (pcall st=2 closer-boom, topd=1),
+**           the coroutine's window holds the latched error object
+**           ([string]), and a subsequent closethread reports st=2 with
+**           the closer's error (last-error-wins), closing nothing new.
+**
+**   W-SETYLD cross-thread yielding closer (dead co): the yield inside
+**           the yy=0 close is denied — the error "attempt to yield
+**           across a C-call boundary" (no position prefix) re-raises on
+**           the caller's boundary; the window/closethread shape as
+**           W-SETERR with the denied-yield error.
+**
+**   W-SETCALLER caller state after a successful cross-thread close:
+**           MAIN's top is unchanged by lua_settop(co, 0), the state
+**           stays usable (push + dostring), coroutine.running on MAIN
+**           reads MAIN.
+**
+**   W-SETM2M mirror direction: a coroutine's C function settops MAIN's
+**           window (the mark placed by MAIN's own C function) — the
+**           closer runs with MAIN identity (the main-active regime:
+**           current_thread == null while MAIN is the close context).
+**
+**   W-SETSUSP suspended co with a live mark in its parked C frame: the
+**           cross-thread settop close fires ON the suspended co (log
+**           |CO/nil); the resumed continuation completes the coroutine
+**           normally (one close total).
+**
+**   W-CSLOT cross-thread lua_closeslot(co, 1) from main on a suspended
+**           co (the mark in its parked C frame): everything resolves on
+**           the PASSED handle's thread (PUC lapi.c lua_closeslot:
+**           index2stack(L) — the closer runs ON co, log |CO/nil); the
+**           resumed continuation completes the coroutine normally (one
+**           close total).
+**
+**   W-CSLOTERR cross-thread lua_closeslot(co, 1) from a pcall-protected
+**           C function on MAIN on a dead co (the published window's top
+**           mark): the erroring closer runs ON the coroutine (log
+**           |CO/nil), the error re-raises on the CALLER's boundary
+**           (pcall st=2 closer-boom, topd=1), and a subsequent
+**           closethread reports st=2 with the closer's error
+**           (last-error-wins), closing nothing new.
 **
 **   W-GC    full GC between resume and closethread: the dead thread's
 **           window keeps the marked object and the error objects alive
@@ -137,21 +189,17 @@
     "end})\n"                                                           \
     "YFN = function() coroutine.yield('from-fn') end\n"
 
-/* The W-SETTOP setup: the closer logs the error argument ONLY (no
-** running-thread identity). The cross-thread lua_settop(co, 0)
-** truncation close runs the closer with the CALLER's thread identity in
-** zig (current_thread is not switched for the settop close) while PUC
-** runs it on the coroutine — a documented divergence newly reachable
-** through the preserved window (at HEAD the same operation hit the
-** clobbered-mark nil-metamethod error instead); the identity axis is
-** excluded here pending its own cut (see the cut report, finding F1).
-** The case's contract is the EARLY close itself: err=nil, yy=0. */
-#define C_SETUP_SETTOP_LUA                                              \
-    "COOBJ = setmetatable({}, {__close = function(_, e)\n"              \
-    "  local es = (type(e) == 'string') and e or type(e)\n"             \
-    "  _G.LOG = _G.LOG .. '|' .. es\n"                                  \
-    "end})\n"                                                           \
-    "YFN = function() coroutine.yield('from-fn') end\n"
+/* The W-SETYLD closer override (a short, fixed load chunk — the yielding
+** closer never errors, so its chunk position never enters a printed
+** error object; the denied-yield error has no position prefix). */
+#define C_YLD_CLOSER_LUA                                                 \
+    "YLDCLOSER = setmetatable({}, {__close = function(_, e)\n"           \
+    "  local c, ismain = coroutine.running()\n"                           \
+    "  local where = (c == _G.COTEST) and 'CO' or (ismain and 'MAIN' or 'OTHER')\n" \
+    "  local es = (type(e) == 'string') and e or type(e)\n"               \
+    "  _G.LOG = _G.LOG .. '|' .. where .. '/' .. es\n"                    \
+    "  coroutine.yield('y-from-closer')\n"                                \
+    "end})\n"
 
 /* The body closure source (built per case with the marked object's
 ** global name; the chunk sources are short and fixed — the same quoting
@@ -426,6 +474,126 @@ static void print_log(lua_State *L, const char *label) {
     lua_pop(L, 1);
 }
 
+/* ------------------------------------------------------------------ */
+/* Cross-thread settop drivers (F1: the synchronous C API close context) */
+/* ------------------------------------------------------------------ */
+
+/* pcall-protected settop driver: runs ON main (arg 1 = the target
+** thread); does lua_settop(target, 0). The cross-thread close happens
+** inside it, so a closer error re-raises on THIS pcall boundary. */
+static int prot_settop0(lua_State *L) {
+    lua_State *co = lua_tothread(L, 1);
+    if (!co) return luaL_error(L, "not a thread");
+    lua_settop(co, 0);
+    return 0;
+}
+
+/* Run the cross-thread settop under pcall protection on main and report
+** the protected result (status + error object) + main's top delta. The
+** target thread travels as arg 1 (the COTEST global holds the same
+** thread value). */
+static void prot_cross_settop(lua_State *L, const char *label) {
+    int st;
+    int top_before = lua_gettop(L);
+    lua_pushcfunction(L, prot_settop0);
+    lua_getglobal(L, "COTEST");
+    st = lua_pcall(L, 1, 0, 0);
+    printf("%s: st=%d err=%s topd=%d\n", label, st,
+           (st != LUA_OK && lua_isstring(L, -1)) ? lua_tostring(L, -1) : "-",
+           lua_gettop(L) - top_before);
+    if (st != LUA_OK) lua_pop(L, 1);
+}
+
+/* Print a thread's whole window: gettop + per-slot type names. */
+static void print_co_win(lua_State *co, const char *label) {
+    int n = lua_gettop(co);
+    printf("%s: n=%d types=[", label, n);
+    for (int i = 1; i <= n; i++)
+        printf("%s%s", (i > 1 ? "," : ""),
+               lua_typename(co, lua_type(co, i)));
+    printf("]\n");
+}
+
+/* pcall-protected closeslot driver: runs ON main (arg 1 = the target
+** thread); does lua_closeslot(target, 1). The cross-thread close happens
+** inside it, so a closer error re-raises on THIS pcall boundary. */
+static int prot_closeslot1(lua_State *L) {
+    lua_State *co = lua_tothread(L, 1);
+    if (!co) return luaL_error(L, "not a thread");
+    lua_closeslot(co, 1);
+    return 0;
+}
+
+/* Run the cross-thread closeslot under pcall protection on main and
+** report the protected result (status + error object) + main's top
+** delta. The target thread travels as arg 1 (the COTEST global holds
+** the same thread value). */
+static void prot_cross_closeslot(lua_State *L, const char *label) {
+    int st;
+    int top_before = lua_gettop(L);
+    lua_pushcfunction(L, prot_closeslot1);
+    lua_getglobal(L, "COTEST");
+    st = lua_pcall(L, 1, 0, 0);
+    printf("%s: st=%d err=%s topd=%d\n", label, st,
+           (st != LUA_OK && lua_isstring(L, -1)) ? lua_tostring(L, -1) : "-",
+           lua_gettop(L) - top_before);
+    if (st != LUA_OK) lua_pop(L, 1);
+}
+
+/* W-SETSAME body: mark arg 1 TBC, then settop the OWN window to 0 — the
+** same-thread truncation close (identity MAIN, err=nil). */
+static int c_same_settop(lua_State *L) {
+    lua_toclose(L, 1);
+    lua_settop(L, 0);
+    return 0;
+}
+
+/* W-SETSERR body: swap arg 1 to the erroring closer, mark it TBC, then
+** settop the OWN window to 0 — the closer error must escape lua_settop
+** to the enclosing pcall boundary (PUC luaD_throw). */
+static int c_same_settop_err(lua_State *L) {
+    lua_getglobal(L, "ERRCLOSER");
+    lua_replace(L, 1);
+    lua_toclose(L, 1);
+    lua_settop(L, 0);
+    return 0;
+}
+
+/* W-SETM2M: the coroutine-side C function that settops MAIN's window
+** (the mark placed by MAIN's own C function). */
+static lua_State *g_main_L;
+
+static int x_settop_main(lua_State *L) {
+    (void)L;
+    lua_settop(g_main_L, 0);
+    return 0;
+}
+
+/* W-SETM2M driver (runs on MAIN): mark arg 1 TBC on MAIN's window, then
+** resume arg 2 (the coroutine whose C function settops MAIN). */
+static int m_driver(lua_State *L) {
+    int nres = 0;
+    lua_State *co;
+    g_main_L = L;
+    lua_toclose(L, 1);                 /* mark MAINOBJ on main's window */
+    co = lua_tothread(L, 2);
+    if (!co) return luaL_error(L, "not a thread");
+    lua_resume(co, L, 0, &nres);       /* co's C fn settops main        */
+    return 0;                          /* mark already closed          */
+}
+
+/* W-SETSUSP: a body that parks with a live mark in its C frame (yieldk
+** with the mark placed before the yield). */
+static int k_simple(lua_State *L, int status, lua_KContext ctx) {
+    (void)L; (void)status; (void)ctx;
+    return 0;
+}
+
+static int c_toclose_yieldk(lua_State *L) {
+    lua_toclose(L, 1);
+    return lua_yieldk(L, 0, (lua_KContext)0, k_simple);
+}
+
 /* The W-OOMR body source: the coroutine's result IS the protected
 ** call's result, so the continuation's observation of the recovery
 ** (status + the recovered fixed message) is observable as the
@@ -444,13 +612,12 @@ static void print_log(lua_State *L, const char *label) {
 ** create co = coroutine.create(<body closure>) with the marked object
 ** `objname`, anchored in COTEST for the Lua closers' identity check.
 */
-static lua_State *w_setup2(lua_State *L, lua_CFunction body,
-                           const char *yfn_override, const char *src,
-                           const char *setup) {
+static lua_State *w_setup(lua_State *L, lua_CFunction body,
+                          const char *yfn_override, const char *src) {
     lua_State *co;
     lua_pushliteral(L, "");
     lua_setglobal(L, "LOG");
-    if (luaL_dostring(L, setup) != 0) {
+    if (luaL_dostring(L, C_SETUP_LUA) != 0) {
         printf("FAIL setup: %s\n",
                lua_isstring(L, -1) ? lua_tostring(L, -1) : "?");
         lua_pop(L, 1);
@@ -491,12 +658,6 @@ static lua_State *w_setup2(lua_State *L, lua_CFunction body,
     lua_pushvalue(L, -1);
     lua_setglobal(L, "COTEST");
     return co;  /* anchored on L's stack */
-}
-
-/* Common setup (the identity-logging closers). */
-static lua_State *w_setup(lua_State *L, lua_CFunction body,
-                          const char *yfn_override, const char *src) {
-    return w_setup2(L, body, yfn_override, src, C_SETUP_LUA);
 }
 
 /* Fresh state per case. */
@@ -673,13 +834,15 @@ static int t_w_tbl(void) {
     return 0;
 }
 
-/* W-SETTOP: early close via lua_settop(co, 0) between resume and close. */
+/* W-SETTOP: early close via lua_settop(co, 0) between resume and close.
+** The cross-thread truncation close runs the closer ON the coroutine
+** (identity CO, err=nil); the closethread error OBJECT stays a
+** documented split-stack divergence — status only. */
 static int t_w_settop(void) {
     lua_State *L = w_begin();
     lua_State *co;
     if (!L) return 1;
-    co = w_setup2(L, c_tbc_callk_conterr, NULL, body_src("COOBJ"),
-                  C_SETUP_SETTOP_LUA);
+    co = w_setup(L, c_tbc_callk_conterr, NULL, body_src("COOBJ"));
     if (!co) { lua_close(L); return 1; }
     do_resume(L, co, "W-SETTOP resume1");
     do_resume_win(L, co, "W-SETTOP resume2", "COOBJ"); /* the published window */
@@ -688,6 +851,225 @@ static int t_w_settop(void) {
     do_closethread_st(L, co, "W-SETTOP closethread"); /* st=2 (status only) */
     print_log(L, "W-SETTOP log2");            /* unchanged: one close */
     do_closethread_st(L, co, "W-SETTOP reclose");     /* st=0 */
+    lua_close(L);
+    return 0;
+}
+
+/* W-SETSAME: same-thread control — the close runs on MAIN itself. */
+static int t_w_setsame(void) {
+    lua_State *L = w_begin();
+    if (!L) return 1;
+    lua_pushliteral(L, "");
+    lua_setglobal(L, "LOG");
+    if (luaL_dostring(L, C_SETUP_LUA) != 0) { lua_close(L); return 1; }
+    /* anchor COOBJ on L's stack, run the closer-marking C function under
+    ** pcall: the mark closes at the truncation (err=nil) with MAIN
+    ** identity; pcall returns OK (no error). */
+    lua_getglobal(L, "COOBJ");
+    lua_pushcfunction(L, c_same_settop);
+    lua_insert(L, -2);   /* [fn, COOBJ] */
+    {
+        int st = lua_pcall(L, 1, 0, 0);
+        printf("W-SETSAME pcall: st=%d\n", st);
+        if (st != LUA_OK) {
+            printf("W-SETSAME err: %s\n",
+                   lua_isstring(L, -1) ? lua_tostring(L, -1) : "?");
+            lua_pop(L, 1);
+        }
+    }
+    print_log(L, "W-SETSAME log1");           /* |MAIN/nil */
+    lua_close(L);
+    return 0;
+}
+
+/* W-SETSERR: same-thread erroring closer — the error escapes lua_settop
+** to the enclosing pcall boundary. */
+static int t_w_setserr(void) {
+    lua_State *L = w_begin();
+    if (!L) return 1;
+    lua_pushliteral(L, "");
+    lua_setglobal(L, "LOG");
+    if (luaL_dostring(L, C_SETUP_LUA) != 0) { lua_close(L); return 1; }
+    lua_pushcfunction(L, c_same_settop_err);
+    lua_pushnil(L);   /* arg 1 placeholder; the C fn swaps in ERRCLOSER */
+    {
+        int st = lua_pcall(L, 1, 0, 0);
+        printf("W-SETSERR pcall: st=%d err=%s\n", st,
+               (st != LUA_OK && lua_isstring(L, -1))
+                   ? lua_tostring(L, -1) : "-");
+        if (st != LUA_OK) lua_pop(L, 1);
+    }
+    print_log(L, "W-SETSERR log1");           /* |MAIN/nil */
+    lua_close(L);
+    return 0;
+}
+
+/* W-SETERR: cross-thread erroring closer (dead co) — the closer runs ON
+** the coroutine, the error re-raises on the caller's pcall boundary. */
+static int t_w_seterr(void) {
+    lua_State *L = w_begin();
+    lua_State *co;
+    if (!L) return 1;
+    co = w_setup(L, c_tbc_callk_conterr, NULL, body_src("ERRCLOSER"));
+    if (!co) { lua_close(L); return 1; }
+    do_resume(L, co, "W-SETERR resume1");
+    do_resume(L, co, "W-SETERR resume2");     /* st=2: window published */
+    prot_cross_settop(L, "W-SETERR settop");  /* closer errors */
+    print_log(L, "W-SETERR log1");            /* |CO/nil */
+    print_co_win(co, "W-SETERR cowin");       /* the latched error object */
+    do_closethread(L, co, "W-SETERR closethread"); /* st=2 closer-boom */
+    print_log(L, "W-SETERR log2");            /* unchanged: one close */
+    lua_close(L);
+    return 0;
+}
+
+/* W-SETYLD: cross-thread yielding closer (dead co) — the yield inside
+** the yy=0 close is denied; the error re-raises on the caller. */
+static int t_w_setyld(void) {
+    lua_State *L = w_begin();
+    lua_State *co;
+    if (!L) return 1;
+    co = w_setup(L, c_tbc_callk_conterr, C_YLD_CLOSER_LUA,
+                 body_src("YLDCLOSER"));
+    if (!co) { lua_close(L); return 1; }
+    do_resume(L, co, "W-SETYLD resume1");
+    do_resume(L, co, "W-SETYLD resume2");
+    prot_cross_settop(L, "W-SETYLD settop");  /* closer yields: denied */
+    print_log(L, "W-SETYLD log1");
+    print_co_win(co, "W-SETYLD cowin");
+    do_closethread(L, co, "W-SETYLD closethread"); /* st=2 denied-yield err */
+    print_log(L, "W-SETYLD log2");
+    lua_close(L);
+    return 0;
+}
+
+/* W-SETCALLER: the caller (main) state after a successful cross-thread
+** close — top unchanged, state usable, running identity intact. */
+static int t_w_setcaller(void) {
+    lua_State *L = w_begin();
+    lua_State *co;
+    if (!L) return 1;
+    co = w_setup(L, c_tbc_callk_conterr, NULL, body_src("COOBJ"));
+    if (!co) { lua_close(L); return 1; }
+    do_resume(L, co, "W-SETCALLER resume1");
+    do_resume(L, co, "W-SETCALLER resume2");
+    {
+        int top_before = lua_gettop(L);
+        lua_settop(co, 0);
+        printf("W-SETCALLER topd=%d\n", lua_gettop(L) - top_before);
+        lua_pushliteral(L, "still-alive");
+        printf("W-SETCALLER push: %s top=%d\n",
+               lua_isstring(L, -1) ? lua_tostring(L, -1) : "?",
+               lua_gettop(L));
+        lua_pop(L, 1);
+        if (luaL_dostring(L,
+                "local c, m = coroutine.running() "
+                "return (m and 'MAIN' or 'OTHER')") != 0) {
+            printf("W-SETCALLER running: FAILED\n");
+            lua_close(L);
+            return 1;
+        }
+        printf("W-SETCALLER running: %s\n", lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+    print_log(L, "W-SETCALLER log1");         /* |CO/nil */
+    lua_close(L);
+    return 0;
+}
+
+/* W-SETM2M: mirror direction — a coroutine's C function settops MAIN's
+** window; the closer must run with MAIN identity. */
+static int t_w_setm2m(void) {
+    lua_State *L = w_begin();
+    if (!L) return 1;
+    lua_pushliteral(L, "");
+    lua_setglobal(L, "LOG");
+    if (luaL_dostring(L, C_SETUP_LUA) != 0) { lua_close(L); return 1; }
+    /* MAINOBJ = the same identity-logging closer; XCO's body calls the
+    ** global C function that settops MAIN. */
+    if (luaL_dostring(L,
+            "MAINOBJ = setmetatable({}, getmetatable(COOBJ))\n") != 0) {
+        lua_close(L);
+        return 1;
+    }
+    lua_pushcfunction(L, x_settop_main);
+    lua_setglobal(L, "XSETTOP");
+    if (luaL_dostring(L,
+            "XCO = coroutine.create(function() XSETTOP() end)\n") != 0) {
+        lua_close(L);
+        return 1;
+    }
+    lua_getglobal(L, "MAINOBJ");
+    lua_getglobal(L, "XCO");
+    lua_pushcfunction(L, m_driver);
+    lua_insert(L, -3);                 /* [fn, MAINOBJ, XCO]            */
+    {
+        int st = lua_pcall(L, 2, 0, 0);
+        printf("W-SETM2M pcall: st=%d\n", st);
+        if (st != LUA_OK) {
+            printf("W-SETM2M err: %s\n",
+                   lua_isstring(L, -1) ? lua_tostring(L, -1) : "?");
+            lua_pop(L, 1);
+        }
+    }
+    print_log(L, "W-SETM2M log1");             /* |MAIN/nil */
+    lua_close(L);
+    return 0;
+}
+
+/* W-SETSUSP: suspended co with a live mark in its parked C frame — the
+** cross-thread settop close fires ON the suspended co. */
+static int t_w_setsusp(void) {
+    lua_State *L = w_begin();
+    lua_State *co;
+    if (!L) return 1;
+    co = w_setup(L, c_toclose_yieldk, NULL,
+                 "return function() CBODY(COOBJ) end");
+    if (!co) { lua_close(L); return 1; }
+    do_resume(L, co, "W-SETSUSP resume1");  /* yield: parked with the mark */
+    lua_settop(co, 0);                      /* cross-thread close on co */
+    print_log(L, "W-SETSUSP log1");          /* |CO/nil */
+    do_resume(L, co, "W-SETSUSP resume2");   /* k returns: co completes */
+    print_log(L, "W-SETSUSP log2");          /* unchanged: one close */
+    do_closethread(L, co, "W-SETSUSP closethread"); /* st=0 */
+    lua_close(L);
+    return 0;
+}
+
+/* W-CSLOT: cross-thread lua_closeslot(co, 1) on a suspended co — the
+** close resolves and runs on the PASSED handle's thread. */
+static int t_w_cslot(void) {
+    lua_State *L = w_begin();
+    lua_State *co;
+    if (!L) return 1;
+    co = w_setup(L, c_toclose_yieldk, NULL,
+                 "return function() CBODY(COOBJ) end");
+    if (!co) { lua_close(L); return 1; }
+    do_resume(L, co, "W-CSLOT resume1");   /* yield: parked with the mark */
+    lua_closeslot(co, 1);                  /* cross-thread closeslot */
+    print_log(L, "W-CSLOT log1");           /* |CO/nil */
+    do_resume(L, co, "W-CSLOT resume2");    /* k returns: co completes */
+    print_log(L, "W-CSLOT log2");           /* unchanged: one close */
+    do_closethread(L, co, "W-CSLOT closethread"); /* st=0 */
+    lua_close(L);
+    return 0;
+}
+
+/* W-CSLOTERR: cross-thread lua_closeslot(co, 1) on a dead co from a
+** pcall-protected C function on MAIN — the erroring closer runs ON the
+** coroutine, the error re-raises on the caller's boundary. */
+static int t_w_csloterr(void) {
+    lua_State *L = w_begin();
+    lua_State *co;
+    if (!L) return 1;
+    co = w_setup(L, c_tbc_callk_conterr, NULL, body_src("ERRCLOSER"));
+    if (!co) { lua_close(L); return 1; }
+    do_resume(L, co, "W-CSLOTERR resume1");
+    do_resume(L, co, "W-CSLOTERR resume2");  /* st=2: window published */
+    prot_cross_closeslot(L, "W-CSLOTERR closeslot"); /* closer errors */
+    print_log(L, "W-CSLOTERR log1");          /* |CO/nil */
+    do_closethread(L, co, "W-CSLOTERR closethread"); /* st=2 closer-boom */
+    print_log(L, "W-CSLOTERR log2");          /* unchanged: one close */
     lua_close(L);
     return 0;
 }
@@ -726,6 +1108,15 @@ int main(void) {
     if (t_w_oomr())   return 1;
     if (t_w_tbl())    return 1;
     if (t_w_settop()) return 1;
+    if (t_w_setsame()) return 1;
+    if (t_w_setserr()) return 1;
+    if (t_w_seterr()) return 1;
+    if (t_w_setyld()) return 1;
+    if (t_w_setcaller()) return 1;
+    if (t_w_setm2m()) return 1;
+    if (t_w_setsusp()) return 1;
+    if (t_w_cslot()) return 1;
+    if (t_w_csloterr()) return 1;
     if (t_w_gc())     return 1;
     printf("=== 39_resume_error_window DONE ===\n");
     return 0;

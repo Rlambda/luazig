@@ -8255,6 +8255,18 @@ pub const Vm = struct {
         // whole chain (same exhaustion subtlety as closeWindowTruncationMarks).
         const run_start: usize = if (broke) i + 1 else i;
         if (run_start >= chain.items.len) return; // empty run
+        // PUC luaF_close(L, ...) runs the closers ON the passed L. When the
+        // target is not the active runtime (a synchronous C API close on
+        // another thread's handle — lua_settop/lua_pop from the caller),
+        // activate the target as the close context for the whole region;
+        // the same-thread close already runs in the target's context.
+        if (th != self.activeBytecodeThread()) {
+            const ctx = self.enterSyncCloseContext(th) catch return error.OutOfMemory;
+            defer self.restoreSyncCloseContext(ctx);
+            const final_err = try self.closeTbcRegion(th, th, run_start, null, null, 0, false, &.{});
+            if (final_err) |fe| try self.crossCloseErrorRaise(ctx, th, fe);
+            return;
+        }
         const final_err = try self.closeTbcRegion(th, th, run_start, null, null, 0, false, &.{});
         if (final_err) |fe| {
             // A closer errored (last-error-wins; err_obj was set by fail()
@@ -8265,6 +8277,125 @@ pub const Vm = struct {
             self.err = if (fe == .String) fe.String.bytes() else null;
             return error.RuntimeError;
         }
+    }
+
+    /// The saved caller dispatch context around a synchronous C API close
+    /// on a target thread that is not the active runtime (PUC lua_settop/
+    /// lua_closeslot -> luaF_close(L, level, CLOSEKTOP, 0): the closers run
+    /// ON the passed L — coroutine.running, the C API handle, hooks and the
+    /// raise channel all resolve to the target for the whole close). The
+    /// same field-for-field save/restore as closeThreadRegionsOnClosedThread,
+    /// without its dead-thread lifecycle: the caller's status mirror (a
+    /// running caller reads "normal" while another thread is the active
+    /// runtime), cur_handle, and the target's caller link (the "normal"
+    /// status probe reads it). Restored on EVERY exit — ordinary return,
+    /// RuntimeError, OutOfMemory, a denied yield, ThreadSwitch — by the
+    /// defer at the call site.
+    /// The anonymous status enum of Thread (no declared name — resolved
+    /// through the struct's field type).
+    const ThreadStatus = blk: {
+        for (@typeInfo(Thread).@"struct".fields) |f| {
+            if (std.mem.eql(u8, f.name, "status")) break :blk f.type;
+        }
+        unreachable;
+    };
+
+    const SyncCloseContext = struct {
+        th: *Thread,
+        prev_thread: ?*Thread,
+        prev_status: ?ThreadStatus,
+        prev_handle: ?*lua_State,
+        saved_caller: ?*Thread,
+    };
+
+    /// Activate `th` as the close context. The handle is reserved BEFORE
+    /// any mutation: on OOM the caller's context is untouched and the
+    /// ERRMEM propagates to the caller's own boundary.
+    pub fn enterSyncCloseContext(self: *Vm, th: *Thread) error{OutOfMemory}!SyncCloseContext {
+        // The closers' C API handle (PUC: the thread IS a lua_State).
+        self.ensureThreadApiHandle(th) catch return error.OutOfMemory;
+        const prev_thread = self.current_thread;
+        var prev_status: ?ThreadStatus = null;
+        if (prev_thread) |pt| {
+            prev_status = pt.status;
+            // Mirror the resume path: while another thread is the active
+            // runtime, a running caller reads as "normal" (PUC auxstatus).
+            if (pt.status == .running) pt.status = .suspended;
+        }
+        const prev_handle = self.cur_handle;
+        const saved_caller = th.caller;
+        // switchThread sets current_thread BEFORE refreshing the hook cache
+        // so the closers read the TARGET's hook state. The main thread
+        // activates the main-active regime (current_thread == null):
+        // coroutine.running's ismain, auxstatus and the C API's main
+        // resolution all key on null, not on the thread pointer.
+        self.switchThread(if (self.main_thread == th) null else th);
+        th.caller = prev_thread;
+        self.cur_handle = th.api_handle;
+        return .{
+            .th = th,
+            .prev_thread = prev_thread,
+            .prev_status = prev_status,
+            .prev_handle = prev_handle,
+            .saved_caller = saved_caller,
+        };
+    }
+
+    pub fn restoreSyncCloseContext(self: *Vm, ctx: SyncCloseContext) void {
+        // switchThread restores current_thread and refreshes the hook cache
+        // from the caller's state (same ordering as
+        // closeThreadRegionsOnClosedThread).
+        self.switchThread(ctx.prev_thread);
+        ctx.th.caller = ctx.saved_caller;
+        self.cur_handle = ctx.prev_handle;
+        if (ctx.prev_thread) |pt| {
+            if (ctx.prev_status) |st| pt.status = st;
+        }
+    }
+
+    /// The cross-thread closer-error exit (PUC luaD_throw's no-errorJmp arm,
+    /// ldo.c:130-138): the raising thread has no armed boundary of its own
+    /// (it is not the active runtime), so the throw first runs resetthread
+    /// semantics on it — close the WHOLE remaining chain with the error,
+    /// newest first, last-error-wins (luaD_closeprotected over level 1) —
+    /// and latch the death state (a later lua_closethread reports the
+    /// status and the error object). Then the error re-raises on the
+    /// CALLER: PUC copies the error object onto the main thread's top and
+    /// re-throws on the main thread's armed boundary — the caller IS the
+    /// main thread in the synchronous C API shapes probed (a coroutine
+    /// caller diverges here: PUC unwinds past the caller's resume straight
+    /// to main's boundary; luazig raises on the caller's own boundary,
+    /// preserving the error object and status either way).
+    pub fn crossCloseErrorRaise(
+        self: *Vm,
+        ctx: SyncCloseContext,
+        th: *Thread,
+        first_err: Value,
+    ) DispatchError!void {
+        const last = (try self.closeTbcRegion(th, th, 0, null, first_err, 2, false, &.{})) orelse first_err;
+        const status: i32 = if (last == .String and last.String == self.oom_msg_str) 4 else 2;
+        th.status = .dead;
+        th.errfunc = ERRFUNC_NONE; // PUC luaE_resetthread
+        // PUC luaD_throw sets L->status = errcode after the reset — the
+        // death status a later lua_closethread reports (APIstatus of
+        // resetthread(L, L->status)).
+        th.api_status = status;
+        th.close_has_err = true;
+        th.close_err = last;
+        // PUC resetthread's seterrorobj at stack+1: the final error object
+        // at the target's window top (best-effort — the push may OOM; the
+        // latch above already carries the object allocation-free).
+        th.top = cWindowBase(th);
+        self.cWindowPush(th, last) catch {};
+        // The re-raise on the caller (PUC: the main thread's armed
+        // boundary). Must address the caller thread directly — the context
+        // restore at the call site has not run yet, and errThread() would
+        // resolve to the target.
+        const caller = ctx.prev_thread orelse self.main_thread.?;
+        caller.err_has_obj = true;
+        caller.err_obj = last;
+        self.err = if (last == .String) last.String.bytes() else null;
+        return error.RuntimeError;
     }
 
     /// Safepoint window checker — a Debug-regime
@@ -52488,6 +52619,27 @@ pub const Vm = struct {
                 // yield attempt inside the closer is an error. err = null
                 // (LUA_OK — the closer gets 1 arg). The workhorse nils the
                 // slot (PUC preclose + setnilvalue).
+                //
+                // PUC lua_closeslot(L1, ...) runs the closer ON L1 — the
+                // window thread (the state/thread lane target may differ
+                // from the thread executing this testC builtin). Same
+                // close-context contract as the settop truncation close.
+                if (th != self.activeBytecodeThread()) {
+                    const sctx = self.enterSyncCloseContext(th) catch return error.OutOfMemory;
+                    defer self.restoreSyncCloseContext(sctx);
+                    const final_err = try self.closeTbcRegion(
+                        th,
+                        th,
+                        th.c_tbc_chain.items.len - 1,
+                        null,
+                        null,
+                        0,
+                        false,
+                        &.{},
+                    );
+                    if (final_err) |fe| try self.crossCloseErrorRaise(sctx, th, fe);
+                    return null;
+                }
                 const final_err = try self.closeTbcRegion(
                     th,
                     th,

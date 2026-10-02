@@ -45,6 +45,40 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
+- [x] **C-S3 correction: ERRMEM из живой C-continuation портит TBC slot
+  при `lua_resume` (BLOCKER, FIX-NOW; review `9057be2`).** Suite 39
+  W-OOM проверяет только status и top error, поэтому пропускает close:
+  после запрещённой аллокации в `k_cont_oom` Zig `lua_closethread`
+  возвращает `metamethod 'close' is nil`, LOG пуст, status 2; PUC
+  закрывает исходный Table на CO с `not enough memory` и возвращает
+  status 4. Репродюсер `/tmp/cs3_oom_close.c` (suite 39 W-OOM +
+  `lua_closethread` после unfreeze), raw
+  `/tmp/cs3_oom_close_{zig,puc}.txt`.
+  Первый неверный путь: C-API OOM через `cThrowOn` не ставит
+  `err_c_window`; `resumeErrorWindowIntact` отклоняет сохранённое C-окно,
+  `c_api.zig` reconstruction коллапсирует top к `cWindowBase` поверх
+  frame-slot mark. Нужен PUC `luaD_seterrorobj(ERRMEM)` append на живом
+  top с fixed MEMERRMSG, без потери error kind и без allocation.
+  CLOSED (C-S3 OOM correction, `62588a7`, 2026-10-02): ErrCWindow.kind
+  (raise/errmem) + latchErrmemRaiseWindow на ВСЕХ C-API OOM throw
+  boundaries (cThrowOn, lua_pcallk, auxwrap x2); eligibility-driven
+  publication в apiResumeThread-failed arms (c_api lua_resume, api.zig
+  @"resume"); closethread status transport (last_close_status, ERRMEM
+  death -> 4); nonallocating fixed MEMERRMSG; origin/status-различение
+  вместо equality. Suite 39: W-OOM full-parity (closethread st=4,
+  |CO/not enough memory, mark_is_obj=1, повторный close без дубля, VM
+  reuse) + контроль W-OOMR (recovery) — byte-identical PUC D+RF
+  (координатор верифицировал лично). Unit-тест OOM-формы скорректирован
+  по probe-доказательству (PUC: k с body C-кадром, memerrmsg на живом
+  top пустого окна nres=1; старый [oom,oom] nres=2 пиннил
+  пре-correction форму; pushcfunction-триггер в PUC 5.5 инвалиден —
+  заменён pushlstring; FO6 alloc-расхождение задокументировано).
+  Гейты: battery 359/359 D+RF; 26/27 suites identical; smoke PASS
+  (попутно закрыт F3(cs3) gc.lua step-dots); matrix zig_fail=0; api580
+  GREEN (Thread 3864). Perf: +0.18% шум. FO1 HIGH pre-existing —
+  suite 14_state_handles hook-yield assert на HEAD (известный пункт 14,
+  stash-verified не этим cut'ом).
+
 - [ ] **F1(cs3): cross-thread `lua_settop(co,0)` close — closers
   работают на identity вызывающего (HIGH; найден cs3-cut, механизм
   pre-existing).** zig печатает `|MAIN`, PUC `|CO`; нужен switchThread

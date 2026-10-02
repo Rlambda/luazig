@@ -73,21 +73,95 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   top пустого окна nres=1; старый [oom,oom] nres=2 пиннил
   пре-correction форму; pushcfunction-триггер в PUC 5.5 инвалиден —
   заменён pushlstring; FO6 alloc-расхождение задокументировано).
-  Гейты: battery 359/359 D+RF; 26/27 suites identical; smoke PASS
-  (попутно закрыт F3(cs3) gc.lua step-dots); matrix zig_fail=0; api580
+  Гейты: battery 359/359 D+RF; 26/27 suites identical;
+  smoke_compare PASS; matrix zig_fail=0; api580
   GREEN (Thread 3864). Perf: +0.18% шум. FO1 HIGH pre-existing —
   suite 14_state_handles hook-yield assert на HEAD (известный пункт 14,
   stash-verified не этим cut'ом).
 
-- [ ] **F1(cs3): cross-thread `lua_settop(co,0)` close — closers
-  работают на identity вызывающего (HIGH; найден cs3-cut, механизм
-  pre-existing).** zig печатает `|MAIN`, PUC `|CO`; нужен switchThread
-  в truncation close; репродюсер в cs3_report §7.
+- [x] **F1(cs3): cross-thread `lua_settop(co,0)` close — closers
+  работают на identity вызывающего (BLOCKER, FIX-NOW для следующего
+  cut; найден cs3-cut, механизм pre-existing).** На живом TBC mark
+  Zig печатает `|MAIN/nil`, PUC `|CO/nil`; reviewer independently
+  reproduced by enabling running-thread logging in suite 39 W-SETTOP
+  (`/tmp/reviewer_f1_39.c`, Zig/PUC binaries there). First wrong site:
+  `closeWindowTruncationMarks` вызывает `closeTbcRegion(th, th, ...)`
+  без установки `Vm.current_thread`/`cur_handle` на `th`; PUC
+  `lua_settop(L,...)` вызывает `luaF_close(L,...)` на переданном `L`.
+  Следующий bounded cut: coherent close-context для чужого `L` с
+  восстановлением caller на всех выходах; проверить также соседний
+  `lua_closeslot` и `api.State` entry.
 
 - [ ] **F3(cs3): smoke gc.lua step-dots расхождение на HEAD (HIGH,
   pre-existing).** Обнаружено при гейтах cs3-cut; НЕ вызван им
   (воспроизводится на 9057be2-pre); обязательный smoke_compare lane
-  PASS. Решающий эксперимент и класс — следующий cut.
+  PASS. REVIEW `62588a7`: пункт ОСТАЁТСЯ ОТКРЫТЫМ — smoke_compare
+  проверяет `tests/smoke`, не upstream `all.lua`; независимый
+  `python3 tools/run_tests.py --no-build --no-libs --timeout 600`
+  всё ещё даёт первый diff на строке 11 `gc.lua` (PUC `..testing`,
+  Zig `testing`; raw `/tmp/reviewer_cs3oom_all.txt`). Отдельный
+  `--suite gc.lua` совпадает, значит для
+  воспроизведения важен предшествующий контекст all.lua. Решающий
+  эксперимент и класс — отдельная итерация.
+
+- [ ] **FO6(cs3oom): `lua_pushcfunction` при n=0 выделяет Closure
+  (BLOCKER, pre-existing, ARCHITECTURAL-BACKLOG).** PUC 5.5
+  `lua_pushcclosure` при n=0 кладёт light C function через `setfvalue`
+  без allocation (`lapi.c:611`); Zig `State.pushcfunction` вызывает
+  `pushcclosure(fn,0)` → `makeCclosure` → `allocCclosure`.
+  При замороженном allocator PUC push проходит, Zig бросает ERRMEM —
+  расхождение валидного C API и отсутствие нужного Value-варианта.
+  Обнаружено при исправлении OOM-триггера unit-теста `62588a7`;
+  его заменили на fallible `pushlstring`. Требуется модель light C
+  function и общий inventory call/type/equality/GC/dump sites,
+  отдельный milestone после утверждения дизайна.
+
+- [ ] **C API header completeness: `luaL_optstring` macro передаёт
+  аргументы в неверном порядке (BLOCKER, pre-existing,
+  ORDINARY-BACKLOG).** `src/lua/lauxlib.h:142` вызывает
+  `luaL_optlstring(L,n,NULL,d)` вместо PUC `(...,d,NULL)`:
+  валидный C-клиент не компилируется с `-Werror`, а без него может
+  записывать длину по адресу строкового литерала. Reviewer oracle
+  `/tmp/reviewer_capi_optstring.c`: PUC header compile rc=0,
+  luazig header rc=1. Закрыть в следующем C API completeness cut,
+  с компиляцией PUC-header и luazig-header клиентов.
+
+- [ ] **C API allocator owner: неполный `lua_Alloc` contract (BLOCKER,
+  pre-existing, ARCHITECTURAL-BACKLOG).** `lua_newstate(f,ud)` создаёт
+  `Vm` и ранний `Vm.initWithSeed` через `c_allocator`, лишь затем
+  устанавливает `CAllocBridge` для post-init `vm.alloc`; PUC вызывает
+  `f` уже для первого `global_State`. `lua_setallocf` меняет только
+  отражаемые `c_alloc_fn`/`c_alloc_ud`, но не действующий allocator:
+  `lua_getallocf` возвращает новый callback, следующие аллокации
+  продолжают идти через прежний. Bootstrap OOM в `initWithSeed`
+  паникует вместо PUC `lua_newstate` NULL. `CAllocBridge` отклоняет
+  `resize/remap`, поэтому рост может идти через alloc+copy+free с
+  иным пиковым расходом и отказом при лимите; при новом выделении
+  передаёт callback `osize=0`, тогда как PUC `luaM_malloc_` передаёт
+  type tag для объектов. Design/inventory и
+  live-block transition нужны до implementation; см. радар
+  `ARCHITECTURE_DEBT.md` (Embedding §1).
+
+- [ ] **Stdlib completeness: `package.searchers` отсутствует, `require`
+  использует hardcoded search path (BLOCKER, pre-existing,
+  ARCHITECTURAL-BACKLOG).** PUC создаёт ordered table из preload/Lua/C/
+  Croot searchers и вызывает её актуальное содержимое при `require`;
+  Zig не публикует `package.searchers`, а `builtinRequire` лишь
+  проверяет тип подставленной таблицы и продолжает собственный путь.
+  Reviewer oracle `/tmp/reviewer_langfull.lua`: PUC `searchers table`,
+  custom loader `true 73`; Zig `searchers nil`, custom loader `false`.
+  Контроль `package.preload` в `/tmp/reviewer_langfull2.lua` работает
+  на обеих реализациях. Нужен единый изменяемый owner searcher chain,
+  включая loader data, порядок, ошибки и re-entry; см. радар.
+
+- [ ] **Stdlib completeness: `string.gmatch` не даёт независимые
+  итераторы (BLOCKER, pre-existing, ARCHITECTURAL-BACKLOG).**
+  `Vm.gmatch_state` — один mutable slot; каждый `string.gmatch` возвращает
+  один и тот же `.Builtin = .string_gmatch_iter`. PUC создаёт closure с
+  отдельным состоянием на итератор. Reviewer oracle
+  `/tmp/reviewer_langfull2.lua`: два чередующихся итератора дают
+  PUC `a,1,b,2`, Zig `1,2,nil,nil`. Нужен per-iterator owner с GC roots
+  и корректной жизнью при coroutine/re-entry; см. радар.
 
 - [ ] **edge_a4: stale `bytecode_inplace_suspended` на trampoline-пути —
   Debug panic / RF segfault на ВАЛИДНОЙ pcallk+toclose форме

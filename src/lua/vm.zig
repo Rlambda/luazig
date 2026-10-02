@@ -1635,6 +1635,14 @@ const CClsretState = struct {
     /// (precover's pcallk-entry snapshot — the C function's own marks are
     /// below it and must not close in this pass).
     chain_base: usize = 0,
+    /// The thread that OWNS the chain the close was running over. Null
+    /// means the CLSRET frame's own thread. A testc state-lane recovery
+    /// close runs over the WINDOW owner's chain (another thread) while
+    /// the suspended frame (and the re-entry drive) live on the
+    /// recovering thread — the re-entry must replay the close on the
+    /// same chain. The thread stays GC-reachable through the frame's
+    /// testc_state (state table -> _mainthread); traced here as well.
+    chain_th: ?*Thread = null,
 };
 
 const CloseMode = enum { return_close, error_escape };
@@ -8143,7 +8151,7 @@ pub const Vm = struct {
         // whole chain (same exhaustion subtlety as closeWindowTruncationMarks).
         const run_start: usize = if (broke) i + 1 else i;
         if (run_start >= chain.items.len) return; // empty run
-        const final_err = try self.closeTbcRegion(th, run_start, null, null, 0, false, &.{});
+        const final_err = try self.closeTbcRegion(th, th, run_start, null, null, 0, false, &.{});
         if (final_err) |fe| {
             // A closer errored (last-error-wins; err_obj was set by fail()
             // inside the close). PUC: the error escapes lua_settop to the
@@ -15458,29 +15466,26 @@ pub const Vm = struct {
             else
                 self.errThread().err_obj;
             if (self.errThread().err_has_obj) {
-                if (fr.u.c.testc_state != null) {
-                    // testc frame: the window lives on the state's target
-                    // thread (the direct/closure/hook lanes: th itself; the
-                    // state lane: the state's main thread). funcidx is
-                    // window-relative on that thread's window (the callee's
-                    // position — .pcallk passes call_idx, the c_api
-                    // lua_pcallk convention). Truncate to it, then push the
-                    // error at the callee's old slot: the continuation shim
-                    // sees [prefix..., error] (PUC: L->top = func + 1).
-                    const wth = if (fr.u.c.testc_state) |tcs| (tcs.target orelse th) else th;
-                    self.truncateToPcallkFuncidx(wth, funcidx);
-                    self.cWindowPush(wth, publish_obj) catch {};
-                } else {
-                    // Production frame: the window lives on th.stack.
-                    // funcidx is window-relative (the callee's position);
-                    // truncate to it, then push the error AT the callee's
-                    // old slot (PUC: L->top = func + 1). Any production
-                    // marks at/above funcidx were already closed by
-                    // precover's region close — the truncation close inside
-                    // cWindowSetCount finds nothing (defensive).
-                    self.truncateToPcallkFuncidx(th, funcidx);
-                    self.cWindowPush(th, publish_obj) catch {};
-                }
+                // The window lives on wth — the testc state's target (the
+                // direct/closure/hook lanes: th itself; the state lane: the
+                // state's main thread) or th for a production frame. funcidx
+                // is window-relative (the callee's position — .pcallk passes
+                // call_idx, the c_api lua_pcallk convention); the testc
+                // window sits win_off slots above wth's C-API anchor.
+                // Truncate to the callee's slot, then push the error AT the
+                // callee's old slot: the continuation shim sees
+                // [prefix..., error] (PUC: L->top = func + 1). After Cut 3's
+                // precover region close the truncation close inside
+                // cWindowSetCount finds NOTHING for either lane — precover
+                // already closed every mark at/above the callee's slot with
+                // the error, exactly PUC finishpcallk's
+                // luaF_close(func, status, yy=1) BEFORE seterrorobj — the
+                // truncation is stack-shape discipline only (defensive).
+                const tcs = fr.u.c.testc_state;
+                const wth = if (tcs) |tc| (tc.target orelse th) else th;
+                const win_off: usize = if (tcs) |tc| tc.win_off else 0;
+                self.truncateToPcallkFuncidx(wth, win_off + funcidx);
+                self.cWindowPush(wth, publish_obj) catch {};
             }
             // PUC: luaD_shrinkstack(L)
             self.shrinkBcStack();
@@ -15614,19 +15619,32 @@ pub const Vm = struct {
         // the closer's fail()), refresh CIST_RECST, and close again until
         // the region is empty.
         const pcallk_chain_base = fr.u.c.aux.pcallk.chain_base;
+        const pcallk_funcidx = fr.u.c.aux.pcallk.funcidx;
         var region_base: usize = pcallk_chain_base;
         // A re-drive (after a mid-recovery suspension) may find the region
         // already fully closed below the snapshot — clamp before scanning.
         if (th.c_tbc_chain.items.len < region_base) region_base = th.c_tbc_chain.items.len;
-        if (fr.u.c.testc_state == null) {
-            // Production frame: the window (and the chain) live on th;
-            // level = the pcallk'd callee's absolute slot. PUC has ONE
-            // tbclist: finishpcallk's luaF_close(func, status, yy=1)
-            // closes every entry at a slot >= the callee's, whether it
-            // was marked before or after pcallk armed the frame — the
-            // level scan below extends the snapshot region down through
-            // qualifying pre-pcallk arg-marks.
-            const level = fr.frameBase() + fr.u.c.aux.pcallk.funcidx;
+        // The window owner: th for production frames and the same-thread
+        // testc lanes (direct/closure/hook — TestcContState.target null);
+        // the state lane's target thread for a state-lane pcallk (the
+        // k-frame lives on th, the window and its marks on the target).
+        // tcs is a heap pointer — stable across the closer-driven frame
+        // growth below; `fr` itself is NOT (re-fetch after any close).
+        const tcs = fr.u.c.testc_state;
+        const wth: ?*Thread = if (tcs) |tc| tc.target else null;
+        if (wth == null) {
+            // The window (and the chain) live on th; level = the pcallk'd
+            // callee's absolute slot. The YPCALL frame is th's TOP frame
+            // here (the pop loop above removed everything above it), so
+            // its base IS the C-API window anchor; win_off lifts the testc
+            // window above it (0 for the production and direct lanes).
+            // PUC has ONE tbclist: finishpcallk's
+            // luaF_close(func, status, yy=1) closes every entry at a slot
+            // >= the callee's, whether it was marked before or after pcallk
+            // armed the frame — the level scan below extends the snapshot
+            // region down through qualifying pre-pcallk arg-marks.
+            const win_off: usize = if (tcs) |tc| tc.win_off else 0;
+            const level = fr.frameBase() + win_off + pcallk_funcidx;
             while (region_base > 0) {
                 const below = th.c_tbc_chain.items[region_base - 1];
                 const in_region = switch (below) {
@@ -15637,13 +15655,15 @@ pub const Vm = struct {
                 region_base -= 1;
             }
         }
-        // testc frames keep the snapshot as the region base: their window
-        // may live on another thread's state lane, where th-relative slot
-        // comparisons are meaningless.
+        // A state-lane frame (wth != null) keeps the snapshot as th's
+        // region base: th-relative slot comparisons are meaningless for
+        // the window's marks — they live on wth's chain, in wth-stack
+        // coordinates, and close below.
         while (true) {
             const err_arg: ?Value = if (self.errThread().err_has_obj) self.errThread().err_obj else null;
             const err_status_i: i32 = self.errThread().errStatus();
             _ = try self.closeTbcRegion(
+                th,
                 th,
                 region_base,
                 ci_idx,
@@ -15670,6 +15690,58 @@ pub const Vm = struct {
             // it changes during the close.
             const fr_now = th.call_frames.getPtr(ci_idx);
             fr_now.callstatus = setcistrecst(fr_now.callstatus, @intCast(self.errThread().errStatus()));
+        }
+        // State lane (wth != null): the script's toclose marks live on the
+        // TARGET's chain in wth-stack coordinates — including pre-pcallk
+        // arg-marks at/above the callee's slot, which close HERE with the
+        // error (the same set PUC finishpcallk's
+        // luaF_close(func, status, yy=1) closes at the callee's level).
+        // No PUC parity reference exists for this lane (PUC ltests arms
+        // state-lane pcallk on L1, where an error aborts the stand-alone
+        // interpreter) — this is the zig-internal contract: select the
+        // region by LEVEL on wth's chain (the live window anchor + win_off
+        // + funcidx — the callee's absolute slot), close it AFTER th's
+        // region, yieldable, with the in-flight error, re-driven on closer
+        // errors — the same regime as th's region above. The closers and
+        // the CLSRET park run on th (the recovering thread); the chain,
+        // the mark slots, and the staging raise stay on wth (the chain
+        // owner) — closeTbcRegion's chain/run split.
+        if (wth) |wt| {
+            const wlevel = Vm.cWindowBase(wt) + tcs.?.win_off + pcallk_funcidx;
+            // Level scan from the chain TOP: the qualifying entries (slot
+            // >= the callee's) form a chain suffix under PUC's tbclist
+            // discipline (every new mark above the last); marks below the
+            // callee (the window prefix locals) stay out and close at the
+            // frame's return instead.
+            var wbase = wt.c_tbc_chain.items.len;
+            while (wbase > 0) {
+                const below = wt.c_tbc_chain.items[wbase - 1];
+                const in_region = switch (below) {
+                    .frame_slot => |fs| fs.slot_idx >= wlevel,
+                    .detached => |d| d.level >= wlevel,
+                };
+                if (!in_region) break;
+                wbase -= 1;
+            }
+            while (true) {
+                const err_arg: ?Value = if (self.errThread().err_has_obj) self.errThread().err_obj else null;
+                const err_status_i: i32 = self.errThread().errStatus();
+                _ = try self.closeTbcRegion(
+                    wt,
+                    th,
+                    wbase,
+                    ci_idx,
+                    err_arg,
+                    err_status_i,
+                    true,
+                    &.{},
+                );
+                // Drain gate + RECST refresh — same contract as th's
+                // re-drive loop above.
+                if (wt.c_tbc_chain.items.len <= wbase) break;
+                const fr_now = th.call_frames.getPtr(ci_idx);
+                fr_now.callstatus = setcistrecst(fr_now.callstatus, @intCast(self.errThread().errStatus()));
+            }
         }
         // PUC: luaD_rawrunprotected(L, unroll, NULL) — re-enter unroll.
         // luazig: the drive loop IS unroll. Return true to signal the
@@ -15739,7 +15811,7 @@ pub const Vm = struct {
                 .return_close => null,
                 .error_escape => cs.error_value,
             };
-            const final_err = self.closeTbcRegion(th, cs.chain_base, my_idx, err_arg, cs.error_status, true, cs.results) catch |e| switch (e) {
+            const final_err = self.closeTbcRegion(cs.chain_th orelse th, th, cs.chain_base, my_idx, err_arg, cs.error_status, true, cs.results) catch |e| switch (e) {
                 error.Yield => {
                     // A closer yielded again: the workhorse updated
                     // clsret_state in place. The frame stays with
@@ -15970,7 +16042,7 @@ pub const Vm = struct {
             // resolve through the window; a yielding closer leaves the
             // frame + window in place for the next resume.
             if (threadTbcRegionNonEmpty(th, fr.tbc_chain_base)) {
-                const final_err = self.closeTbcRegion(th, fr.tbc_chain_base, my_idx, null, 0, true, results) catch |e| switch (e) {
+                const final_err = self.closeTbcRegion(th, th, fr.tbc_chain_base, my_idx, null, 0, true, results) catch |e| switch (e) {
                     error.Yield => {
                         // A closer yielded: clsret_state (with the saved
                         // results) is installed on the frame. The frame is
@@ -16037,7 +16109,7 @@ pub const Vm = struct {
                 const results = try self.alloc.dupe(Value, ri);
                 var results_owned = true;
                 errdefer if (results_owned) self.alloc.free(results);
-                const final_err = self.closeTbcRegion(th, fr.tbc_chain_base, my_idx, null, 0, true, results) catch |e| switch (e) {
+                const final_err = self.closeTbcRegion(th, th, fr.tbc_chain_base, my_idx, null, 0, true, results) catch |e| switch (e) {
                     error.Yield => {
                         // A closer yielded: clsret_state (with the saved
                         // results) is installed on the frame. The frame is
@@ -17106,7 +17178,7 @@ pub const Vm = struct {
                     //    boundary region close owns them.)
                     if (owner.close_mode) {
                         const err_arg: ?Value = if (state.error_value == .Nil) null else state.error_value;
-                        const final_err = try self.closeTbcRegion(owner, frame.tbc_chain_base, frame_index, err_arg, 2, false, &.{});
+                        const final_err = try self.closeTbcRegion(owner, owner, frame.tbc_chain_base, frame_index, err_arg, 2, false, &.{});
                         if (final_err) |fe| {
                             // A closer errored: last-error-wins — the new error
                             // replaces the unwind's error for the remaining
@@ -17134,7 +17206,7 @@ pub const Vm = struct {
                 // thread-close close owns them.
                 if (owner.close_mode) {
                     const err_arg: ?Value = if (state.error_value == .Nil) null else state.error_value;
-                    const final_err = try self.closeTbcRegion(owner, frame.tbc_chain_base, null, err_arg, 2, false, &.{});
+                    const final_err = try self.closeTbcRegion(owner, owner, frame.tbc_chain_base, null, err_arg, 2, false, &.{});
                     if (final_err) |fe| {
                         // A closer errored: last-error-wins — the new error
                         // replaces the unwind's error for the remaining
@@ -29442,7 +29514,7 @@ pub const Vm = struct {
                         // (yy=0): clsret_frame=null.
                         if (th.c_tbc_chain.items.len > 0) {
                             const err_arg: ?Value = if (th.close_has_err) th.close_err else null;
-                            const final_err = try self.closeTbcRegion(th, 0, null, err_arg, 2, false, &.{});
+                            const final_err = try self.closeTbcRegion(th, th, 0, null, err_arg, 2, false, &.{});
                             if (final_err) |fe| {
                                 th.close_has_err = true;
                                 th.close_err = fe;
@@ -30059,7 +30131,7 @@ pub const Vm = struct {
         // installed. incnny (inside closeTbcRegion) lands on th — the
         // closed thread — so a yielding closer fails with the
         // C-call-boundary error, exactly like PUC callclosemethod.
-        return self.closeTbcRegion(th, 0, null, err, err_status, false, &.{});
+        return self.closeTbcRegion(th, th, 0, null, err, err_status, false, &.{});
     }
 
     /// P16.50-review-8: the close transport's failed-close report — a
@@ -34245,6 +34317,11 @@ pub const Vm = struct {
                         if (cs.error_value) |v| {
                             if (GcObject.fromValue(v) != null) try self.gcMarkValue(v);
                         }
+                        // A state-lane recovery close suspends with its
+                        // region on ANOTHER thread's chain; keep that
+                        // thread (and its stack-rooted marks) reachable
+                        // through the suspension.
+                        if (cs.chain_th) |cth| try self.gcMarkValue(.{ .Thread = cth });
                     }
                 }
                 // P16.30 Stage C: trace the thread's C-API TBC chain.
@@ -47048,7 +47125,15 @@ pub const Vm = struct {
     /// CClsretState install (the frame that stays pushed across the
     /// yield; its window lives on th.stack). null for close-all sites
     /// (always non-yieldable — a dead thread has no frames to suspend
-    /// on).
+    /// on). The index is into `run_th`'s call_frames.
+    ///
+    /// `th` owns the CHAIN and the mark slots (staging raise, seterrorobj
+    /// slot writes, stack growth). `run_th` is the thread the closers run
+    /// on: it owns the C-call depth accounting and the `clsret_frame`
+    /// park. They differ only for a testc state-lane recovery close (the
+    /// marks live on the window owner's chain while the recovery frame,
+    /// the closers, and the resume drive live on the recovering thread);
+    /// every other caller passes the same thread for both.
     ///
     /// `err` / `err_status`: the in-flight error (PUC `luaF_close`'s
     /// `status` argument): null = closing with no error (`__close` gets
@@ -47084,6 +47169,7 @@ pub const Vm = struct {
     fn closeTbcRegion(
         self: *Vm,
         th: *Thread,
+        run_th: *Thread,
         base: usize,
         clsret_frame: ?usize,
         err: ?Value,
@@ -47207,7 +47293,7 @@ pub const Vm = struct {
             // including the yy=1 yield park (PUC's yield longjmps past
             // ccall's decrement; lua_resume re-derives nCcalls on resume).
             const ccall_mode: Thread.CCallMode = if (!yieldable) .nonyieldable else .yieldable;
-            self.ccallEnter(th, ccall_mode) catch |ccall_err| switch (ccall_err) {
+            self.ccallEnter(run_th, ccall_mode) catch |ccall_err| switch (ccall_err) {
                 error.RuntimeError => {
                     // C-stack overflow (ccallEnter's depth guard): the
                     // metamethod never runs. PUC's ccall raises before
@@ -47226,7 +47312,7 @@ pub const Vm = struct {
                 },
                 else => return ccall_err,
             };
-            defer th.ccallExit(ccall_mode);
+            defer run_th.ccallExit(ccall_mode);
             const closer_result = self.runCloseMetamethod(val, cur_err);
             closer_result catch |e| switch (e) {
                 error.Yield => {
@@ -47245,10 +47331,10 @@ pub const Vm = struct {
                     }
                     // PUC yy=1: the close suspends mid-way. Install (or
                     // update) the CClsretState; the caller propagates the
-                    // yield with the frame left pushed (its window lives
-                    // on th.stack).
+                    // yield with the frame left pushed on run_th (the
+                    // closers and the resume drive run there).
                     const fr_idx = clsret_frame orelse unreachable; // close-all sites are non-yieldable
-                    const fr = th.call_frames.getPtr(fr_idx);
+                    const fr = run_th.call_frames.getPtr(fr_idx);
                     if (fr.u.c.clsret_state) |cs| {
                         // Resumed close yielding again — update in place
                         // (cs.results already carries the saved results).
@@ -47268,6 +47354,7 @@ pub const Vm = struct {
                             .error_value = cur_err,
                             .error_status = cur_status,
                             .chain_base = base,
+                            .chain_th = th,
                         };
                         fr.u.c.clsret_state = cs;
                         fr.setClsret();
@@ -47356,7 +47443,7 @@ pub const Vm = struct {
             // This C frame's region: every mark newer than the frame.
             // clsret_frame=null: the forced close is non-yieldable
             // (yy=0), so no CLSRET can be installed.
-            const final_err = try self.closeTbcRegion(th, top.tbc_chain_base, null, cur_err, 2, false, &.{});
+            const final_err = try self.closeTbcRegion(th, th, top.tbc_chain_base, null, cur_err, 2, false, &.{});
             if (final_err) |fe| cur_err = fe;
             self.discardCFrame(th);
         }
@@ -47364,7 +47451,7 @@ pub const Vm = struct {
         // frame's region — close them with the running error (PUC
         // luaE_resetthread's closeprotected pass reaches them last).
         if (framesAtBase(th)) {
-            const final_err = try self.closeTbcRegion(th, 0, null, cur_err, 2, false, &.{});
+            const final_err = try self.closeTbcRegion(th, th, 0, null, cur_err, 2, false, &.{});
             if (final_err) |fe| cur_err = fe;
         }
         return cur_err;
@@ -47404,7 +47491,7 @@ pub const Vm = struct {
         const base = fr.tbc_chain_base;
         if (!threadTbcRegionNonEmpty(th, base)) return;
         const err: ?Value = if (self.errThread().err_has_obj) self.errThread().err_obj else null;
-        const final = self.closeTbcRegion(th, base, null, err, 2, false, &.{}) catch return;
+        const final = self.closeTbcRegion(th, th, base, null, err, 2, false, &.{}) catch return;
         if (final) |fe| {
             // The final closer error replaces the pcall failure's error
             // object (PUC: luaD_closeprotected's status → luaD_seterrorobj).
@@ -47430,7 +47517,7 @@ pub const Vm = struct {
         if (!threadTbcRegionNonEmpty(th, base)) return;
         const err: ?Value = if (self.errThread().err_has_obj) self.errThread().err_obj else null;
         const err_status: i32 = if (self.errThread().err_is_errerr) 5 else 2;
-        const final = self.closeTbcRegion(th, base, null, err, err_status, false, &.{}) catch return;
+        const final = self.closeTbcRegion(th, th, base, null, err, err_status, false, &.{}) catch return;
         if (final) |fe| {
             // The final closer error replaces the pcall failure's error
             // object (PUC: luaD_closeprotected's status → luaD_seterrorobj).
@@ -48313,7 +48400,7 @@ pub const Vm = struct {
             // already popped above it) — the exact PUC
             // luaF_close(ci->func, CLOSEKTOP) level set.
             if (threadTbcRegionNonEmpty(th, cur_fr.tbc_chain_base)) {
-                const final_err = self.closeTbcRegion(th, cur_fr.tbc_chain_base, my_cframe_idx, null, 0, true, saved_results) catch |e| switch (e) {
+                const final_err = self.closeTbcRegion(th, th, cur_fr.tbc_chain_base, my_cframe_idx, null, 0, true, saved_results) catch |e| switch (e) {
                     error.Yield => {
                         // A closer yielded: the workhorse installed a
                         // CClsretState (with the saved results) on the
@@ -50283,7 +50370,7 @@ pub const Vm = struct {
                 // concats the error with Y → "hiho").
                 {
                     const err_val: ?Value = if (sub_vm.errThread().err_has_obj) sub_vm.errThread().err_obj else null;
-                    const final = sub_vm.closeTbcRegion(sth, 0, null, err_val, 2, false, &.{}) catch null;
+                    const final = sub_vm.closeTbcRegion(sth, sth, 0, null, err_val, 2, false, &.{}) catch null;
                     if (final) |fe| {
                         sub_vm.errThread().err_has_obj = true;
                         sub_vm.errThread().err_obj = fe;
@@ -50517,7 +50604,7 @@ pub const Vm = struct {
                 const results = try self.copyTestcReturnValues(win.slice(), spec);
                 var results_owned = true;
                 errdefer if (results_owned) self.infraAlloc().free(results);
-                const final_err = self.closeTbcRegion(th, sfr.tbc_chain_base, frame_idx, null, 0, true, results) catch |e| switch (e) {
+                const final_err = self.closeTbcRegion(th, th, sfr.tbc_chain_base, frame_idx, null, 0, true, results) catch |e| switch (e) {
                     error.Yield => {
                         // A closer yielded: clsret_state (with the saved
                         // results) is installed on the testC C-frame.
@@ -52223,6 +52310,7 @@ pub const Vm = struct {
                 // (LUA_OK — the closer gets 1 arg). The workhorse nils the
                 // slot (PUC preclose + setnilvalue).
                 const final_err = try self.closeTbcRegion(
+                    th,
                     th,
                     th.c_tbc_chain.items.len - 1,
                     null,
@@ -71621,23 +71709,22 @@ test "builtin yield closer: local alias shape keeps the callee above live close 
 //
 // When a testC pcallk'd callee errors, the error unwind parks the frames
 // (bytecode_inplace_suspended = true) to preserve the YPCALL C-frame, and
-// the recovery then runs the marked slot's __close from INSIDE finishCcall
-// (finishpcallk's truncation close). The nested closer enters
-// runBytecodeInternal with the C-frame on top: in-place resume must be
-// rejected there — the flag's park is not the top frame — so the closer
-// stages as a fresh Lua frame. Dispatching the C-frame's union as bytecode
-// was a Debug panic / ReleaseFast crash.
+// precover's region close then runs the pre-pcallk arg-marks' __close from
+// INSIDE the recovery (PUC finishpcallk's luaF_close(func, status, yy=1):
+// every mark at/above the callee's slot, with the ORIGINAL error object,
+// yieldable — a yielding closer suspends the recovery on the pcall frame).
+// The nested closer enters runBytecodeInternal with the C-frame on top:
+// in-place resume must be rejected there — the flag's park is not the top
+// frame — so the closer stages as a fresh Lua frame. Dispatching the
+// C-frame's union as bytecode was a Debug panic / ReleaseFast crash.
 //
-// The asserted output is the CURRENT contract, with the known divergences
-// vs PUC kept visible on purpose (they are separate open axes, not
-// normalized here):
-//   - error/yy transport: PUC passes the original error object to the
-//     closer (cl:boom) and a yielding closer suspends the recovery; the
-//     truncation close passes e=nil (cl:nil) and a yield inside it errors,
-//     so resume #1 completes the whole form and the thread is dead.
-//   - slot identity: for the 0-param form PUC's callee frame aliases the
-//     marked slot (the closer never runs, log empty); the staged callee
-//     copy keeps the slot value, so the closer runs with e=nil.
+// The 1-param control and error-closer forms are byte-identical to PUC
+// (verified against the PUC ltests oracle). One known divergence stays
+// visible on purpose (a separate open axis, not normalized here):
+//   - slot identity (0-param form): PUC's callee frame aliases the marked
+//     slot (GETTABUP R0 overwrites it; the closer never runs, log empty);
+//     the staged callee copy keeps the slot value, so the closer RUNS with
+//     e=boom — the zig contract asserted below.
 // The yield form (no error) is byte-identical to PUC and pins the
 // park-consumption path: the parked callee resumes in place, then the k
 // continuation's nested Lua call stages fresh while the YPCALL C-frame is
@@ -71655,7 +71742,10 @@ test "testC pcallk recovery: TBC close inside the C continuation keeps the parke
     // Each form returns: log | resume1 | status1 | resume2-ok | status2.
     const forms = [_]Form{
         // 1-param control: the callee keeps the marked slot's value intact;
-        // the closer is real and yields after logging.
+        // the closer is real, sees the ORIGINAL error object (e=boom), and
+        // yields after logging — byte-identical to PUC (the recovery close
+        // suspends on the pcall frame; resume #2 finishes the closer and
+        // drives the k continuation).
         .{
             .name = "ctrl-1param-yield-closer",
             .src =
@@ -71675,13 +71765,16 @@ test "testC pcallk recovery: TBC close inside the C continuation keeps the parke
             \\local r2 = { coroutine.resume(co, "R2") }
             \\return table.concat(LOG, ","),
             \\  tostring(r1[1]) .. "," .. tostring(r1[2] or "nil"),
-            \\  s1, tostring(r2[1]), coroutine.status(co)
+            \\  s1, tostring(r2[1]) .. "," .. tostring(r2[2] or "nil"),
+            \\  coroutine.status(co)
             ,
-            .want = &.{ "cl:nil", "true,contRan", "dead", "false", "dead" },
+            .want = &.{ "cl:boom,after:R2", "true,inclose", "suspended", "true,contRan", "dead" },
         },
         // 0-param callee: the marked slot sits above the callee's frame.
-        // PUC's closer never runs here (slot identity divergence, see the
-        // header) — the safe-completion contract is what this asserts.
+        // PUC's closer never runs there (the callee's GETTABUP R0
+        // overwrites the marked slot — axis-b slot-identity divergence,
+        // see the header); the staged callee copy keeps the slot, so the
+        // zig contract is the REAL closer with e=boom, suspending.
         .{
             .name = "edge-0param-yield-closer",
             .src =
@@ -71701,12 +71794,14 @@ test "testC pcallk recovery: TBC close inside the C continuation keeps the parke
             \\local r2 = { coroutine.resume(co, "R2") }
             \\return table.concat(LOG, ","),
             \\  tostring(r1[1]) .. "," .. tostring(r1[2] or "nil"),
-            \\  s1, tostring(r2[1]), coroutine.status(co)
+            \\  s1, tostring(r2[1]) .. "," .. tostring(r2[2] or "nil"),
+            \\  coroutine.status(co)
             ,
-            .want = &.{ "cl:nil", "true,contRan", "dead", "false", "dead" },
+            .want = &.{ "cl:boom,after:R2", "true,inclose", "suspended", "true,contRan", "dead" },
         },
         // Erroring closer inside the recovery close: last-error-wins, the
-        // continuation still runs, the thread completes dead.
+        // continuation still runs, the thread completes dead —
+        // byte-identical to PUC.
         .{
             .name = "ctrl-1param-error-closer",
             .src =
@@ -71725,7 +71820,91 @@ test "testC pcallk recovery: TBC close inside the C continuation keeps the parke
             \\  tostring(r1[1]) .. "," .. tostring(r1[2] or "nil"),
             \\  coroutine.status(co)
             ,
+            .want = &.{ "cl:boom", "true,contRan", "dead" },
+        },
+        // Marked slot BELOW the pcallk callee's level (the window prefix,
+        // not an argument): the recovery region close must NOT close it —
+        // it closes at the frame's script-end return close with e=nil.
+        // Byte-identical to PUC.
+        .{
+            .name = "mark-below-func-level",
+            .src =
+            \\local LOG = {}
+            \\local f_1p = function(a) error("boom", 0) end
+            \\local closer = setmetatable({}, { __close = function(o, e)
+            \\  LOG[#LOG + 1] = "cl:" .. tostring(e)
+            \\end })
+            \\local co = coroutine.create(function()
+            \\  return T.testC("pushvalue 3; toclose 5; pushvalue 2; pushvalue 3; pcallk 1 0 4; pushstring afterK; return 2",
+            \\    f_1p, closer, "pushstring contRan; return 1")
+            \\end)
+            \\local r1 = { coroutine.resume(co) }
+            \\return table.concat(LOG, ","),
+            \\  tostring(r1[1]) .. "," .. tostring(r1[2] or "nil"),
+            \\  coroutine.status(co)
+            ,
             .want = &.{ "cl:nil", "true,contRan", "dead" },
+        },
+        // MULTIPLE pre-pcallk arg-marks at/above the callee's slot: both
+        // close in the recovery region close, LIFO (newest/highest first),
+        // each with the ORIGINAL error object. Byte-identical to PUC.
+        .{
+            .name = "multi-arg-marks-lifo",
+            .src =
+            \\local LOG = {}
+            \\local f_2p = function(a, b) error("boom", 0) end
+            \\local ca = setmetatable({}, { __close = function(o, e)
+            \\  LOG[#LOG + 1] = "A:" .. tostring(e)
+            \\end })
+            \\local cb = setmetatable({}, { __close = function(o, e)
+            \\  LOG[#LOG + 1] = "B:" .. tostring(e)
+            \\end })
+            \\local co = coroutine.create(function()
+            \\  return T.testC("pushvalue 2; pushvalue 3; pushvalue 4; toclose 7; toclose 8; pcallk 2 0 5; pushstring afterK; return 2",
+            \\    f_2p, ca, cb, "pushstring contRan; return 1")
+            \\end)
+            \\local r1 = { coroutine.resume(co) }
+            \\return table.concat(LOG, ","),
+            \\  tostring(r1[1]) .. "," .. tostring(r1[2] or "nil"),
+            \\  coroutine.status(co)
+            ,
+            .want = &.{ "B:boom,A:boom", "true,contRan", "dead" },
+        },
+        // State lane: the script's toclose marks live on the STATE's main
+        // thread chain (wth) while the YPCALL k-frame lives on the running
+        // coroutine — precover closes the wth region by LEVEL with the
+        // in-flight error (chain owner wth, run thread th — the
+        // closeTbcRegion chain/run split). No PUC parity reference exists
+        // (PUC's runC arms state-lane pcallk on the target's own thread and
+        // continues the main script on error — a different model); this
+        // asserts the zig-internal contract: the pre-pcallk arg-mark closes
+        // with e=boom, the k continuation runs (its side effect lands), and
+        // nothing cross-corrupts. The k's first RESULT value is lost to a
+        // pre-existing state-lane delivery quirk (testC returns "0" —
+        // baseline-identical, separate axis), so the form asserts the side
+        // effect, not the returned value.
+        // NOTE: the embedded scripts are one-line "..." strings on purpose:
+        // Lua `[[ ]]` literals with newlines allocate normalized constant
+        // bytes in codegen that leak under the testing allocator at deinit
+        // (a pre-existing proto k-string ownership gap, first exposed by
+        // this form — reported separately; no other unit test compiles
+        // `[[ ]]` literals).
+        .{
+            .name = "state-lane-arg-mark",
+            .src =
+            \\local state = T.newstate()
+            \\T.loadlib(state, 1 | 2, 4)
+            \\local ok = T.doremote(state, "LOG = {}; X = function(a) error('boom', 0) end; CL = setmetatable({}, { __close = function(o, e) LOG[#LOG + 1] = 'cl:' .. tostring(e) end }); Z = 'unset'; return 'ok'")
+            \\local co = coroutine.create(function()
+            \\  return T.testC(state, "getglobal X; pushstring 'pushstring contRan; setglobal Z; return 1'; getglobal X; getglobal CL; toclose 4; pcallk 1 0 2; pushstring afterK; return 2")
+            \\end)
+            \\local r1 = { coroutine.resume(co) }
+            \\local log = T.doremote(state, "local s = ''; for i = 1, #LOG do s = s .. tostring(LOG[i]) .. ',' end; return s")
+            \\local z = T.doremote(state, "return tostring(Z)")
+            \\T.closestate(state)
+            \\return log, z, tostring(r1[1]), coroutine.status(co)
+            ,
+            .want = &.{ "cl:boom,", "contRan", "true", "dead" },
         },
         // Yield form (no error): PUC-identical. The parked callee resumes
         // in place; the k continuation then calls a Lua function while the

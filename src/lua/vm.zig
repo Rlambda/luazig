@@ -29198,10 +29198,234 @@ pub const Vm = struct {
         // levels), where each level's continuation must see the callee's
         // results (PUC luaD_poscall places them on the caller's stack
         // BEFORE k runs). resume_inbox carries those results to the shim.
-        if (th.bytecode_inplace_suspended and
-            th.call_frames.len() > 0 and
-            !th.call_frames.getConstPtr(th.call_frames.len() - 1).isC())
-        {
+        // PUC lua_resume routes ANY error status from ANY body kind through
+        // precover into this SAME unroll (recover -> finishCcall -> k), so
+        // the fresh body runs FIRST when no frames are preserved, and a
+        // recovered body error (a live YPCALL C-frame on top) re-enters this
+        // unroll via recovered_to_unroll instead of a second drive loop. The
+        // entry condition does not exclude a C-frame on top: the resume-entry
+        // C-frame consumer above and the close-mode reset leave only Lua
+        // frames (or the base) on top on the preserved-frames paths, so a
+        // C-frame here is exactly a recovered YPCALL frame the unroll must
+        // drive (or a stale flag the unroll drains to completion instead of
+        // re-running the body).
+        const unroll_at_entry = th.bytecode_inplace_suspended and
+            th.call_frames.len() > 0;
+        var recovered_to_unroll = false;
+        if (!unroll_at_entry) {
+            // P16.2c: fresh body (or no preserved Lua frame) — resolve here.
+            resolved = try self.resolveCallable(th.callee, exec_args, null);
+            resolved_valid = true;
+            switch (resolved.callee) {
+                .Builtin => |id| {
+                    // Normal path: first run or no preserved Lua frame.
+                    // P16.50-review-7 BLOCKER 4: stage the body builtin's
+                    // results in a buffer sized to its EXACT window
+                    // (builtinOutLen: arg-derivable for window builtins, 0
+                    // for owned producers — their exact results come back
+                    // as an owned slice). The old caller-window sizing
+                    // (outs.len - 1) both truncated large bodies and padded
+                    // short ones (see the payload_n comment above).
+                    const nouts = builtinOutLen(self, id, resolved.args);
+                    if (nouts != 0) {
+                        payload = try self.alloc.alloc(Value, nouts);
+                        payload_n = nouts;
+                        payload_heap = true;
+                    }
+                    // P16.50-review-6 BLOCKER 1: capture the result contract.
+                    // The catch arms set flags and fall through to the common
+                    // tails, which never read the payload on those paths.
+                    if (self.callBuiltin(id, resolved.args, payload, .host, resolved.ccmt)) |co_bres| {
+                        switch (co_bres) {
+                            // Owned results (a T.testC coroutine body) carry
+                            // the EXACT count — replace the staging payload
+                            // with the owned slice (the tail defer frees it
+                            // via self.alloc.free; foreign blocks pass
+                            // through). The resume tail then reports exactly
+                            // vals.len results (PUC lua_resume: the body's
+                            // actual returns).
+                            .owned => |vals| {
+                                if (payload_heap) self.alloc.free(payload);
+                                payload = vals;
+                                payload_n = vals.len;
+                                payload_heap = true;
+                            },
+                            // Window results: the ACTUAL produced count can
+                            // be smaller than the window (coroutine.close's
+                            // 1-of-2, io_read's early nil) — payload_n is
+                            // the produced count, not the window size.
+                            .window => |produced| {
+                                payload_n = produced;
+                            },
+                            // P16.50-review-8: defensive — callBuiltin's
+                            // generic arm materializes spans before
+                            // returning, so a span cannot reach this
+                            // staging switch; treat it as the callee's
+                            // exact results (owned replacement) if one
+                            // ever does.
+                            .span => |sp| {
+                                const vals = try self.materializeResumeSpan(sp);
+                                if (payload_heap) self.alloc.free(payload);
+                                payload = vals;
+                                payload_n = vals.len;
+                                payload_heap = true;
+                            },
+                        }
+                    } else |e| switch (e) {
+                        error.Yield => {
+                            yielded = true;
+                        },
+                        error.RuntimeError, error.OutOfMemory => {
+                            if (e == error.OutOfMemory) self.setOutOfMemoryError();
+                            if (e == error.RuntimeError and th.close_mode and
+                                !self.forced_close_had_error and
+                                !self.isStackOverflowRuntimeError())
+                            {
+                                forced_close_ok = true;
+                            } else recovered: {
+                                // PUC lua_resume centralizes recovery: every
+                                // error status reaching the resume boundary
+                                // goes through precover (ldo.c: after
+                                // rawrunprotected, `status = precover(L,
+                                // status)`), whatever the body kind — the
+                                // pcallk defer covers ERRMEM too. A builtin
+                                // body (T.testC's pcallk) leaves its
+                                // CIST_YPCALL frame armed (callBuiltin's
+                                // error guard preserves it); without precover
+                                // here the frame is dropped and the error
+                                // escapes the coroutine uncaught.
+                                const rec = self.precover(th) catch |pe| switch (pe) {
+                                    // A __close metamethod in the recovery
+                                    // region yielded (yy=1): standard
+                                    // suspension — the values stay in
+                                    // th.yielded (the common yield tail
+                                    // consumes them) and the C-frame keeps
+                                    // its CIST_CLSRET; the next resume
+                                    // re-drives the recovery.
+                                    error.Yield => {
+                                        yielded = true;
+                                        break :recovered;
+                                    },
+                                    else => return pe,
+                                };
+                                if (!rec) {
+                                    if (e == error.OutOfMemory) return error.OutOfMemory;
+                                    ok = false;
+                                    break :recovered;
+                                }
+                                // Recovered: the CIST_YPCALL C-frame is on
+                                // top — re-enter the shared unroll below
+                                // (PUC: precover -> unroll -> finishCcall ->
+                                // k -> poscall). The staging buffer is the
+                                // body builtin's result window, not live
+                                // state: release it so the unroll's
+                                // completion paths own the payload slot.
+                                if (payload_heap) {
+                                    self.alloc.free(payload);
+                                    payload = &[_]Value{};
+                                    payload_n = 0;
+                                    payload_heap = false;
+                                }
+                                th.bytecode_inplace_suspended = true;
+                                recovered_to_unroll = true;
+                            }
+                        },
+                        else => return e,
+                    }
+                },
+                .Closure => |cl| {
+                    if (cl.proto != null and !self.bytecode_coroutine_trampoline_active) {
+                        const step = try self.driveBytecodeCoroutineTrampoline(th, cl, resolved.args, resolved.ccmt);
+                        switch (step) {
+                            .returned => |ret| {
+                                payload = ret;
+                                payload_n = ret.len;
+                                payload_heap = true;
+                            },
+                            .yielded => |ret| {
+                                if (ret.len > 0) {
+                                    payload = ret;
+                                    payload_n = ret.len;
+                                    payload_heap = true;
+                                }
+                                yielded = true;
+                            },
+                            .failed => {
+                                ok = false;
+                            },
+                            .forced_close => {
+                                forced_close_ok = true;
+                            },
+                        }
+                    } else {
+                        const ret_opt: ?[]Value = retblk: {
+                            const r = self.runClosure(cl, resolved.args, resolved.ccmt) catch |e| switch (e) {
+                                error.Yield => {
+                                    yielded = true;
+                                    break :retblk null;
+                                },
+                                error.RuntimeError, error.OutOfMemory => {
+                                    if (e == error.OutOfMemory) self.setOutOfMemoryError();
+                                    if (e == error.RuntimeError and th.yieldedValues() != null and th.capture_yield_id != 0) {
+                                        yielded = true;
+                                        break :retblk null;
+                                    }
+                                    if (e == error.RuntimeError and th.close_mode and
+                                        !self.forced_close_had_error and
+                                        !self.isStackOverflowRuntimeError())
+                                    {
+                                        forced_close_ok = true;
+                                    } else recovered: {
+                                        // PUC precover (ldo.c): any error
+                                        // status reaching the resume boundary
+                                        // recovers through the innermost
+                                        // CIST_YPCALL frame — the pcallk defer
+                                        // covers ERRMEM too. Recovered: the
+                                        // YPCALL C-frame is on top — re-enter
+                                        // the shared unroll below (PUC:
+                                        // precover -> unroll -> finishCcall ->
+                                        // k). Not recovered: the error is
+                                        // uncaught at the resume boundary.
+                                        const rec = self.precover(th) catch |pe| switch (pe) {
+                                            // A __close metamethod in the
+                                            // recovery region yielded (yy=1):
+                                            // standard suspension — the values
+                                            // stay in th.yielded (the common
+                                            // yield tail consumes them) and
+                                            // the C-frame keeps its
+                                            // CIST_CLSRET; the next resume
+                                            // re-drives the recovery.
+                                            error.Yield => {
+                                                yielded = true;
+                                                break :recovered;
+                                            },
+                                            else => return pe,
+                                        };
+                                        if (!rec) {
+                                            if (e == error.OutOfMemory) return error.OutOfMemory;
+                                            ok = false;
+                                            break :recovered;
+                                        }
+                                        th.bytecode_inplace_suspended = true;
+                                        recovered_to_unroll = true;
+                                    }
+                                    break :retblk null;
+                                },
+                                error.ThreadSwitch => return error.ThreadSwitch,
+                            };
+                            break :retblk r;
+                        };
+                        if (ret_opt) |ret| {
+                            payload = ret;
+                            payload_n = ret.len;
+                            payload_heap = true;
+                        }
+                    }
+                },
+                else => return self.fail("coroutine.resume: bad thread", .{}),
+            }
+        }
+        if (unroll_at_entry or recovered_to_unroll) {
             unroll_loop: while (true) {
                 // (A) All frames popped: the last poscall left the final
                 // results in resume_inbox. "Popped" means
@@ -29275,6 +29499,21 @@ pub const Vm = struct {
                     // (B) C-frame on top: run its continuation (PUC
                     // finishCcall), poscall, loop back. This handles chains
                     // of nested callk/pcallk continuations.
+                    // A stale testC continuation frame (k=testcContShim with
+                    // its state already consumed by the precover that
+                    // processed a pcallk above it) carries no continuation
+                    // state: finishCcall would clear resume_inbox and destroy
+                    // the completed continuation's results. Pop it and
+                    // publish the inbox to the client window below it — the
+                    // same skip the resume-entry continuation drive performs.
+                    if (top_fr.u.c.k == &testcContShim and top_fr.u.c.testc_state == null) {
+                        try self.poscallCFrame(th, 0);
+                        {
+                            const ri = th.resume_inbox.slice() orelse &[_]Value{};
+                            try self.publishCompletionToClientWindow(th, ri);
+                        }
+                        continue :unroll_loop;
+                    }
                     th.bytecode_inplace_suspended = false;
                     const fc_result = self.finishCcall(th) catch |e2| switch (e2) {
                         error.Yield => {
@@ -29571,254 +29810,6 @@ pub const Vm = struct {
                     }
                 }
                 continue :unroll_loop;
-            }
-        } else {
-            // P16.2c: fresh body (or no preserved Lua frame) — resolve here.
-            resolved = try self.resolveCallable(th.callee, exec_args, null);
-            resolved_valid = true;
-            switch (resolved.callee) {
-                .Builtin => |id| {
-                    // Normal path: first run or no preserved Lua frame.
-                    // P16.50-review-7 BLOCKER 4: stage the body builtin's
-                    // results in a buffer sized to its EXACT window
-                    // (builtinOutLen: arg-derivable for window builtins, 0
-                    // for owned producers — their exact results come back
-                    // as an owned slice). The old caller-window sizing
-                    // (outs.len - 1) both truncated large bodies and padded
-                    // short ones (see the payload_n comment above).
-                    const nouts = builtinOutLen(self, id, resolved.args);
-                    if (nouts != 0) {
-                        payload = try self.alloc.alloc(Value, nouts);
-                        payload_n = nouts;
-                        payload_heap = true;
-                    }
-                    // P16.50-review-6 BLOCKER 1: capture the result contract.
-                    // The catch arms set flags and fall through to the common
-                    // tails, which never read the payload on those paths.
-                    if (self.callBuiltin(id, resolved.args, payload, .host, resolved.ccmt)) |co_bres| {
-                        switch (co_bres) {
-                            // Owned results (a T.testC coroutine body) carry
-                            // the EXACT count — replace the staging payload
-                            // with the owned slice (the tail defer frees it
-                            // via self.alloc.free; foreign blocks pass
-                            // through). The resume tail then reports exactly
-                            // vals.len results (PUC lua_resume: the body's
-                            // actual returns).
-                            .owned => |vals| {
-                                if (payload_heap) self.alloc.free(payload);
-                                payload = vals;
-                                payload_n = vals.len;
-                                payload_heap = true;
-                            },
-                            // Window results: the ACTUAL produced count can
-                            // be smaller than the window (coroutine.close's
-                            // 1-of-2, io_read's early nil) — payload_n is
-                            // the produced count, not the window size.
-                            .window => |produced| {
-                                payload_n = produced;
-                            },
-                            // P16.50-review-8: defensive — callBuiltin's
-                            // generic arm materializes spans before
-                            // returning, so a span cannot reach this
-                            // staging switch; treat it as the callee's
-                            // exact results (owned replacement) if one
-                            // ever does.
-                            .span => |sp| {
-                                const vals = try self.materializeResumeSpan(sp);
-                                if (payload_heap) self.alloc.free(payload);
-                                payload = vals;
-                                payload_n = vals.len;
-                                payload_heap = true;
-                            },
-                        }
-                    } else |e| switch (e) {
-                        error.Yield => {
-                            yielded = true;
-                        },
-                        error.RuntimeError => {
-                            if (th.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
-                                forced_close_ok = true;
-                            } else {
-                                // PUC lua_resume centralizes recovery: every
-                                // error reaching the resume boundary goes
-                                // through precover (ldo.c: after
-                                // rawrunprotected, `status = precover(L,
-                                // status)`), whatever the body kind. A
-                                // builtin body (T.testC's pcallk) leaves its
-                                // CIST_YPCALL frame armed (callBuiltin's
-                                // RuntimeError guard preserves it); without
-                                // precover here the frame is dropped and the
-                                // error escapes the coroutine uncaught.
-                                recovered: {
-                                    const rec = self.precover(th) catch |pe| switch (pe) {
-                                        // A __close in the recovery region
-                                        // yielded (yy=1): standard suspension —
-                                        // the C-frame stays with CIST_CLSRET and
-                                        // the next resume re-drives the recovery.
-                                        error.Yield => {
-                                            yielded = true;
-                                            const ys = th.yieldedValues() orelse &[_]Value{};
-                                            if (ys.len > 0) {
-                                                payload = try self.alloc.alloc(Value, ys.len);
-                                                payload_n = ys.len;
-                                                payload_heap = true;
-                                                for (ys, 0..) |v, i| payload[i] = v;
-                                            }
-                                            th.yielded.deinit(self.alloc);
-                                            break :recovered;
-                                        },
-                                        else => return pe,
-                                    };
-                                    if (!rec) {
-                                        ok = false;
-                                        break :recovered;
-                                    }
-                                    // Recovered: the CIST_YPCALL C-frame is
-                                    // on top — drive its continuation chain
-                                    // (PUC unroll: finishCcall → k → poscall
-                                    // until the frame stack unwinds to the
-                                    // base). Mirrors the resume-entry
-                                    // continuation drive above (the
-                                    // cframe_processed loop), including the
-                                    // stale-frame skip and the nested
-                                    // precover for a continuation that
-                                    // errors under another pcallk.
-                                    while (true) {
-                                        if (framesAtBase(th)) {
-                                            const ri = th.resume_inbox.slice() orelse &[_]Value{};
-                                            payload = try self.alloc.alloc(Value, ri.len);
-                                            payload_n = ri.len;
-                                            payload_heap = true;
-                                            for (ri, 0..) |v, i| payload[i] = v;
-                                            th.resume_inbox.deinit(self.alloc);
-                                            ok = true;
-                                            break;
-                                        }
-                                        const tfr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
-                                        if (!tfr.isC()) {
-                                            // A Lua frame surfaced above the
-                                            // base without a suspension:
-                                            // re-enter it in place (the
-                                            // unroll loop's Lua branch).
-                                            th.bytecode_inplace_suspended = true;
-                                            th.bytecode_resume_boundary = bytecodeOuterBoundary(&th.call_frames);
-                                            break;
-                                        }
-                                        if (tfr.u.c.k == &testcContShim and tfr.u.c.testc_state == null) {
-                                            try self.poscallCFrame(th, 0);
-                                            const ri = th.resume_inbox.slice() orelse &[_]Value{};
-                                            try self.publishCompletionToClientWindow(th, ri);
-                                            continue;
-                                        }
-                                        th.bytecode_inplace_suspended = false;
-                                        const fc = self.finishCcall(th) catch |e2| switch (e2) {
-                                            error.Yield => {
-                                                yielded = true;
-                                                const ys = th.yieldedValues() orelse &[_]Value{};
-                                                if (ys.len > 0) {
-                                                    payload = try self.alloc.alloc(Value, ys.len);
-                                                    payload_n = ys.len;
-                                                    payload_heap = true;
-                                                    for (ys, 0..) |v, i| payload[i] = v;
-                                                }
-                                                th.yielded.deinit(self.alloc);
-                                                break;
-                                            },
-                                            error.OutOfMemory => return self.resumeUncaughtErrorTail(th),
-                                            error.RuntimeError => {
-                                                const rec2 = self.precover(th) catch |pe2| switch (pe2) {
-                                                    error.Yield => {
-                                                        yielded = true;
-                                                        const ys = th.yieldedValues() orelse &[_]Value{};
-                                                        if (ys.len > 0) {
-                                                            payload = try self.alloc.alloc(Value, ys.len);
-                                                            payload_n = ys.len;
-                                                            payload_heap = true;
-                                                            for (ys, 0..) |v, i| payload[i] = v;
-                                                        }
-                                                        th.yielded.deinit(self.alloc);
-                                                        break;
-                                                    },
-                                                    else => return pe2,
-                                                };
-                                                if (rec2) {
-                                                    th.bytecode_inplace_suspended = false;
-                                                    continue;
-                                                }
-                                                ok = false;
-                                                break;
-                                            },
-                                            else => return e2,
-                                        };
-                                        if (yielded) break;
-                                        try self.poscallCFrame(th, fc);
-                                        {
-                                            const ri = th.resume_inbox.slice() orelse &[_]Value{};
-                                            try self.publishCompletionToClientWindow(th, ri);
-                                        }
-                                    }
-                                }
-                            }
-                        },
-                        else => return e,
-                    }
-                },
-                .Closure => |cl| {
-                    if (cl.proto != null and !self.bytecode_coroutine_trampoline_active) {
-                        const step = try self.driveBytecodeCoroutineTrampoline(th, cl, resolved.args, resolved.ccmt);
-                        switch (step) {
-                            .returned => |ret| {
-                                payload = ret;
-                                payload_n = ret.len;
-                                payload_heap = true;
-                            },
-                            .yielded => |ret| {
-                                if (ret.len > 0) {
-                                    payload = ret;
-                                    payload_n = ret.len;
-                                    payload_heap = true;
-                                }
-                                yielded = true;
-                            },
-                            .failed => {
-                                ok = false;
-                            },
-                            .forced_close => {
-                                forced_close_ok = true;
-                            },
-                        }
-                    } else {
-                        const ret_opt: ?[]Value = retblk: {
-                            const r = self.runClosure(cl, resolved.args, resolved.ccmt) catch |e| switch (e) {
-                                error.Yield => {
-                                    yielded = true;
-                                    break :retblk null;
-                                },
-                                error.RuntimeError => {
-                                    if (th.yieldedValues() != null and th.capture_yield_id != 0) {
-                                        yielded = true;
-                                        break :retblk null;
-                                    }
-                                    if (th.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
-                                        forced_close_ok = true;
-                                    } else {
-                                        ok = false;
-                                    }
-                                    break :retblk null;
-                                },
-                                error.ThreadSwitch => return error.ThreadSwitch,
-                                error.OutOfMemory => return error.OutOfMemory,
-                            };
-                            break :retblk r;
-                        };
-                        if (ret_opt) |ret| {
-                            payload = ret;
-                            payload_n = ret.len;
-                            payload_heap = true;
-                        }
-                    }
-                },
-                else => return self.fail("coroutine.resume: bad thread", .{}),
             }
         }
 

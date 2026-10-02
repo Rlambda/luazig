@@ -114,8 +114,8 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   inclose suspended / r2 contRan / cl:boom,after:R2); t_a4_exact
   crash-free с ровно документированным axis-b residual. Perf: lua_calls
   +1.54% instructions — register-allocation артефакт (cycles/wall
-  перекрываются, замедления нет; raw в отчёте). Пункт остаётся открытым
-  ДО A4 (ось b: staged callee оставляет marked slot, PUC
+  перекрываются; небольшой slowdown ими не исключён; raw в отчёте).
+  Пункт остаётся открытым ДО A4 (ось b: staged callee оставляет marked slot, PUC
   перезаписывает). New finding: state-lane result delivery quirk
   (r1[2]="0") — ORDINARY-BACKLOG (a3_report §7.1).
 
@@ -168,6 +168,32 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   big.lua — идентичный отказ обоих движков (harness). F2: подтверждено,
   глотает ошибку только apiSettop call-site (семантика close верна) —
   сужение существующего пункта F2, не новый корень.
+  RESEARCH UPDATE (cs3res, 2026-10-02, к `571e3b3`; отчёт
+  `/tmp/opencode/cs3res_report.md`, клон-доказательство
+  `/tmp/opencode/cs3res/tree`): root cause доказан динамически —
+  c_api.zig:2308-2313, dead-thread error publication в lua_resume
+  коллапсирует окно к base top C-кадра (= помеченный слот) и
+  перезаписывает его. Трасса: mark slot 6 Table → pub-pre
+  [Table,Closure,String] (frozen window = PUC throw-time) → pub-post
+  [String,String] → closer на String → «metamethod 'close' is nil».
+  PUC дублирует error object на top (luaD_seterrorobj, ldo.c:991) БЕЗ
+  collapse. НЕ split TBC, НЕ A4 staging, НЕ ordered owner — STOP-условия
+  не сработали, локальный cut корректен. Bounded fix V2a проверен в
+  изолированном клоне: PUC seterrorobj-семантика (дублировать top-1 err
+  пока frozen window держит его; старая реконструкция как fallback) —
+  координатор верифицировал лично: suite 23 IDENTICAL vs PUC Debug+RF;
+  suites 10/11/13/22/24/25/26/37/38 IDENTICAL; unit 359/359; smoke
+  90/90; бонус — закрывает a2 §6.1 P2 (KE-shape window gap, PUC parity
+  [boom,kerr,kerr]). Рекомендован следующий implementation-промпт:
+  порт V2a в product (опционально latch «err at top» в момент raise
+  вместо value-compare + унификация testC-lane сайта). Findings:
+  (a) BLOCKER FIX-NOW — publication clobber (этот cut); (b) MEDIUM
+  pre-existing chunkid ellipsis расхождение на C-raise сайте (обнажено,
+  не вызвано — класс известного long-string chunkname-усечения);
+  (c) MEDIUM a2 §6.1 P1 raw-C-body gap остаётся (кадр pop'нут до
+  публикации — нужен capture-at-pop, отдельная итерация); (d) LOW —
+  testC-lane api.zig @"resume" publication получить тот же контракт
+  при порте.
 
 - [x] **precover region-close: yielding closer протаскивает nil error
   object сквозь `coroutine.resume`, VM после этого непригодна (BLOCKER,

@@ -2469,23 +2469,38 @@ const ResumeResult = union(enum) {
 };
 
 /// C-S3: the C-API raise window latch — the frozen geometry of the
-/// raising C frame at the moment a C-API `lua_error` (or the testC
-/// `error` command, same contract) installed the in-flight error and
-/// threw. Read-and-cleared ONCE by `Vm.resumeErrorWindowIntact` at the
-/// `lua_resume` error publication: when the raiser's frame and window
-/// survived the unwind unchanged (PUC keeps `L->ci` in place across
+/// raising C frame at the moment a C-API raise installed the in-flight
+/// error and threw. Read-and-cleared ONCE by `Vm.resumeErrorWindowIntact`
+/// at the `lua_resume` error publication: when the raiser's frame and
+/// window survived the unwind unchanged (PUC keeps `L->ci` in place across
 /// `luaD_throw`, so `luaD_seterrorobj` at the resume boundary appends
 /// the error at the live top instead of collapsing the window), the
-/// publication duplicates the error object at the current top — PUC
-/// parity — instead of reconstructing `[residue?, err, err]` over the
-/// window base (which clobbers TBC-marked slots and detaches the
-/// marked objects from their close-at-`lua_closethread` contract).
+/// publication appends the error object at the current top — PUC parity
+/// — instead of reconstructing `[residue?, err, err]` over the window
+/// base (which clobbers TBC-marked slots and detaches the marked objects
+/// from their close-at-`lua_closethread` contract).
 const ErrCWindow = struct {
+    /// The raise's semantic origin — decides the eligibility proof and
+    /// the publication shape. `.raise`: a C `lua_error` (or the testC
+    /// `error` command, same contract) — the error object sits at the
+    /// window top-1 and the publication duplicates it (PUC
+    /// `luaD_seterrorobj`'s non-ERRMEM arm moves top-1 to the top);
+    /// eligibility re-proves the in-flight object identity. `.errmem`:
+    /// a C-API ERRMEM throw (`cThrowOn`'s OOM arm and the direct OOM
+    /// longjmp arms) — the FIXED pre-interned MEMERRMSG is published AT
+    /// the top by the publication (PUC `luaD_seterrorobj(ERRMEM)`
+    /// writes the fixed literal at the live top); the value at top-1
+    /// before the throw is NOT the error object, so no object-equality
+    /// proof applies — eligibility re-proves the in-flight OOM status.
+    kind: enum { raise, errmem },
     /// The raiser's window base (`cWindowBase` at raise time).
     base: usize,
-    /// The raiser's `top` at raise time (the error object at top-1).
+    /// The raiser's `top` at raise time (`.raise`: the error object at
+    /// top-1; `.errmem`: the fixed object is appended at this top).
     top: usize,
-    /// The installed error object (post message-handler).
+    /// The installed error object (`.raise`: post message-handler;
+    /// `.errmem`: the fixed MEMERRMSG literal — permanent, marked for
+    /// uniformity with the in-flight error object).
     obj: Value,
 };
 
@@ -4264,7 +4279,7 @@ comptime {
     std.debug.assert(@sizeOf(Closure) == 48);
     std.debug.assert(@sizeOf(Cell) == 48);
     std.debug.assert(@sizeOf(Userdata) == 56);
-    std.debug.assert(@sizeOf(Thread) == 3856);
+    std.debug.assert(@sizeOf(Thread) == 3864);
 }
 
 /// Result of compiling a text chunk through the host-selected bytecode
@@ -5647,6 +5662,16 @@ pub const Vm = struct {
     debug_namewhat_override: ?[]const u8 = null,
     debug_name_override: ?[]const u8 = null,
     last_builtin_out_count: usize = 0,
+    /// PUC lua_closethread's return status transport: the APIstatus
+    /// `luaE_resetthread(L, L->status)` computes — the thread's death
+    /// status (ERRMEM=4 included), or the closing metamethod's status
+    /// when a closer errors (last-error-wins). Written ONLY by
+    /// builtinCoroutineClose at each of its exits (read by
+    /// apiCloseThread right after; the Lua-level coroutine.close
+    /// consumer ignores it — its [false, err] result carries no status
+    /// code). Same single-writer transport pattern as
+    /// last_builtin_out_count.
+    last_close_status: i32 = 0,
     active_builtin: ?BuiltinId = null,
     active_builtin_args: ?[]const Value = null,
     gmatch_state: ?GmatchState = null,
@@ -7595,7 +7620,11 @@ pub const Vm = struct {
         defer self.builtin_outs_on_stack = saved_on_bc;
         try exposeDispatchResult(void, self.builtinCoroutineClose(&[_]Value{.{ .Thread = th }}, out[0..]));
         const ok = out[0] == .Bool and out[0].Bool;
-        return .{ .status = if (ok) 0 else 2, .err = out[1] };
+        // PUC lua_closethread returns APIstatus(luaE_resetthread(L,
+        // L->status)): the death status (ERRMEM=4 included) when no closer
+        // errored, the closer's status otherwise — transported by
+        // builtinCoroutineClose via last_close_status.
+        return .{ .status = if (ok) 0 else self.last_close_status, .err = out[1] };
     }
 
     pub fn apiYield(self: *Vm, args: []const Value) Error!void {
@@ -7995,23 +8024,45 @@ pub const Vm = struct {
     /// raiser's C window survived the unwind intact — the PUC
     /// `luaD_seterrorobj`-at-live-top precondition (PUC never pops the
     /// raising frame on `luaD_throw`, so `L->ci`/`L->top` at the resume
-    /// boundary are exactly what `lua_error` left). Eligible iff the
-    /// latch is set, neither the window top nor its base anchor moved
-    /// (a popped raw C frame or a Lua-frame raise moves both), and the
-    /// in-flight error object is still the latched one (thread-held
-    /// state identity — never a stack-slot comparison). On success the
-    /// caller appends the error object ONCE at the current top (PUC
-    /// duplicates top-1); otherwise the caller keeps the existing
-    /// `[residue?, err, err]` reconstruction at the window base.
-    /// Single read: the latch is consumed here regardless of the
-    /// verdict (a published error never re-publishes).
+    /// boundary are exactly what the raise left). Eligible iff the
+    /// latch is set and neither the window top nor its base anchor
+    /// moved (a popped raw C frame or a Lua-frame raise moves both);
+    /// the in-flight error is then re-proved by its semantic origin —
+    /// a `.raise` latch re-checks the thread-held error object identity
+    /// (never a stack-slot comparison), an `.errmem` latch re-checks
+    /// the in-flight OOM status (`err_is_oom` — the fixed object the
+    /// publication appends is not the pre-throw top-1, so an object
+    /// equality proof does not apply). On success the caller appends
+    /// the error object ONCE at the current top (PUC duplicates top-1
+    /// for `.raise`, writes the fixed literal for `.errmem`); otherwise
+    /// the caller keeps the existing `[residue?, err, err]`
+    /// reconstruction at the window base. Single read: the latch is
+    /// consumed here regardless of the verdict (a published error never
+    /// re-publishes).
     pub fn resumeErrorWindowIntact(th: *Thread) bool {
         const lw = th.err_c_window orelse return false;
         th.err_c_window = null;
         if (th.top != lw.top) return false;
         if (cWindowBase(th) != lw.base) return false;
-        if (!th.err_has_obj) return false;
-        return valuesEqual(th.err_obj, lw.obj);
+        switch (lw.kind) {
+            .raise => {
+                if (!th.err_has_obj) return false;
+                return valuesEqual(th.err_obj, lw.obj);
+            },
+            .errmem => return th.err_is_oom,
+        }
+    }
+
+    /// C-S3: latch the raise window at a C-API ERRMEM throw boundary
+    /// (`cThrowOn`'s OOM arm and the direct OOM longjmp arms) — the
+    /// structural witness the resume publication reads back via
+    /// `resumeErrorWindowIntact`. The latched object is the FIXED
+    /// pre-interned MEMERRMSG (allocation-free; interned once at Vm
+    /// init) — the object `luaD_seterrorobj(ERRMEM)` publishes at the
+    /// live top. No error object is created here.
+    pub fn latchErrmemRaiseWindow(self: *Vm, th: *Thread) void {
+        const obj: Value = .{ .String = self.oom_msg_str orelse self.internStrAssume("not enough memory") };
+        th.err_c_window = .{ .kind = .errmem, .base = cWindowBase(th), .top = th.top, .obj = obj };
     }
 
     /// PUC `index2value` slot resolution for the anchored window. Returns
@@ -28057,6 +28108,12 @@ pub const Vm = struct {
             error.OutOfMemory => {
                 if (self.c_error_jmp) |jb| {
                     self.setOutOfMemoryError();
+                    // C-S3: latch the raise window — the wrap C frame on
+                    // th_cur is the raising frame; if the error crosses a
+                    // lua_resume boundary with this frame live, the
+                    // publication appends the fixed object at the live
+                    // top instead of collapsing the window.
+                    self.latchErrmemRaiseWindow(th_cur);
                     self.c_error_value = self.errThread().err_obj;
                     self.c_error_status = 4; // LUA_ERRMEM
                     _longjmp(@ptrCast(jb), 1);
@@ -28084,6 +28141,9 @@ pub const Vm = struct {
             self.alloc.free(res);
             if (self.c_error_jmp) |jb| {
                 self.setOutOfMemoryError();
+                // C-S3: same raise-window latch as the auxwrapResume arm
+                // above — the wrap C frame is the raising frame.
+                self.latchErrmemRaiseWindow(th_cur);
                 self.c_error_value = self.errThread().err_obj;
                 self.c_error_status = 4; // LUA_ERRMEM
                 _longjmp(@ptrCast(jb), 1);
@@ -30207,6 +30267,10 @@ pub const Vm = struct {
         const outw = self.refreshBuiltinOuts() orelse outs;
         if (outw.len > 0) outw[0] = .{ .Bool = false };
         if (outw.len > 1) outw[1] = .Nil;
+        // The transport itself failed (an OOM of the result normalization —
+        // PUC's transport is infallible): report the failure as an ordinary
+        // error close; no error object exists to identity-map.
+        self.last_close_status = 2;
         th.close_has_err = false;
         th.close_err = .Nil;
         self.last_builtin_out_count = @min(@as(usize, 2), outw.len);
@@ -30214,6 +30278,7 @@ pub const Vm = struct {
 
     fn builtinCoroutineClose(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         self.last_builtin_out_count = 0;
+        self.last_close_status = 0;
         // P16.27 T1: PUC lua_closethread -> luaD_closeprotected(yy=0) ->
         // callclosemethod(yy=0) -> luaD_callnoyield. The non-yieldable
         // ownership lives on each driven __close invocation (the close
@@ -30268,6 +30333,14 @@ pub const Vm = struct {
             // P16.31 Cut 4: the closers run ON the closed thread
             // (closeThreadRegionsOnClosedThread) — PUC drives them on the
             // closed thread's stack (on=CO, p31a [D]).
+            // PUC lua_closethread returns APIstatus(luaE_resetthread(L,
+            // L->status)): the thread's DEATH status (ERRMEM=4 included —
+            // seterrorobj(ERRMEM) then publishes the fixed MEMERRMSG),
+            // replaced by the closer's status when a closer errors
+            // (last-error-wins). Capture the death status BEFORE the
+            // resetCI mirror below clears api_status; the close error
+            // status transports via last_close_status.
+            const death_status: i32 = if (th.api_status >= 2) th.api_status else 2;
             const close_err = try self.closeThreadRegionsOnClosedThread(th, th.close_err, 2);
             if (close_err != null) th.close_err = close_err.?;
             th.status = .dead;
@@ -30287,6 +30360,14 @@ pub const Vm = struct {
             const outw = self.refreshBuiltinOuts() orelse outs;
             if (outw.len > 0) outw[0] = .{ .Bool = false };
             if (outw.len > 1) outw[1] = th.close_err;
+            // No closer error: the death status is the close's result
+            // (PUC closeprotected echoes the incoming status). A closer
+            // error replaces it (ERRRUN, or ERRMEM by fixed-object
+            // identity — the same mapping the auxwrap close uses).
+            self.last_close_status = if (close_err) |ce|
+                (if (ce == .String and ce.String == self.oom_msg_str) 4 else 2)
+            else
+                death_status;
             th.close_has_err = false;
             th.close_err = .Nil;
             self.last_builtin_out_count = @min(@as(usize, 2), outw.len);
@@ -30347,6 +30428,11 @@ pub const Vm = struct {
                 const outw = self.refreshBuiltinOuts() orelse outs;
                 if (outw.len > 0) outw[0] = .{ .Bool = false };
                 if (outw.len > 1) outw[1] = if (rres.len > 1) rres[1] else .Nil;
+                // The forced-close unwind's error is a closer error
+                // (last-error-wins): ERRRUN, or ERRMEM by fixed-object
+                // identity — the same status mapping the auxwrap close
+                // uses.
+                self.last_close_status = if (rres.len > 1 and rres[1] == .String and rres[1].String == self.oom_msg_str) 4 else 2;
                 // Error is already returned by this close call; do not keep it
                 // latched for subsequent close() calls on the dead coroutine.
                 th.close_has_err = false;
@@ -30379,6 +30465,9 @@ pub const Vm = struct {
                 const outw = self.refreshBuiltinOuts() orelse outs;
                 if (outw.len > 0) outw[0] = .{ .Bool = false };
                 if (outw.len > 1) outw[1] = final_err.?;
+                // A closer error on the lingering marks: ERRRUN, or ERRMEM
+                // by fixed-object identity (last-error-wins).
+                self.last_close_status = if (final_err.? == .String and final_err.?.String == self.oom_msg_str) 4 else 2;
                 self.last_builtin_out_count = @min(@as(usize, 2), outw.len);
                 return;
             }
@@ -51539,7 +51628,7 @@ pub const Vm = struct {
                 // lanes with a prefix never match cWindowBase at the
                 // publication and keep the reconstruction). Latched on
                 // win.th — the window's owner thread.
-                win.th.err_c_window = .{ .base = win.base(), .top = win.th.top, .obj = v };
+                win.th.err_c_window = .{ .kind = .raise, .base = win.base(), .top = win.th.top, .obj = v };
                 self.captureErrorTraceback();
                 return error.RuntimeError;
             },
@@ -60569,7 +60658,11 @@ fn p50r3KOom(L: ?*lua_State, status: c_int, ctx: isize) callconv(.c) c_int {
     // Arm INSIDE k: the resume preamble allocated before k, so the single
     // failure shot lands deterministically on k's own first allocation.
     p50r3_oneshot.?.armed = true;
-    c_api.lua_pushcfunction(L, p50Cfunc); // throws LUA_ERRMEM through the boundary
+    // A fresh-string push: the first allocation is the string object — an
+    // OOM raised INSIDE the continuation, exactly on k's own first request.
+    // (lua_pushcfunction is NOT a valid OOM trigger for this scenario:
+    // PUC 5.5 pushes a light C function there — no allocation, no OOM.)
+    _ = c_api.lua_pushlstring(L, "p50r3-oom-trigger", 17);
     return 0; // unreachable: the push never returns on the armed shot
 }
 
@@ -61102,9 +61195,8 @@ test "P16.50-review-3 R1: k continuation error transport through finishCcall" {
 
     // ---- Segment B: k raises LUA_ERRMEM (an OOM inside the continuation).
     // The error OBJECT must be the fixed MEMERRMSG string — asserted with
-    // pointer identity. FINDING #1 (asserted AS-IS): the ERRMEM KIND is
-    // masked to LUA_ERRRUN on every observable surface (see the header
-    // comment); PUC returns LUA_ERRMEM (4) here. ----
+    // pointer identity — and the ERRMEM KIND survives the boundary
+    // (P16.50-review-5 B1: PUC returns LUA_ERRMEM (4) here). ----
     {
         p50r3_k_choice = 1;
         p50r3_k_status = -1;
@@ -61137,14 +61229,16 @@ test "P16.50-review-3 R1: k continuation error transport through finishCcall" {
         // kind finishCcall carried now survives the resume boundary.
         try testing.expectEqual(@as(c_int, 4), st2);
         try testing.expectEqual(@as(c_int, 4), c_api.lua_status(L2));
-        try testing.expectEqual(@as(c_int, 2), nres);
-        // The error object IS the fixed MEMERRMSG (PUC luaD_seterrorobj
-        // for LUA_ERRMEM) — duplicated into PUC's [err, err] window (the
-        // coroutine's WINDOW).
+        // C-S3 OOM correction (C probe /tmp/opencode/cs3oom_k.c, PUC 5.5.0
+        // byte-identical): the resume error arm runs luaD_seterrorobj(ERRMEM)
+        // at the LIVE top — k pushed nothing, so the parked body frame's
+        // window was empty and the fixed MEMERRMSG becomes its single slot:
+        // nres = 1, window = [memerrmsg]. (The old [err, err] pair was the
+        // pre-correction reconstruction divergence.)
+        try testing.expectEqual(@as(c_int, 1), nres);
         const wb2 = Vm.cWindowBase(th2);
-        try testing.expectEqual(@as(usize, 2), Vm.cWindowCount(th2));
+        try testing.expectEqual(@as(usize, 1), Vm.cWindowCount(th2));
         try testing.expectEqual(vm.oom_msg_str.?, th2.stack[wb2].String);
-        try testing.expectEqual(vm.oom_msg_str.?, th2.stack[wb2 + 1].String);
         try testing.expect(th2.status == .dead);
         try testing.expectEqual(frames0, main_th.call_frames.len());
 

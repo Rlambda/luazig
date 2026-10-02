@@ -838,17 +838,28 @@ pub const State = struct {
         // window (the old window truncated every host resume to 63
         // results; PUC lua_resume returns ALL results on the stack).
         const res = vm.apiResumeThread(th, args) catch {
-            // apiResumeThread itself failed (owned-slice OOM): consume the
-            // staging. PUC would install the fixed MEMERRMSG here — an
-            // allocation we cannot trust on this path; the window stays
-            // empty at the top frame's base. (C-S3 crash fix: the old
-            // func_slot anchor can sit below the surviving top frame's
-            // base — a C continuation — leaving top < base, a corrupt
-            // window that underflows every later count.)
-            th.top = vm_mod.Vm.cWindowBase(th);
-            // C-S3 hygiene: this arm IS the publication — the latch the
-            // resume's error tail left is stale, never read.
-            th.err_c_window = null;
+            // apiResumeThread itself failed (owned-slice OOM): the
+            // resume's error tail already ran (the thread is dead with
+            // its error latched); PUC's transport is infallible (stack
+            // writes), so this arm is a best-effort publication of the
+            // FIXED pre-interned MEMERRMSG (no allocation for the
+            // object; only the window growth can fail). The C-S3 latch
+            // is the structural witness through the shared eligibility:
+            // a surviving raiser's C window (an in-coroutine C-API OOM)
+            // keeps its geometry — the fixed object is appended at the
+            // LIVE top, TBC-marked slots included, exactly like PUC
+            // luaD_seterrorobj(ERRMEM); ineligible (the raise popped
+            // the frame or moved the window) — anchor at the top
+            // frame's base (the old func_slot anchor can sit below the
+            // surviving top frame's base — a C continuation — leaving
+            // top < base, a corrupt window that underflows every later
+            // count).
+            if (vm_mod.Vm.resumeErrorWindowIntact(th)) {
+                if (vm.oom_msg_str) |ms| vm.cWindowPush(th, .{ .String = ms }) catch {};
+            } else {
+                th.top = vm_mod.Vm.cWindowBase(th);
+                if (vm.oom_msg_str) |ms| vm.cWindowPush(th, .{ .String = ms }) catch {};
+            }
             return .memory_error;
         };
         defer vm.alloc.free(res);

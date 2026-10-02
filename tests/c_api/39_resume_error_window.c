@@ -56,14 +56,26 @@
 **           closes at the body's return with err=nil, and the coroutine
 **           completes normally.
 **
-**   W-OOM   ERRMEM control: a continuation that hits a denied
-**           allocation (custom allocator frozen from inside the
-**           continuation) reports st=4 with the FIXED "not enough
-**           memory" object. Only st + the top value are asserted: PUC
-**           keeps the window and appends one memerrmsg while the zig
-**           OOM publication reconstructs (a documented, kept-divergent
-**           OOM semantics pair; the status and the error object are the
-**           parity contract).
+**   W-OOM   ERRMEM parity: a continuation that hits a denied allocation
+**           (custom allocator frozen from inside the continuation)
+**           reports st=4 with the FULL preserved window — PUC
+**           luaD_seterrorobj(ERRMEM) appends the FIXED "not enough
+**           memory" object at the live top; the value at top-1 before
+**           the throw is NOT the error object (no duplicate pair), and
+**           the TBC-marked slot keeps the ORIGINAL object (mark
+**           identity). lua_closethread then runs the closer ON the
+**           coroutine with the original error ("not enough memory"),
+**           returns status 4 with the fixed object, a repeated
+**           closethread is a no-op (st=0, no second close), and the VM
+**           stays usable after the failure.
+**
+**   W-OOMR  OOM recovery control (no live C window at any publication):
+**           a pcallk protection inside the coroutine consumes the
+**           C-API OOM (the recovery hands LUA_ERRMEM + the fixed
+**           message to the continuation); no resume publication runs,
+**           the mark closes at the body's return with err=nil, and the
+**           coroutine completes normally with the continuation's
+**           observation.
 **
 **   W-TBL   non-string error object: the continuation raises a TABLE;
 **           the window keeps [COOBJ, YFN, tbl, tbl] (types + rawequal
@@ -284,6 +296,44 @@ static int c_tbc_callk_oom(lua_State *L) {
 }
 
 /* ------------------------------------------------------------------ */
+/* W-OOMR: the OOM recovery control (no publication)                   */
+/* ------------------------------------------------------------------ */
+
+/* W-OOMR continuation: the pcallk recovery hands the consumed OOM to k
+** (status LUA_ERRMEM + the fixed message on top). Unfreeze the allocator
+** FIRST (the recovery consumed the OOM; the observation itself may
+** allocate), then format the observation as the protected call's
+** result. */
+static int k_oom_recover(lua_State *L, int status, lua_KContext ctx) {
+    (void)ctx;
+    g_deny = 0;
+    lua_pushfstring(L, "k:%d:%s", status,
+                    lua_isstring(L, -1) ? lua_tostring(L, -1) : "?");
+    return 1;
+}
+
+/* W-OOMR callee: freeze the allocator, then force a FRESH string
+** allocation — the denied allocation raises ERRMEM with the fixed
+** MEMERRMSG while the pcallk protection of the caller is armed. */
+static int c_oom_callee(lua_State *L) {
+    (void)L;
+    g_deny = 1;
+    lua_pushfstring(L, "oom-%d", ++g_oom_ctr);
+    return 0;  /* not reached when the push throws */
+}
+
+/* W-OOMR body: mark arg 1 TBC, call the OOMing callee through a pcallk
+** whose continuation observes the recovery; the mark sits BELOW the
+** pcall boundary, so the recovery's close leaves it for the body's own
+** return (err=nil). */
+static int c_tbc_pcallk_oom(lua_State *L) {
+    lua_toclose(L, 1);
+    lua_pushcfunction(L, c_oom_callee);
+    lua_pcallk(L, 0, 1, 0, (lua_KContext)0, k_oom_recover);
+    return 1;  /* the recovery's observation, left at the top */
+}
+
+/* ------------------------------------------------------------------ */
 /* Report helpers                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -295,15 +345,15 @@ static void do_resume(lua_State *L, lua_State *co, const char *label) {
            (nres > 0 && lua_isstring(co, -1)) ? lua_tostring(co, -1) : "-");
 }
 
-/* Resume and report st + the FULL published window: nres, per-slot type
-** names, the marked-object identity (slot 1 vs the global COOBJ's value
-** moved onto the coroutine), and the duplicate-pair identity (the top
-** two slots). The moved reference is popped before returning. */
-static void do_resume_win(lua_State *L, lua_State *co, const char *label,
-                          const char *ident_global) {
-    int nres = 0;
-    int st = lua_resume(co, L, 0, &nres);
-    printf("%s: st=%d nres=%d types=[", label, st, nres);
+/* Print the published window of an already-resumed coroutine: nres,
+** per-slot type names, the marked-object identity (slot 1 vs the global
+** COOBJ's value moved onto the coroutine), and the duplicate-pair
+** identity (the top two slots). The moved reference is popped before
+** returning. Allocates (getglobal/xmove) — the caller must unfreeze a
+** denial first. */
+static void print_win(lua_State *L, lua_State *co, int st, int nres,
+                      const char *ident_global) {
+    printf("st=%d nres=%d types=[", st, nres);
     for (int i = 1; i <= nres; i++)
         printf("%s%s", (i > 1 ? "," : ""),
                lua_typename(co, lua_type(co, i)));
@@ -317,6 +367,29 @@ static void do_resume_win(lua_State *L, lua_State *co, const char *label,
     if (nres >= 2)
         printf(" pair_equal=%d", lua_rawequal(co, nres - 1, nres));
     printf("\n");
+}
+
+/* Resume and report st + the FULL published window. */
+static void do_resume_win(lua_State *L, lua_State *co, const char *label,
+                          const char *ident_global) {
+    int nres = 0;
+    int st = lua_resume(co, L, 0, &nres);
+    printf("%s: ", label);
+    print_win(L, co, st, nres, ident_global);
+}
+
+/* W-OOM resume2: resume under the frozen allocator (the continuation
+** froze it mid-flight), then unfreeze and print the FULL published
+** window — the identity checks allocate (getglobal/xmove) and must not
+** run under the denial. The publication itself is done before the
+** unfreeze; the window is read post-hoc. */
+static void do_resume_win_oom(lua_State *L, lua_State *co, const char *label,
+                              const char *ident_global) {
+    int nres = 0;
+    int st = lua_resume(co, L, 0, &nres);
+    g_deny = 0;  /* unfreeze before the window inspection */
+    printf("%s: ", label);
+    print_win(L, co, st, nres, ident_global);
 }
 
 /* Resume and report st + top value only (no nres: PUC's resume_error
@@ -352,6 +425,12 @@ static void print_log(lua_State *L, const char *label) {
                ? lua_tostring(L, -1) : "(empty)");
     lua_pop(L, 1);
 }
+
+/* The W-OOMR body source: the coroutine's result IS the protected
+** call's result, so the continuation's observation of the recovery
+** (status + the recovered fixed message) is observable as the
+** completion's result. */
+#define C_OOMR_BODY_LUA "return function() return CBODY(COOBJ, YFN) end"
 
 /* ------------------------------------------------------------------ */
 /* The case driver                                                     */
@@ -529,7 +608,7 @@ static int t_w_pcallk(void) {
     return 0;
 }
 
-/* W-OOM: ERRMEM control — st + the fixed message only. */
+/* W-OOM: ERRMEM parity — full preserved window + close + reclose + reuse. */
 static int t_w_oom(void) {
     lua_State *L = lua_newstate(lalloc, NULL, 0);
     lua_State *co;
@@ -539,8 +618,11 @@ static int t_w_oom(void) {
     co = w_setup(L, c_tbc_callk_oom, NULL, body_src("COOBJ"));
     if (!co) { lua_close(L); return 1; }
     do_resume(L, co, "W-OOM resume1");       /* yield: st=1 */
-    do_resume_val(L, co, "W-OOM resume2");   /* st=4 not enough memory */
-    g_deny = 0;  /* unfreeze before teardown */
+    do_resume_win_oom(L, co, "W-OOM resume2", "COOBJ"); /* st=4 full window */
+    do_closethread(L, co, "W-OOM closethread"); /* st=4, closer + orig err */
+    print_log(L, "W-OOM log");               /* |CO/not enough memory */
+    do_closethread(L, co, "W-OOM reclose");  /* st=0, no second close */
+    print_log(L, "W-OOM log2");
     /* The VM stays usable after the failure (the frozen-allocator error
     ** left no corrupt state): run a chunk and read its result back. */
     if (luaL_dostring(L, "return 'alive'") != 0) {
@@ -550,6 +632,26 @@ static int t_w_oom(void) {
     }
     printf("W-OOM reuse: %s\n", lua_tostring(L, -1));
     lua_pop(L, 1);
+    lua_close(L);
+    return 0;
+}
+
+/* W-OOMR: OOM recovery control — the pcallk protection consumes the OOM
+** (no resume publication runs); the continuation observes LUA_ERRMEM +
+** the fixed message, the mark closes at the body's return with err=nil,
+** and the coroutine completes normally. */
+static int t_w_oomr(void) {
+    lua_State *L = lua_newstate(lalloc, NULL, 0);
+    lua_State *co;
+    if (!L) return 1;
+    luaL_openlibs(L);
+    g_deny = 0;
+    co = w_setup(L, c_tbc_pcallk_oom, NULL, C_OOMR_BODY_LUA);
+    if (!co) { lua_close(L); return 1; }
+    do_resume(L, co, "W-OOMR resume1");      /* completes: st=0 k:4:... */
+    print_log(L, "W-OOMR log1");             /* |CO/nil (mark at return) */
+    do_closethread(L, co, "W-OOMR closethread"); /* st=0, no close */
+    print_log(L, "W-OOMR log2");
     lua_close(L);
     return 0;
 }
@@ -621,6 +723,7 @@ int main(void) {
     if (t_w_rbc())    return 1;
     if (t_w_pcallk()) return 1;
     if (t_w_oom())    return 1;
+    if (t_w_oomr())   return 1;
     if (t_w_tbl())    return 1;
     if (t_w_settop()) return 1;
     if (t_w_gc())     return 1;

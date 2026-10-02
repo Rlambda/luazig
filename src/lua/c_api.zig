@@ -408,15 +408,18 @@ pub export fn lua_closethread(L: ?*lua_State, from: ?*lua_State) c_int {
         return 0; // LUA_OK
     }
 
-    // Error: push the error object on the window (PUC luaD_seterrorobj).
-    // (b) status-returning API: lua_closethread returns the close status;
-    // PUC's seterrorobj moves the object WITHIN one stack (infallible), our
-    // window push can OOM — the status (2) is still returned, only the
-    // object push is lost (P16.50-review-5 B2 inventory; architectural fix
-    // = reserved window slots, same family as the LUA_MINSTACK reserve).
+    // Error: push the error object on the window (PUC luaD_seterrorobj —
+    // for an ERRMEM death the object IS the fixed MEMERRMSG the close
+    // transported). (b) status-returning API: lua_closethread returns the
+    // close's status verbatim (PUC APIstatus — ERRRUN(2), ERRMEM(4), or
+    // ERRERR(5)); PUC's seterrorobj moves the object WITHIN one stack
+    // (infallible), our window push can OOM — the status is still
+    // returned, only the object push is lost (P16.50-review-5 B2
+    // inventory; architectural fix = reserved window slots, same family
+    // as the LUA_MINSTACK reserve).
     th.top = Vm.cWindowBase(th);
     vm.cWindowPush(th, result.err) catch {};
-    return 2; // LUA_ERRRUN
+    return result.status;
 }
 
 /// PUC `lua_atpanic` (lapi.c:lua_atpanic): install a panic function called when
@@ -540,7 +543,7 @@ pub export fn lua_error(L: ?*lua_State) noreturn {
     // luaD_seterrorobj) instead of collapsing the window onto
     // TBC-marked slots. eth == the raising thread == the window owner
     // (verified: handleThread(h) == h.thread orelse main here).
-    eth.err_c_window = .{ .base = Vm.cWindowBase(eth), .top = eth.top, .obj = eth.err_obj };
+    eth.err_c_window = .{ .kind = .raise, .base = Vm.cWindowBase(eth), .top = eth.top, .obj = eth.err_obj };
     if (vm.c_error_jmp) |jb| {
         _longjmp(jb, 1);
     }
@@ -1677,6 +1680,13 @@ fn cThrowOn(vm: *Vm, throwing: *vm_mod.lua_State, err: api.ApiError) noreturn {
                 // the Lua-facing error paths observe (and no new interning
                 // can fail under the failing allocator).
                 vm.setOutOfMemoryError();
+                // C-S3: latch the raise window BEFORE the longjmp — the
+                // structural witness for the resume publication. The
+                // throwing state's top C frame is the raising frame; the
+                // eligibility re-proves the geometry at the publication,
+                // so a cross-thread throw whose frame is not on this
+                // thread's window self-invalidates there.
+                vm.latchErrmemRaiseWindow(Vm.handleThread(throwing));
                 vm.c_error_value = vm.errThread().err_obj;
                 vm.c_error_status = 4; // LUA_ERRMEM
                 _longjmp(jb, 1);
@@ -2267,22 +2277,31 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
     // returns ALL results on the stack). Freed via vm.alloc.free (the
     // charged-block registry passes infraAlloc'd blocks through).
     const res = vm.apiResumeThread(co, args) catch {
-        // apiResumeThread itself failed (owned-slice OOM): consume the
-        // staging and install the FIXED pre-interned MEMERRMSG (PUC
-        // luaD_seterrorobj with status ERRMEM; the intern is a no-alloc
-        // lookup, only the window growth can fail — best-effort).
-        // C-S3 crash fix (pre-existing, exposed by the suite-39 ERRMEM
-        // control): anchor at the TOP frame's base, like the main arm's
-        // reconstruction — the old func_slot anchor sits BELOW the
-        // surviving top frame's base whenever the raiser's frame is
-        // still on the stack (a C continuation), leaving top < base and
-        // underflowing every later window count.
-        th.top = Vm.cWindowBase(th);
-        // C-S3 hygiene: the resume's error tail already ran inside
-        // apiResumeThread — whatever latch it left is stale (this arm
-        // IS the publication; it never reads the latch).
-        co.err_c_window = null;
-        if (vm.oom_msg_str) |ms| vm.cWindowPush(th, .{ .String = ms }) catch {};
+        // apiResumeThread itself failed (owned-slice OOM): the resume's
+        // error tail already ran inside apiResumeThread (the thread is
+        // dead with its error latched); PUC's transport is infallible
+        // (stack writes), so this arm is a best-effort publication of
+        // the FIXED pre-interned MEMERRMSG (the intern is a no-alloc
+        // lookup, only the window growth can fail). The C-S3 latch is
+        // the structural witness read through the shared eligibility:
+        // when the raiser's C window survived the throw (an in-coroutine
+        // C-API OOM), the fixed object is appended at the LIVE top —
+        // the window, TBC-marked slots included, stays observable for
+        // lua_closethread exactly like PUC luaD_seterrorobj(ERRMEM).
+        // Ineligible (no live raising C window — the raise popped the
+        // frame or moved the window): anchor at the TOP frame's base
+        // like the main arm's reconstruction (the old func_slot anchor
+        // sits BELOW the surviving top frame's base whenever the
+        // raiser's frame is still on the stack, leaving top < base and
+        // underflowing every later window count).
+        if (Vm.resumeErrorWindowIntact(co)) {
+            // (b): the append is best-effort under OOM — the status
+            // below survives; only the observable window is lost.
+            if (vm.oom_msg_str) |ms| vm.cWindowPush(th, .{ .String = ms }) catch {};
+        } else {
+            th.top = Vm.cWindowBase(th);
+            if (vm.oom_msg_str) |ms| vm.cWindowPush(th, .{ .String = ms }) catch {};
+        }
         if (nres) |p| p.* = @intCast(Vm.cWindowCount(th));
         return 4; // LUA_ERRMEM
     };
@@ -2678,6 +2697,13 @@ pub export fn lua_pcallk(
                 // frame stays armed so the recovery owns the continuation.
                 if (vm.c_error_jmp) |jb| {
                     vm.setOutOfMemoryError();
+                    // C-S3: latch the raise window (the pcallk caller's
+                    // top C frame is the raising frame). A recovery
+                    // (precover → finishpcallk) consumes the latch with
+                    // the error; only an unrecovered crossing reaches a
+                    // publication, where the latch is the eligibility
+                    // witness.
+                    vm.latchErrmemRaiseWindow(th);
                     vm.c_error_value = vm.errThread().err_obj;
                     vm.c_error_status = 4; // LUA_ERRMEM
                     _longjmp(jb, 1);

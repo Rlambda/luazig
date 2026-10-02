@@ -105,6 +105,19 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   (codegen_bc.zig:4243 — long-string ветка toOwnedSlice без владельца,
   течёт каждая [[ ]]-константа; short-ветка имеет defer buf.deinit) —
   ORDINARY-BACKLOG, отдельный cut; raw /tmp/opencode/a1_test_dbg2.txt.
+  A3 UPDATE (2026-10-02, cut `79c5590`): ось (c) ЗАКРЫТА — testC
+  pcallk recovery закрывает TBC по уровню с исходной ошибкой и yy=1 на
+  всех lanes (current-thread/thread-target/state; CClsretState.chain_th
+  + GC mark; closeTbcRegion th/run_th split; snapshot-only исключение и
+  CLOSEKTOP-закрытие выбранного региона удалены). Координатор
+  верифицировал лично: t_ctrl1/t_ctrl1_err ПОБАЙТОВО PUC D+RF (r1
+  inclose suspended / r2 contRan / cl:boom,after:R2); t_a4_exact
+  crash-free с ровно документированным axis-b residual. Perf: lua_calls
+  +1.54% instructions — register-allocation артефакт (cycles/wall
+  перекрываются, замедления нет; raw в отчёте). Пункт остаётся открытым
+  ДО A4 (ось b: staged callee оставляет marked slot, PUC
+  перезаписывает). New finding: state-lane result delivery quirk
+  (r1[2]="0") — ORDINARY-BACKLOG (a3_report §7.1).
 
 - [x] **P-1 (production BLOCKER, найден tbcres 2026-10-02): C-closure,
   resumed напрямую как тело корутины, + ошибка → ветка 29788-29817 не
@@ -126,12 +139,23 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   pre-fix падал BE/YC/CE/KE/OM/NESTK/GR ровно по P-1). Координатор
   верифицировал лично (38/37/22 IDENTICAL, battery 359/359, smoke
   91/91, matrix zig_fail=0). Perf: coroutine_yield −0.44%,
-  lua_calls шум. Попутный finding (MEDIUM, ORDINARY-BACKLOG, не
-  маскирован): general C-raise error-window gap — PUC держит окно
-  поднимающего C-кадра целиком под error object ([A1,A2,err,err]),
-  zig реконструирует [residue?,err,err] и отбрасывает (c_api.zig:2308
-  truncation); воспроизводится без pcallk/recovery на pre-fix;
-  отдельная итерация multi-value window capture при frame-pop.
+  lua_calls шум. Попутное расхождение C-raise error-window не
+  маскировано; оно записано отдельным открытым пунктом ниже.
+
+- [ ] **C-raise error-window: неверные nresults и потеря значений
+  окна поднимающего C-кадра (BLOCKER, pre-existing, ORDINARY-BACKLOG;
+  review A2, 2026-10-02).** Plain C-body с аргументами A1,A2 вызывает
+  lua_error: PUC lua_resume оставляет [A1,A2,err,err] (nres=4), Zig —
+  [err,err] (nres=2). В KE-форме suite 38 PUC сохраняет
+  [boom,kerr,kerr], Zig — [kerr,kerr]; suite 38 сравнивает recovery
+  control/status/top error и явно документирует этот остаток, но не
+  проверяет полное uncaught-окно. Первый неверный шаг —
+  c_api.zig:2308 truncation до cWindowBase с реконструкцией только
+  [api_err_residue?,err,err]; значения raising C-frame к этому моменту
+  потеряны. Воспроизводится на pre-A2 product без pcallk/recovery
+  (`/tmp/opencode/p38_probe.c`, raw `_puc.txt`/`_zig.txt`). Требуется
+  отдельный cut с multi-value window capture при frame-pop и
+  дифференциалом полного окна; A2 не перехватывает.
 
 - [ ] **suite 23 C-S3/C-S4 red (`metamethod 'close' is nil`) —
   помеченный слот содержит объект ошибки к моменту close (tbcres,

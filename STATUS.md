@@ -342,6 +342,37 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   loadlib probe return-форма (UNCONFIRMED). STOP не сработал:
   ABI/GC-ownership/call-frame совместимы — implementation prompt можно
   выдавать без повторного inventory.
+  REVIEW 2026-10-04: **INCONCLUSIVE для implementation handoff**.
+  FO6/frozen-allocation и same-pointer identity подтверждены, D1 остаётся
+  кандидатом. Но cut 4 основан на неверной PUC-предпосылке: `luaopen_package`
+  вызывает `luaL_setfuncs(L, ll_funcs, 1)` (`loadlib.c:744`), поэтому
+  `require` уже является CClosure с package-upvalue в обоих движках;
+  миграция его в light C function нарушила бы parity. Заявленный полный
+  call-site inventory также пропускает `else`/`unreachable`-ветви,
+  которые Zig не заставит обновить при добавлении нового Value tag:
+  `tableGetValueDepth`/`callResolvedIndexMetamethod`, `gsubCallRepl`,
+  `builtinStringGsub`, `tableSortLess`/`builtinTableSort` и resolved
+  metamethod paths. Эти пути становятся достижимы сразу в первом cut.
+  Нужна bounded verification всех callable-classification sites и
+  исправленного cut-порядка; исходный research-handoff остаётся
+  неизменным, implementation prompt пока не утверждён.
+
+- [ ] **VLCF research handoff: ложный `require` cut и неполный callable
+  inventory (HIGH, FIX-NOW для следующего VLCF research).** PUC
+  `loadlib.c:744` создаёт `require` с одним package-upvalue; текущий
+  luazig делает то же. Удаление upvalue ради light function внесло бы
+  регрессию. Новый `Value` tag также пройдёт компиляцию через
+  `else`/`unreachable` в путях метаметодов, gsub, sort и debug.getinfo,
+  поэтому cut 1 исходного плана не является самостоятельно зелёным.
+  Решающий следующий шаг — bounded semantic switch audit и пересборка
+  cut-плана; `prompt.md` содержит scope и focused differential.
+
+- [ ] **`package.loadlib(path, "*")` возвращает function вместо true
+  (BLOCKER, pre-existing, ORDINARY-BACKLOG).** PUC `loadlib.c:391–394`
+  публикует boolean true при успешном probe; luazig `llAccessible`
+  возвращает closure. Независимый контроль на `libc.so.6`: PUC
+  `boolean nil`, Zig `function nil` для `type(v), type(err)`. Это
+  соседний package API parity-gap, без зависимости от VLCF.
 
 - [ ] **C API header completeness: `luaL_optstring` macro передаёт
   аргументы в неверном порядке (BLOCKER, pre-existing,

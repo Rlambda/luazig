@@ -7388,7 +7388,19 @@ pub const Vm = struct {
     /// `what` is a LUA_GC* constant. `param` and `value` are used only for
     /// LUA_GCPARAM (param=LUA_GCP* index, value=new value or -1 for getter).
     /// Returns context-dependent values per PUC semantics.
-    pub fn gcControl(self: *Vm, what: i32, param: i32, value: i32) i32 {
+    /// The PUC lua_gc switch table (lapi.c:1171-1246) with one extension:
+    /// a MainDestined raised by a finalizer during the collection (the GC
+    /// running on a coroutine, a cross-thread closer error destined for
+    /// another thread's armed boundary) is RELAYED to the caller instead
+    /// of swallowed — PUC's luaD_throw longjmp crosses the lua_gc C frame
+    /// to the owner's boundary (ldo.c:130-138), and this signature
+    /// carries that signal across the Zig-side boundary. OOM stays
+    /// absorbed here (pre-existing documented trade-off at i32
+    /// boundaries: the collection aborts mid-cycle in a valid state,
+    /// same as PUC's longjmp aborts it, only without unwinding the
+    /// caller). Callers that cannot propagate MainDestined must use
+    /// `gcControl` instead.
+    pub fn gcControlRelay(self: *Vm, what: i32, param: i32, value: i32) error{MainDestined}!i32 {
         // PUC lapi.c:1174: if gcstp & (GCSTPGC|GCSTPCLS) return -1.
         if (self.gc_stp & (GCSTPGC | GCSTPCLS) != 0) return -1;
         return switch (what) {
@@ -7406,17 +7418,19 @@ pub const Vm = struct {
             },
             2 => blk: { // LUA_GCCOLLECT: fullgc
                 // PUC lua_gc(LUA_GCCOLLECT) → luaC_fullgc(L,0) → luaC_runtilstate
-                // which can luaD_throw on OOM (longjmp). gcControl returns i32
-                // (C ABI boundary), so we cannot propagate via longjmp. The
-                // catch {} swallows OOM: the collection is incomplete (some
-                // objects not collected), but GC invariants are not corrupted
-                // — gcFullCollectionForUser uses try internally, so a failure
+                // which can luaD_throw on OOM (longjmp). This i32 boundary
+                // absorbs OOM: the collection is incomplete (some objects
+                // not collected), but GC invariants are not corrupted —
+                // gcFullCollectionForUser uses try internally, so a failure
                 // aborts mid-cycle leaving gc_state in a valid intermediate
                 // state. PUC's longjmp also aborts the operation; the
                 // difference is that PUC unwinds the C stack while we return
-                // normally. This is the best we can do at a non-throwing C
-                // ABI boundary.
-                self.gcFullCollectionForUser() catch {};
+                // normally. A MainDestined from a finalizer is NOT absorbed:
+                // PUC's throw crosses this frame to the owner's boundary.
+                self.gcFullCollectionForUser() catch |e| switch (e) {
+                    error.MainDestined => return error.MainDestined,
+                    else => {},
+                };
                 break :blk 0;
             },
             3 => @as(i32, @intFromFloat(@max(0.0, self.gc_count_kb))), // LUA_GCCOUNT: totalbytes >> 10
@@ -7437,12 +7451,14 @@ pub const Vm = struct {
                 } else {
                     self.gc_step_debt_kb -= @as(f64, @floatFromInt(n)) / 1024.0;
                 }
-                // PUC luaC_step can luaD_throw on OOM (longjmp). gcControl
-                // returns i32 (C ABI boundary), so we swallow OOM via
-                // `catch false` (treat as "cycle not completed"). PUC's longjmp
-                // also aborts the step; the return-value semantics (1 =
-                // completed, 0 = not completed) are identical for the
-                // non-OOM path.
+                // PUC luaC_step can luaD_throw on OOM (longjmp). This i32
+                // boundary absorbs OOM (treat as "cycle not completed");
+                // PUC's longjmp also aborts the step and the return-value
+                // semantics (1 = completed, 0 = not completed) are identical
+                // for the non-OOM path. A MainDestined from a finalizer is
+                // NOT absorbed (see arm 2); on relay the oldstp restore
+                // below is skipped exactly like PUC's longjmp skips
+                // lapi.c:1215 — GCSTPGC latches.
                 //
                 // STEP pacing note: our incremental step may complete a cycle
                 // in a different number of internal gcAdvance calls than PUC's
@@ -7452,7 +7468,10 @@ pub const Vm = struct {
                 // (1 = cycle reached GCSpause, 0 = still in progress) is
                 // identical to PUC's — only the internal work granularity
                 // differs. The 17_gccontrol differential test verifies this.
-                const completed = self.gcStep(n) catch false;
+                const completed = self.gcStep(n) catch |e| switch (e) {
+                    error.MainDestined => return error.MainDestined,
+                    else => false,
+                };
                 self.gc_stp = oldstp; // restore previous state
                 self.gc_running = (self.gc_stp == 0);
                 break :blk if (completed) 1 else 0;
@@ -7466,17 +7485,24 @@ pub const Vm = struct {
                 const prev_was_pure_inc = (self.gc_mode == .incremental and self.gc_gen_phase != .major);
                 if (prev_was_pure_inc) {
                     // PUC luaC_changemode → entergen → luaC_fullgc can throw
-                    // (luaD_throw/longjmp). gcControl returns i32 (C ABI
-                    // boundary), so we swallow OOM. If entergen fails, the
-                    // mode transition is incomplete but gc_mode/gc_gen_phase
-                    // remain in their prior valid state — no invariant
-                    // corruption.
-                    self.gcEnterGenerational() catch {};
+                    // (luaD_throw/longjmp). OOM is absorbed at this i32
+                    // boundary: if entergen fails, the mode transition is
+                    // incomplete but gc_mode/gc_gen_phase remain in their
+                    // prior valid state — no invariant corruption. A
+                    // MainDestined from a finalizer is NOT absorbed (see
+                    // arm 2).
+                    self.gcEnterGenerational() catch |e| switch (e) {
+                        error.MainDestined => return error.MainDestined,
+                        else => {},
+                    };
                 } else if (self.gc_mode == .incremental and self.gc_gen_phase == .major) {
                     // PUC luaC_changemode: KGC_GENMAJOR → KGC_INC (rename), then
                     // newmode (KGC_GENMINOR) != KGC_INC → entergen.
                     self.gc_gen_phase = .minor;
-                    self.gcEnterGenerational() catch {};
+                    self.gcEnterGenerational() catch |e| switch (e) {
+                        error.MainDestined => return error.MainDestined,
+                        else => {},
+                    };
                 }
                 break :blk if (prev_was_pure_inc) 8 else 7; // LUA_GCINC=8, LUA_GCGEN=7
             },
@@ -7505,6 +7531,20 @@ pub const Vm = struct {
                 break :blk @intCast(@min(res, @as(u64, std.math.maxInt(i32))));
             },
             else => -1, // invalid option
+        };
+    }
+
+    /// Infallible wrapper for callers that cannot propagate a relayed
+    /// MainDestined through their i32 return: the tests/CLI/apiGc entry
+    /// points (which never run the GC on a coroutine with a pending
+    /// cross-thread closer error) and LUA_GCPARAM (which runs no GC).
+    /// The Lua builtin (builtinCollectgarbage) and the C-ABI entry
+    /// (luazigGcFixed) use gcControlRelay and relay the signal properly.
+    pub fn gcControl(self: *Vm, what: i32, param: i32, value: i32) i32 {
+        return self.gcControlRelay(what, param, value) catch |e| switch (e) {
+            error.MainDestined => @panic(
+                "main-destined error escaped gcControl (use gcControlRelay at boundaries that can relay)",
+            ),
         };
     }
 
@@ -8909,7 +8949,18 @@ pub const Vm = struct {
         defer self.gc_busy = was_busy;
 
         self.gcSeparateTobefnz(true);
-        self.gcDrainTobefnzAll(true);
+        self.gcDrainTobefnzAll(true) catch |e| switch (e) {
+            // Close forces L = main: every raise during the drain is
+            // same-thread (RuntimeError, consumed inside
+            // gcCallFinalizerProtected) or main-destined with owner ==
+            // main == fin_thread (consumed the same way). A relay here
+            // is structurally unreachable; panic rather than silently
+            // swallow the signal.
+            error.MainDestined => @panic(
+                "main-destined error escaped the close-time finalizer drain",
+            ),
+            else => {},
+        };
     }
 
     fn callFinalizer(self: *Vm, gc: Value, args: []const Value) DispatchError!Value {
@@ -11056,7 +11107,7 @@ pub const Vm = struct {
     /// luaD_callnoyield, lgc.c:983; finalizers are non-yieldable). A
     /// yield crossing this boundary would be a VM bug — panic rather
     /// than mask it.
-    fn gcRunOneFinalizer(self: *Vm) void {
+    fn gcRunOneFinalizer(self: *Vm) DispatchError!void {
         const obj = self.gcDequeueTobefnzHead(false);
         const mt: ?*Table = switch (obj) {
             .table => |t| t.metatable,
@@ -11067,7 +11118,7 @@ pub const Vm = struct {
         const gc = self.fastTm(m, .gc) orelse return;
         const self_val: Value = obj.toValue() orelse return;
         const call_args = &[_]Value{self_val};
-        self.gcCallFinalizerProtected(gc, call_args);
+        try self.gcCallFinalizerProtected(gc, call_args);
     }
 
     /// gcCallFinalizerProtected: the GCTM protection wrapper (see
@@ -11100,13 +11151,29 @@ pub const Vm = struct {
     /// consumption. The pre-call err_has_obj snapshot distinguishes the
     /// fresh armed install on fin_thread from a stale flag left by an
     /// earlier recovered error (err state is only cleared at fresh
-    /// raises, resume entries and forced closes). Known divergence: when
-    /// the GC runs on a coroutine and the raise targeted another thread,
-    /// PUC's re-throw
-    /// would bypass the finalizer's protection and land on that
-    /// thread's/main's boundary, abandoning the cycle mid-way; this arm
-    /// restores, warns and continues the cycle instead.
-    fn gcCallFinalizerProtected(self: *Vm, gc: Value, call_args: []const Value) void {
+    /// raises, resume entries and forced closes).
+    ///
+    /// Owner discrimination (PUC luaD_throw, ldo.c:125-141): consume the
+    /// MainDestined HERE only when the error's owner is fin_thread — the
+    /// GCTM's own armed protection (callFinalizer's protected_depth) or
+    /// the close drain on main (fin_thread == main: the unarmed raise
+    /// routes to mainthread's errorJmp, which IS this protection while
+    /// the GC runs on main). When the GC runs on a coroutine and the
+    /// raise is destined for another thread (owner != fin_thread — the
+    /// unarmed arm always installs on MAIN, the armed arm on the
+    /// truncated thread, and neither can be the GC-running coroutine),
+    /// PUC's luaD_throw re-throws on the owner's innermost armed
+    /// errorJmp, BYPASSING the worker's GCTM setjmp: the error escapes
+    /// the cycle mid-way (the worker is abandoned as a zombie, the
+    /// remaining tobefnz persists) and GCTM's `g->gcstp = oldgcstp`
+    /// restore never runs — GCSTPGC latches (every lua_gc option
+    /// returns -1, the collector stays off until lua_close). The relay
+    /// arm models exactly that: the error stays canonically owned by the
+    /// owner's err state, the gc_stp/gc_running restore is skipped (the
+    /// latch) and error.MainDestined propagates up to the owner's
+    /// boundary through the resume chain (the existing zombie transport
+    /// machinery performs the semantic unwind on the owner's side).
+    fn gcCallFinalizerProtected(self: *Vm, gc: Value, call_args: []const Value) DispatchError!void {
         const fin_thread = self.activeBytecodeThread();
         const saved_frame_count = fin_thread.call_frames.len();
         const saved_top = fin_thread.top;
@@ -11117,10 +11184,19 @@ pub const Vm = struct {
         self.gc_stp |= GCSTPGC;
         self.gc_running = false;
         self.gc_busy = false;
+        var relayed = false;
         defer {
             self.gc_busy = was_busy;
-            self.gc_stp = old_gcstp;
-            self.gc_running = (old_gcstp == 0);
+            if (!relayed) {
+                self.gc_stp = old_gcstp;
+                self.gc_running = (old_gcstp == 0);
+            }
+            // relayed: PUC's longjmp skips GCTM's `g->gcstp = oldgcstp`
+            // (lgc.c:991) — GCSTPGC latches (lua_gc returns -1 for every
+            // option until lua_close's GCSTPCLS overwrite) and the
+            // collector stays off (gc_running == false models PUC
+            // gcrunning()==false under the latch; condGcFromDispatch's
+            // gc_running gate is the luaC_condGC block).
         }
         _ = self.callFinalizer(gc, call_args) catch |e| switch (e) {
             error.RuntimeError => self.gcWarnFinalizerError(self.protectedErrorValue()),
@@ -11134,18 +11210,25 @@ pub const Vm = struct {
                 const owner: *Thread =
                     if (!snap_fin_has_obj and fin_thread.err_has_obj) fin_thread else self.main_thread.?;
                 if (owner != fin_thread) {
-                    const obj = if (owner.err_has_obj) owner.err_obj else .Nil;
-                    const is_oom = owner.err_is_oom;
-                    const is_errerr = owner.err_is_errerr;
-                    owner.err_has_obj = false;
-                    owner.err_obj = .Nil;
-                    fin_thread.err_has_obj = true;
-                    fin_thread.err_obj = obj;
-                    fin_thread.err_is_oom = is_oom;
-                    fin_thread.err_is_errerr = is_errerr;
-                    fin_thread.err_source = null;
-                    fin_thread.err_line = -1;
+                    // Relay: nothing is transferred to fin_thread and no
+                    // frame/top restore runs — the worker's frames are
+                    // abandoned exactly like PUC's longjmp abandons the
+                    // GCTM activation; the error remains installed on
+                    // the owner for its boundary to consume.
+                    relayed = true;
+                    return error.MainDestined;
                 }
+                const obj = if (owner.err_has_obj) owner.err_obj else .Nil;
+                const is_oom = owner.err_is_oom;
+                const is_errerr = owner.err_is_errerr;
+                owner.err_has_obj = false;
+                owner.err_obj = .Nil;
+                fin_thread.err_has_obj = true;
+                fin_thread.err_obj = obj;
+                fin_thread.err_is_oom = is_oom;
+                fin_thread.err_is_errerr = is_errerr;
+                fin_thread.err_source = null;
+                fin_thread.err_line = -1;
                 self.unwindBytecodeExecFrames(&fin_thread.call_frames, saved_frame_count);
                 self.apiCloseConventionalPcallBoundary(fin_thread, tbc_base);
                 fin_thread.top = saved_top;
@@ -11170,7 +11253,7 @@ pub const Vm = struct {
     /// finalizer" outcome cannot occur.
     fn gcCallfinStep(self: *Vm) DispatchError!bool {
         if (self.gc_tobefnz_head != null and !self.gc_emergency) {
-            self.gcRunOneFinalizer();
+            try self.gcRunOneFinalizer();
             return true;
         } else {
             try self.gcFinishCycle();
@@ -11216,8 +11299,12 @@ pub const Vm = struct {
     /// finalizer may run the nested emergency collection exactly like
     /// PUC (gcstopem is 0 in callallpendingfinalizers); the drain
     /// itself always continues to the end of the list regardless of
-    /// body errors.
-    fn gcDrainTobefnzAll(self: *Vm, makewhite: bool) void {
+    /// body errors — EXCEPT a relayed MainDestined (owner != the
+    /// draining thread), which PUC's luaD_throw routes past the GCTM
+    /// protection entirely: the drain is abandoned mid-list (the
+    /// remaining tobefnz persists for lua_close) and the error
+    /// propagates to the owner's boundary (see gcCallFinalizerProtected).
+    fn gcDrainTobefnzAll(self: *Vm, makewhite: bool) DispatchError!void {
         while (self.gc_tobefnz_head != null) {
             const obj = self.gcDequeueTobefnzHead(makewhite);
             const mt: ?*Table = switch (obj) {
@@ -11229,7 +11316,7 @@ pub const Vm = struct {
             const gc = self.fastTm(m, .gc) orelse continue;
             const self_val: Value = obj.toValue() orelse continue;
             const call_args = &[_]Value{self_val};
-            self.gcCallFinalizerProtected(gc, call_args);
+            try self.gcCallFinalizerProtected(gc, call_args);
         }
     }
 
@@ -27390,23 +27477,30 @@ pub const Vm = struct {
 
     fn builtinCollectgarbage(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         const want_out = outs.len > 0;
-        // PUC lbaslib.c:201-257: collectgarbage forwards all options to lua_gc.
-        // gcControl implements the PUC lua_gc switch table (including the
-        // GCSTPCLS guard returning -1). We only add the Lua-visible result
-        // conversion: count → fractional number, step/isrunning → boolean,
-        // gen/inc → mode string, param → integer.
+        // PUC lbaselib.c:201-257: collectgarbage forwards all options to lua_gc.
+        // gcControlRelay implements the PUC lua_gc switch table (including
+        // the GCSTPGC/GCSTPCLS guard returning -1) and RELAYS a MainDestined
+        // raised by a finalizer during the collection (PUC luaD_throw crosses
+        // the lua_gc frame to the owner's boundary — the error escapes
+        // collectgarbage entirely, never reaching the result push). The
+        // Lua-visible result conversion follows PUC 5.5 exactly: checkvalres
+        // (`if (res == -1) break;`) lands on luaL_pushfail, which pushes NIL
+        // by default in 5.5 (lauxlib.h:172-174 — false only under
+        // LUA_FAILISFALSE): count/step/isrunning/stop/restart/collect and
+        // (via pushmode) gen/inc push nil when the collector is
+        // latched/stopped; param has no checkvalres and pushes the raw -1.
 
         // Default option is "collect" (PUC luaL_checkoption default).
         if (args.len == 0) {
             // PUC: lua_gc(L, LUA_GCCOLLECT) → default case: checkvalres + push int.
-            const res = self.gcControl(2, 0, -1); // LUA_GCCOLLECT
+            const res = try self.gcControlRelay(2, 0, -1); // LUA_GCCOLLECT
             // P16.39 Cut 3 (correctness): the full collection may have run
             // __gc finalizers (nested Lua on stack, which can grow and
             // reallocate it) — re-derive the outs window before writing.
             const outw = self.refreshBuiltinOuts() orelse outs;
             if (res < 0) {
-                // checkvalres: GCSTPGC/GCSTPCLS → push false (not reentrant).
-                if (want_out) outw[0] = .{ .Bool = false };
+                // checkvalres → luaL_pushfail: nil (not reentrant).
+                if (want_out) outw[0] = .Nil;
             } else {
                 if (want_out) outw[0] = .{ .Int = 0 };
             }
@@ -27420,16 +27514,21 @@ pub const Vm = struct {
 
         if (std.mem.eql(u8, what, "count")) {
             // PUC: k = lua_gc(COUNT); b = lua_gc(COUNTB); push k + b/1024.
-            const k = self.gcControl(3, 0, -1); // LUA_GCCOUNT
-            const b = self.gcControl(4, 0, -1); // LUA_GCCOUNTB
+            const k = try self.gcControlRelay(3, 0, -1); // LUA_GCCOUNT
+            const b = try self.gcControlRelay(4, 0, -1); // LUA_GCCOUNTB
             if (want_out) {
                 const live_ud_kb = try self.testcLiveUserdataKb();
                 // P16.39 Cut 3 (correctness): testcLiveUserdataKb runs a
                 // nested callBuiltin (C-frame push may grow stack) —
                 // re-derive the outs window before writing.
                 const outw = self.refreshBuiltinOuts() orelse outs;
-                const total_kb: f64 = @as(f64, @floatFromInt(k)) + @as(f64, @floatFromInt(b)) / 1024.0;
-                outw[0] = .{ .Num = total_kb + live_ud_kb + self.testc_gc_manual_kb + self.testc_gc_count_bonus_once_kb };
+                if (k < 0) {
+                    // checkvalres(k) → luaL_pushfail: nil.
+                    outw[0] = .Nil;
+                } else {
+                    const total_kb: f64 = @as(f64, @floatFromInt(k)) + @as(f64, @floatFromInt(b)) / 1024.0;
+                    outw[0] = .{ .Num = total_kb + live_ud_kb + self.testc_gc_manual_kb + self.testc_gc_count_bonus_once_kb };
+                }
             }
             self.testc_gc_count_bonus_once_kb = 0.0;
             return;
@@ -27440,44 +27539,59 @@ pub const Vm = struct {
                 .Int => |x| x,
                 else => return self.fail("collectgarbage('step', size) expects integer size", .{}),
             } else 0;
-            const res = self.gcControl(5, @intCast(n), -1); // LUA_GCSTEP
+            const res = try self.gcControlRelay(5, @intCast(n), -1); // LUA_GCSTEP
             // P16.39 Cut 3 (correctness): a step can run a full cycle
             // (stepsize=0) or advance through atomic — running __gc
             // finalizers (nested Lua) — re-derive the outs window first.
             const outw = self.refreshBuiltinOuts() orelse outs;
             if (res < 0) {
-                // GCSTPCLS guard: collector stopped → push false (PUC checkvalres).
-                if (want_out) outw[0] = .{ .Bool = false };
+                // checkvalres → luaL_pushfail: nil.
+                if (want_out) outw[0] = .Nil;
                 return;
             }
             if (want_out) outw[0] = .{ .Bool = res != 0 };
             return;
         }
         if (std.mem.eql(u8, what, "isrunning")) {
-            const res = self.gcControl(6, 0, -1); // LUA_GCISRUNNING
+            const res = try self.gcControlRelay(6, 0, -1); // LUA_GCISRUNNING
+            if (res < 0) {
+                // checkvalres → luaL_pushfail: nil.
+                if (want_out) outs[0] = .Nil;
+                return;
+            }
             if (want_out) outs[0] = .{ .Bool = res != 0 };
             return;
         }
         if (std.mem.eql(u8, what, "generational")) {
-            const res = self.gcControl(7, 0, -1); // LUA_GCGEN
+            const res = try self.gcControlRelay(7, 0, -1); // LUA_GCGEN
             // P16.39 Cut 3 (correctness): the mode switch runs full
             // collections (finalizers) — re-derive the outs window first.
             const outw = self.refreshBuiltinOuts() orelse outs;
-            // PUC pushmode: 8→"incremental", 7→"generational"
+            // PUC pushmode: -1 → luaL_pushfail (nil); 8→"incremental",
+            // 7→"generational"
             if (want_out) {
-                const istr = try self.internStr(if (res == 8) "incremental" else "generational");
-                outw[0] = .{ .String = istr };
+                if (res < 0) {
+                    outw[0] = .Nil;
+                } else {
+                    const istr = try self.internStr(if (res == 8) "incremental" else "generational");
+                    outw[0] = .{ .String = istr };
+                }
             }
             return;
         }
         if (std.mem.eql(u8, what, "incremental")) {
-            const res = self.gcControl(8, 0, -1); // LUA_GCINC
+            const res = try self.gcControlRelay(8, 0, -1); // LUA_GCINC
             // P16.39 Cut 3 (correctness): the mode switch runs full
             // collections (finalizers) — re-derive the outs window first.
             const outw = self.refreshBuiltinOuts() orelse outs;
             if (want_out) {
-                const istr2 = try self.internStr(if (res == 7) "generational" else "incremental");
-                outw[0] = .{ .String = istr2 };
+                if (res < 0) {
+                    // PUC pushmode: -1 → luaL_pushfail (nil).
+                    outw[0] = .Nil;
+                } else {
+                    const istr2 = try self.internStr(if (res == 7) "generational" else "incremental");
+                    outw[0] = .{ .String = istr2 };
+                }
             }
             return;
         }
@@ -27494,36 +27608,39 @@ pub const Vm = struct {
                 .Int => |x| @intCast(x),
                 else => return self.fail("collectgarbage('param', ..., value) expects integer value", .{}),
             } else -1;
-            const res = self.gcControl(9, idx, value); // LUA_GCPARAM
+            const res = try self.gcControlRelay(9, idx, value); // LUA_GCPARAM
             if (want_out) outs[0] = .{ .Int = res };
             return;
         }
-        // stop, restart, collect → PUC default case: push integer res.
+        // stop, restart, collect → PUC default case: checkvalres + push int.
         if (std.mem.eql(u8, what, "stop")) {
-            const res = self.gcControl(0, 0, -1); // LUA_GCSTOP
+            const res = try self.gcControlRelay(0, 0, -1); // LUA_GCSTOP
             if (res < 0) {
-                if (want_out) outs[0] = .{ .Bool = false };
+                // checkvalres → luaL_pushfail: nil.
+                if (want_out) outs[0] = .Nil;
             } else {
-                if (want_out) outs[0] = .{ .Bool = true };
+                if (want_out) outs[0] = .{ .Int = res };
             }
             return;
         }
         if (std.mem.eql(u8, what, "restart")) {
-            const res = self.gcControl(1, 0, -1); // LUA_GCRESTART
+            const res = try self.gcControlRelay(1, 0, -1); // LUA_GCRESTART
             if (res < 0) {
-                if (want_out) outs[0] = .{ .Bool = false };
+                // checkvalres → luaL_pushfail: nil.
+                if (want_out) outs[0] = .Nil;
             } else {
-                if (want_out) outs[0] = .{ .Bool = true };
+                if (want_out) outs[0] = .{ .Int = res };
             }
             return;
         }
         if (std.mem.eql(u8, what, "collect")) {
-            const res = self.gcControl(2, 0, -1); // LUA_GCCOLLECT
+            const res = try self.gcControlRelay(2, 0, -1); // LUA_GCCOLLECT
             // P16.39 Cut 3 (correctness): the full collection may have run
             // __gc finalizers (nested Lua) — re-derive the outs window first.
             const outw = self.refreshBuiltinOuts() orelse outs;
             if (res < 0) {
-                if (want_out) outw[0] = .{ .Bool = false };
+                // checkvalres → luaL_pushfail: nil.
+                if (want_out) outw[0] = .Nil;
             } else {
                 if (want_out) outw[0] = .{ .Int = res };
             }
@@ -30763,8 +30880,16 @@ pub const Vm = struct {
         } else {
             th = try self.expectThread(args[0]);
         }
+        // PUC luaB_close (lcorolib.c): classification runs through
+        // auxstatus — COS_RUN only when the thread IS the running L;
+        // any OTHER thread with an OK status and live frames (a resumer
+        // waiting inside its resume, or a zombie abandoned by a relayed
+        // main-destined error) is COS_NORM → "cannot close a normal
+        // coroutine". The raises use luaL_error's luaL_where(1) position
+        // rule (failArgerror): the immediate caller's position — a C
+        // caller (e.g. pcall) yields a bare message.
         if (th == self.main_thread and self.current_thread != null and self.current_thread.? != th) {
-            return self.fail("cannot close a normal coroutine", .{});
+            return self.failArgerror("cannot close a normal coroutine", .{});
         }
         if (th.status == .running) {
             if (self.current_thread != null and self.current_thread.? == th) {
@@ -30783,9 +30908,14 @@ pub const Vm = struct {
                 return error.RuntimeError;
             }
             if (th == self.main_thread and self.current_thread == null) {
-                return self.fail("cannot close a running main thread", .{});
+                // PUC luaB_close COS_RUN + mainthread: "cannot close main
+                // thread".
+                return self.failArgerror("cannot close main thread", .{});
             }
-            return self.fail("cannot close a running coroutine", .{});
+            // Not the running thread: PUC auxstatus reads COS_NORM (OK
+            // status + live frames) — the resumer and the relayed zombie
+            // both land here.
+            return self.failArgerror("cannot close a normal coroutine", .{});
         }
         if (th == self.main_thread) return self.fail("cannot close the main thread", .{});
         if (th.close_has_err) {
@@ -33406,7 +33536,7 @@ pub const Vm = struct {
                 // (suppressed under an emergency collection — the queue
                 // persists for the next minor cycle's drain).
                 if (!self.gc_emergency) {
-                    self.gcDrainTobefnzAll(true);
+                    try self.gcDrainTobefnzAll(true);
                     self.gcAllgcAssertSync();
                     // A nested emergency collection from a drain body owns
                     // gc_state for its duration (PUC fullgen overwrites
@@ -34142,7 +34272,7 @@ pub const Vm = struct {
             // emergency collection finalizers never run (guard
             // `!g->gcemergency`); the queue persists for the next cycle.
             if (!self.gc_emergency) {
-                self.gcDrainTobefnzAll(true);
+                try self.gcDrainTobefnzAll(true);
             }
             self.gcAllgcAssertSync();
             self.gcScheduleNextAutomaticCycle();

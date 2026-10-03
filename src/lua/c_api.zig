@@ -2678,7 +2678,15 @@ pub export fn lua_pushthread(L: ?*lua_State) c_int {
 /// carries the step size (PUC's vararg `size_t n`).
 pub export fn luazigGcFixed(L: ?*lua_State, what: c_int, data: c_int) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    return s.vm.gcControl(what, data, -1);
+    return s.vm.gcControlRelay(what, data, -1) catch |e| switch (e) {
+        // PUC lua_gc → luaC_fullgc/GCTM → luaD_throw: a main-destined
+        // closer error raised by a finalizer (the GC running on a
+        // coroutine) re-throws on MAIN's armed boundary, crossing this
+        // lua_gc C frame (ldo.c:130-138). Relay the same way (pad-4
+        // longjmp to the innermost landing pad); OOM stays absorbed at
+        // this i32 boundary (pre-existing documented trade-off).
+        error.MainDestined => cRelayMainDestined(s.vm),
+    };
 }
 
 /// `luazigGcParam` handles LUA_GCPARAM: `param` is the LUA_GCP* index,

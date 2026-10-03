@@ -33,8 +33,10 @@
 **   C2   last-error-wins across two erroring closers (LIFO close order).
 **   C3   ERRMEM transport: a REAL allocation failure inside the closer
 **        carries status 4 with the fixed "not enough memory" object; a
-**        LITERAL "not enough memory" string error stays ERRRUN (2) —
-**        classification is by object identity, never by text.
+**        lookalike literal ("nomem-literal" — deliberately NOT the exact
+**        OOM text, which would intern to memerrmsg and raise real ERRMEM
+**        on both runtimes) stays ERRRUN (2) — classification is by
+**        object identity, never by text.
 **   C4   denied yield inside the cross-thread closer: the yield error
 **        takes the same transport (st=2, "attempt to yield across a
 **        C-call boundary").
@@ -54,6 +56,32 @@
 **        finalizer's own protection (PUC GCTM's luaD_pcall) and degrades
 **        to the "error in __gc" warning; the GC cycle and the chunk
 **        continue, the target is dead.
+**   G1   GC on a COROUTINE ('collect'): the MainDestined raised by the
+**        finalizer's cross-thread truncation RELAYS past the worker's
+**        GCTM protection to main's armed pcall (PUC luaD_throw's re-throw
+**        on the owner's innermost armed errorJmp, ldo.c:125-141 — the
+**        error's owner is main, not the GC-running coroutine): the worker
+**        is abandoned mid-collection (zombie reading "normal",
+**        coroutine.close rejected "cannot close a normal coroutine",
+**        resume rejected non-suspended), the target is dead.
+**   G2   post-relay latch: the worker's GCTM `gcstp = oldgcstp` restore
+**        never ran (the longjmp bypassed it) — every collectgarbage
+**        option pushes nil (PUC 5.5 luaL_pushfail; 'param' pushes the
+**        raw -1), a newly created finalizable is NOT collected before
+**        close, and its __gc runs at the lua_close drain.
+**   G3   same-thread closer error during the GC on a coroutine (the
+**        finalizer marks and truncates its OWN frame): the plain
+**        RuntimeError arm still degrades to the "error in __gc" warning
+**        and the cycle continues (stderr parity).
+**   G4   C-ABI lane: lua_gc(LUA_GCCOLLECT) on the worker relays across
+**        the C boundary (the c-gc return line never prints).
+**   G5   'step'-driven relay: the error escapes one of the worker's
+**        collectgarbage('step') calls mid-loop.
+**   G6   armed-main lane: the finalizer truncates MAIN ITSELF mid-resume
+**        while main sits inside its own armed pcall (a marked C driver
+**        resumed the worker) — the armed raise relays the same way.
+**   G7   gen-mode switch: collectgarbage('generational') on the worker
+**        runs the entering full collection — the relay escapes it.
 **
 ** The testC-pad lane of the same transport (the raise crossing testC
 ** C-activations) and the checkpanic panic lane are pinned by the Zig
@@ -668,6 +696,274 @@ static void case_gc(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/* G*: GC on a coroutine — the MainDestined relay past the GCTM         */
+/*                                                                      */
+/* PUC lgc.c GCTM runs the finalizer under its own luaD_pcall setjmp    */
+/* with `g->gcstp |= GCSTPGC`; when the body raises a cross-thread      */
+/* closer error whose owner is NOT the GC-running thread, luaD_throw    */
+/* (ldo.c:125-141) re-throws on the owner's innermost armed errorJmp,   */
+/* bypassing the worker's GCTM setjmp: the error escapes the cycle      */
+/* mid-way (the worker becomes a zombie reading "normal"), GCTM's       */
+/* `g->gcstp = oldgcstp` restore never runs (the latch: every lua_gc    */
+/* option returns -1, so collectgarbage pushes nil, until lua_close's   */
+/* GCSTPCLS overwrite), and the remaining tobefnz persists to the close */
+/* drain.                                                               */
+/* ------------------------------------------------------------------ */
+
+static lua_State *g_target;
+static lua_State *g_main;
+static const char *g_tag;
+
+static int g_gc_cross(lua_State *L) {
+    (void)L;
+    printf("%s gc-cross-enter\n", g_tag);
+    lua_settop(g_target, 0);
+    printf("%s gc-cross-after\n", g_tag); /* PUC: never runs (relay) */
+    return 0;
+}
+
+static int g_gc_cross_main(lua_State *L) {
+    (void)L;
+    printf("%s gc-main-enter\n", g_tag);
+    lua_settop(g_main, 0);
+    printf("%s gc-main-after\n", g_tag); /* PUC: never runs (relay) */
+    return 0;
+}
+
+/* G6: main-side driver with a TBC mark in its own C frame; the worker's
+ * GC finalizer truncates MAIN below the mark (the armed raise). */
+static int g_marked_drive(lua_State *L) {
+    int nres = 0;
+    lua_toclose(L, 1);
+    printf("%s drive-before\n", g_tag);
+    lua_getglobal(L, "GWORKER");
+    lua_State *w = lua_tothread(L, -1);
+    lua_pop(L, 1);
+    int st = lua_resume(w, L, 0, &nres);
+    printf("%s drive-resume st=%d\n", g_tag, st); /* PUC: never runs (relay) */
+    return 0;
+}
+
+/* fresh state for the G cases: GC stopped at init (finalizers run only
+ * at the explicit collection the case triggers on the worker), the
+ * erroring-closable OBJ, and the suspended rooted target. */
+static lua_State *g_fresh(int with_target) {
+    lua_State *L = luaL_newstate();
+    int nres = 0, st;
+    g_main = L;
+    luaL_openlibs(L);
+    lua_gc(L, LUA_GCSTOP, 0);
+    st = luaL_dostring(L, OBJ_SETUP);
+    if (st) {
+        printf("%s setup-error: %s\n", g_tag, lua_tostring(L, -1));
+        lua_close(L);
+        return NULL;
+    }
+    if (with_target) {
+        /* root the target for the whole case (the worker's full
+         * collection must not collect the suspended coroutine itself) */
+        g_target = lua_newthread(L);
+        lua_pushthread(g_target);
+        lua_xmove(g_target, L, 1);
+        lua_setglobal(L, "GTARGET");
+        lua_pushcfunction(g_target, target_body);
+        lua_getglobal(g_target, "OBJ");
+        st = lua_resume(g_target, L, 1, &nres);
+        printf("%s target-first st=%d\n", g_tag, st);
+    }
+    return L;
+}
+
+/* a finalizable userdata whose __gc is `fin`, dropped as garbage */
+static void g_drop_finalizable(lua_State *L, lua_CFunction fin) {
+    lua_newuserdata(L, 0);
+    lua_newtable(L);
+    lua_pushcfunction(L, fin);
+    lua_setfield(L, -2, "__gc");
+    lua_setmetatable(L, -2);
+    lua_pop(L, 1);
+}
+
+/* G1: relay via collectgarbage('collect') + zombie/dead reuse tail */
+static void case_g1(void) {
+    g_tag = "G1";
+    lua_State *L = g_fresh(1);
+    if (!L) return;
+    int st;
+    g_drop_finalizable(L, g_gc_cross);
+    st = luaL_dostring(L,
+        "local worker=coroutine.create(function()\n"
+        " collectgarbage('restart'); collectgarbage('collect'); print('G1 worker-after')\n"
+        "end)\n"
+        "local ok,err=pcall(function()\n"
+        " print('G1 resume-result',coroutine.resume(worker))\n"
+        "end)\n"
+        "print('G1 pcall',ok,err)\n"
+        "print('G1 worker-status',coroutine.status(worker))\n"
+        "print('G1 zombie-close',pcall(coroutine.close,worker))\n"
+        "print('G1 zombie-resume',pcall(coroutine.resume,worker))\n"
+        "print('G1 dead-resume',pcall(coroutine.resume,GTARGET))\n");
+    printf("G1 dostring=%d target-status=%d\n", st, lua_status(g_target));
+    lua_close(L);
+}
+
+/* G2: post-relay latch — every option nil, param -1, close drain */
+static void case_g2(void) {
+    g_tag = "G2";
+    lua_State *L = g_fresh(1);
+    if (!L) return;
+    int st;
+    g_drop_finalizable(L, g_gc_cross);
+    st = luaL_dostring(L,
+        "local worker=coroutine.create(function()\n"
+        " collectgarbage('restart'); collectgarbage('collect'); print('G2 worker-after')\n"
+        "end)\n"
+        "local ok,err=pcall(function() coroutine.resume(worker) end)\n"
+        "print('G2 pcall',ok,err)\n"
+        "print('G2 count',collectgarbage('count'))\n"
+        "print('G2 isrunning',collectgarbage('isrunning'))\n"
+        "print('G2 collect',collectgarbage('collect'))\n"
+        "print('G2 step',collectgarbage('step'))\n"
+        "print('G2 stop',collectgarbage('stop'))\n"
+        "print('G2 restart',collectgarbage('restart'))\n"
+        "print('G2 gen',collectgarbage('generational'))\n"
+        "print('G2 inc',collectgarbage('incremental'))\n"
+        "print('G2 param',collectgarbage('param','pause'))\n"
+        "FINAL2=setmetatable({},{__gc=function() print('G2 final2-ran') end})\n"
+        "print('G2 chunk-continues')\n");
+    printf("G2 dostring=%d\n", st);
+    lua_close(L); /* the close drain runs FINAL2's __gc (latch ends here) */
+    printf("G2 done\n");
+}
+
+/* G3: same-thread closer error during the GC on a coroutine — the plain
+ * RuntimeError arm: warn (stderr) + the cycle continues */
+static int g_gc_selfmark(lua_State *L) {
+    lua_getglobal(L, "OBJ");
+    lua_toclose(L, -1);
+    printf("G3 selfmark-before\n");
+    lua_settop(L, 0);
+    printf("G3 selfmark-after\n"); /* never: the close errors first */
+    return 0;
+}
+
+static void case_g3(void) {
+    g_tag = "G3";
+    lua_State *L = g_fresh(0);
+    if (!L) return;
+    int st;
+    g_drop_finalizable(L, g_gc_selfmark);
+    st = luaL_dostring(L,
+        "local worker=coroutine.create(function()\n"
+        " collectgarbage('restart'); collectgarbage('collect'); print('G3 worker-after')\n"
+        "end)\n"
+        "local ok,err=pcall(function()\n"
+        " print('G3 resume',coroutine.resume(worker))\n"
+        "end)\n"
+        "print('G3 pcall',ok,err)\n"
+        "print('G3 worker-status',coroutine.status(worker))\n");
+    printf("G3 dostring=%d\n", st);
+    lua_close(L);
+}
+
+/* G4: C-ABI lane — lua_gc(LUA_GCCOLLECT) on the worker relays across
+ * the C boundary */
+static int g_c_gc_collect(lua_State *L) {
+    lua_gc(L, LUA_GCRESTART, 0);
+    int res = lua_gc(L, LUA_GCCOLLECT, 0);
+    printf("G4 c-gc-returned %d\n", res); /* PUC: never runs (relay) */
+    lua_pushinteger(L, res);
+    return 1;
+}
+
+static void case_g4(void) {
+    g_tag = "G4";
+    lua_State *L = g_fresh(1);
+    if (!L) return;
+    int st;
+    g_drop_finalizable(L, g_gc_cross);
+    lua_pushcfunction(L, g_c_gc_collect);
+    lua_setglobal(L, "CGC");
+    st = luaL_dostring(L,
+        "local worker=coroutine.create(function()\n"
+        " CGC(); print('G4 worker-after')\n"
+        "end)\n"
+        "local ok,err=pcall(function()\n"
+        " print('G4 resume',coroutine.resume(worker))\n"
+        "end)\n"
+        "print('G4 pcall',ok,err)\n"
+        "print('G4 worker-status',coroutine.status(worker))\n");
+    printf("G4 dostring=%d\n", st);
+    lua_close(L);
+}
+
+/* G5: 'step'-driven relay — the error escapes one step mid-loop */
+static void case_g5(void) {
+    g_tag = "G5";
+    lua_State *L = g_fresh(1);
+    if (!L) return;
+    int st;
+    g_drop_finalizable(L, g_gc_cross);
+    st = luaL_dostring(L,
+        "local worker=coroutine.create(function()\n"
+        " collectgarbage('restart')\n"
+        " for i=1,200 do collectgarbage('step') end\n"
+        " print('G5 worker-after')\n"
+        "end)\n"
+        "local ok,err=pcall(function()\n"
+        " print('G5 resume',coroutine.resume(worker))\n"
+        "end)\n"
+        "print('G5 pcall',ok,err)\n"
+        "print('G5 worker-status',coroutine.status(worker))\n");
+    printf("G5 dostring=%d\n", st);
+    lua_close(L);
+}
+
+/* G6: armed-main lane — the finalizer truncates MAIN mid-resume while
+ * main sits inside its own armed pcall */
+static void case_g6(void) {
+    g_tag = "G6";
+    lua_State *L = g_fresh(0);
+    if (!L) return;
+    int st;
+    g_drop_finalizable(L, g_gc_cross_main);
+    lua_pushcfunction(L, g_marked_drive);
+    lua_setglobal(L, "GDRIVE");
+    st = luaL_dostring(L,
+        "GWORKER=coroutine.create(function()\n"
+        " collectgarbage('restart'); collectgarbage('collect'); print('G6 worker-after')\n"
+        "end)\n"
+        "local ok,err=pcall(function()\n"
+        " local rok=GDRIVE(OBJ)\n"
+        " print('G6 unreachable',rok)\n"
+        "end)\n"
+        "print('G6 pcall',ok,err)\n"
+        "print('G6 worker-status',coroutine.status(GWORKER))\n");
+    printf("G6 dostring=%d\n", st);
+    lua_close(L);
+}
+
+/* G7: gen-mode switch — the entering full collection relays */
+static void case_g7(void) {
+    g_tag = "G7";
+    lua_State *L = g_fresh(1);
+    if (!L) return;
+    int st;
+    g_drop_finalizable(L, g_gc_cross);
+    st = luaL_dostring(L,
+        "local worker=coroutine.create(function()\n"
+        " collectgarbage('restart'); collectgarbage('generational'); print('G7 worker-after')\n"
+        "end)\n"
+        "local ok,err=pcall(function()\n"
+        " print('G7 resume',coroutine.resume(worker))\n"
+        "end)\n"
+        "print('G7 pcall',ok,err)\n"
+        "print('G7 worker-status',coroutine.status(worker))\n");
+    printf("G7 dostring=%d\n", st);
+    lua_close(L);
+}
+
+/* ------------------------------------------------------------------ */
 
 int main(void) {
     /* C printf and Lua print must interleave in program order on both
@@ -685,6 +981,13 @@ int main(void) {
     case_c8();
     case_pm();
     case_gc();
+    case_g1();
+    case_g2();
+    case_g3();
+    case_g4();
+    case_g5();
+    case_g6();
+    case_g7();
     printf("40_maindestined_transport: ALL DONE\n");
     return 0;
 }

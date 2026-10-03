@@ -45,7 +45,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
-- [ ] **F1-correction BLOCKER: cross-thread closer error обязан
+- [x] **F1-correction BLOCKER: cross-thread closer error обязан
   маршрутизировать на armed boundary MAIN (PUC ldo.c luaD_throw
   rethrow мимо resume/pcall границ caller-корутины) — не представимо в
   текущем c_error_jmp-дизайне; STOP, выбор дизайна за ревьювером
@@ -103,6 +103,22 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   F-S4-2 lua_error без memerrmsg-промоушена (pre-existing);
   residuals: IF-1 unprobed, checkpanic lane, perf-измерение
   (milestone scope).
+  CLOSED (F1 milestone, `2d3aa34`, 2026-10-03): typed error.MainDestined
+  transport с АТОМЖНЫМ GC terminal restore в product. Data flow пп.1-5
+  брифа f1impl реализованы полностью; delete list: foreign-error-on-
+  caller, lua_resume OOM-fold для нового kind, caller death
+  finalization, testC -1 sentinel, 66 f1res-комментариев. Постоянный
+  suite 40_maindestined_transport (P1-P3 zombie parity, C1-C8, PM
+  target==MAIN, GC finalizer) — IDENTICAL PUC D+RF; C7 rc=0 D+RF,
+  chunk-continues (координатор верифицировал лично). Гейты: 360/360
+  D+RF, smoke, matrix zig_fail=0, api580 GREEN, fmt; 14_state_handles
+  pre-existing не маскирован. Perf: pcall_ok -0.09% / pcall_err +0.06%
+  (шум). IF-1 закрыт owner-boundary ветвью (PM). Residuals:
+  GC-on-coroutine divergence документирована (PUC убивает chunk, VM
+  восстанавливает+продолжает — оба режима идентичны, parity не
+  заявлен); 2 pre-existing утечки checkpanic sub-VM; committed-
+  binaries repo condition; decoded-string-literal codegen; pristine
+  parser underscore-literal.
 
 - [x] **C-S3 correction: ERRMEM из живой C-continuation портит TBC slot
   при `lua_resume` (BLOCKER, FIX-NOW; review `9057be2`).** Suite 39

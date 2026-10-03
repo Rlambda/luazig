@@ -194,6 +194,14 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
    restore (F-S4-3, C7 зелёный D+RF) должен войти в первый cut с
    typed propagation. Дальнейшие проверки boundary ownership указаны
    в STATUS. Пункт F1-correction остаётся открытым до миграции.
+   EXECUTED (F1 milestone, `2d3aa34`, 2026-10-03): typed
+   error.MainDestined transport перенесён в product с АТОМНЫМ GC
+   terminal restore (F-S4-3 закрыт: finalizer consumer восстанавливает
+   CallFrame/window/top до warning/продолжения; C7 rc=0 D+RF,
+   chunk-continues). Delete list выполнен (foreign-error-on-caller,
+   lua_resume OOM-fold, caller death finalization, testC -1 sentinel,
+   66 f1res-комментариев). Suite 40_maindestined_transport IDENTICAL
+   PUC D+RF. Пункт STATUS закрыт `d712650`.
 
 F2 (`lua_settop`/`lua_closeslot` error transport) остаётся открытым bounded
 parity-дефектом; F3 (forced-close region ownership) закрыт `9b1bad7`.

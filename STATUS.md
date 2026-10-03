@@ -45,6 +45,18 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
+- [ ] **GC finalizer thread-routing parity-gap (ARCHITECTURAL-BACKLOG;
+  f1gc2, 2026-10-03).** PUC на host lua_gc(worker) aborts via panic-
+  hook с thrower = исходный target; zig исполняет finalizers на
+  активном потоке и потребляет raise как GCTM warning (warn/continue).
+  Отдельный от закрытого F1-комплекса класс; raw lanes gt/gm в
+  /tmp/opencode/f1gc2_*.
+
+- [ ] **UNCONFIRMED: zig lua_toclose молча принимает non-closable
+  value, где PUC ошибается (f1gc2, 2026-10-03).** Единичное наблюдение
+  при lane-gm setup; нужен решающий PUC-дифференциал (mark-time
+  checkclosemth — см. также F-S4-1).
+
 - [x] **F1-correction BLOCKER: cross-thread closer error обязан
   маршрутизировать на armed boundary MAIN (PUC ldo.c luaD_throw
   rethrow мимо resume/pcall границ caller-корутины) — не представимо в
@@ -134,8 +146,21 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   matrix zig_fail=0; api580 GREEN; perf -0.75% шум. ELF-бинарники
   suite 40 убраны из трекинга (history-rewrite отклонён — blocker
   владельцу зафиксирован в f1gc_report §ELF).
+  GC-ENTRIES CORRECTION (review; CLOSED `216502d`, 2026-10-03):
+  Defect 1 (BLOCKER, источник cc03d60): State.gc/apiGc -> gcControl
+  wrapper @panic на достижимом MainDestined (C callback на worker,
+  G1). Fix: error{MainDestined}!i32 через gcControlRelay; Zig
+  C-conv callbacks — -3 sentinel; постоянный unit-тест (PUC-эталон).
+  Defect 2 (verdict split): ревью-гипотеза lua_gc->no-pad ОПРОВЕРГНУТА
+  (raw lanes gt/gm); no-pad L-mismatch ПОДТВЕРЖДЁН (lanes s/r) — fix:
+  Vm.main_destined_thrower (unarmed-arm) + panic-hook на исходном
+  thrower с опубликованным объектом; lanes s/r byte-identical PUC.
+  Координатор верифицировал: 361/361 D+RF, suite 40 IDENTICAL D+RF,
+  smoke, matrix zig_fail=0, api580, fmt. Findings зарегистрированы:
+  GC finalizer thread-routing parity-gap (ARCHITECTURAL-BACKLOG) и
+  lua_toclose non-closable acceptance (UNCONFIRMED) — пункты ниже.
 
-- [ ] **F1 GC review correction — GC on a coroutine consumes a MAIN-destined
+- [x] **F1 GC review correction — GC on a coroutine consumes a MAIN-destined
   cross-thread closer error at the wrong boundary (BLOCKER, FIX-NOW;
   review of `2d3aa34`, 2026-10-03).** The F1 `CLOSED` claim above is
   suspended until this changed path has PUC parity. In `vm.zig:11133`,
@@ -154,6 +179,24 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   and add permanent D+RF PUC differential coverage, preserving main-GC C7.
   The correction must also remove the two ELF outputs for suite 40 from
   the milestone commits as required by `AGENTS.md` (source-only test).
+  Product GC relay for Lua `collectgarbage` and C `lua_gc` was implemented
+  in `cc03d60`; the prior coroutine-GC oracle now matches PUC. The
+  historical ELF rewrite remains an explicit owner decision; the files
+  are untracked from `cc03d60` onward.
+
+- [ ] **F1 GC public-entry correction — Zig `State.gc` panics on a relayed
+  MAIN-destined error (BLOCKER, FIX-NOW; review of `cc03d60`, 2026-10-03).**
+  `api.State.gc` (`api.zig:468`) calls `Vm.apiGc` → the new infallible
+  `Vm.gcControl` wrapper (`vm.zig:7544`), whose `MainDestined` arm calls
+  `@panic`. A C callback running on a coroutine can call the public Zig
+  `State.gc(2, 0)`; a finalizer with the same cross-thread closer error
+  as suite 40 G1 then escapes GC toward MAIN. This valid embedding path
+  crashes at the wrapper instead of reaching MAIN's protected boundary.
+  Correct the Zig-facing GC transport and verify a focused PUC-equivalent
+  C differential; audit the newly reachable no-handler `lua_gc` path so
+  `atpanic` receives PUC's original throwing `lua_State` (currently
+  `cRelayMainDestined` passes MAIN at `c_api.zig:1793`). Keep G1–G7 and
+  main-GC C7 parity. See the root `prompt.md` for bounded scope.
 
 - [x] **C-S3 correction: ERRMEM из живой C-continuation портит TBC slot
   при `lua_resume` (BLOCKER, FIX-NOW; review `9057be2`).** Suite 39

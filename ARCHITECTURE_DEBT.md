@@ -181,16 +181,19 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
    base boundary. Решающий C differential должен предшествовать
    дизайну.
    RESEARCH VERDICT (f1res, 2026-10-02, к `9b004d3`; отчёт
-   /tmp/opencode/f1res_report.md, клон /tmp/opencode/f1res/clone):
+   /tmp/opencode/f1res_report.md, прототип /tmp/opencode/f1res/luazig;
+   /tmp/opencode/f1res/clone — pristine base):
    решающий прототип выполнен — typed main-destined transport
    (error-set kind `MainDestined`, один longjmp через ровно один
    C-кадр, все промежуточные Zig defer исполняются, owner err-state =
-   main) даёт P1-P5b 12/12 IDENTICAL PUC D+RF и доминирует над
-   owner-tagged longjmp (A) по всем осям. GO за владельцем; data flow +
-   acceptance + cuts 1-4 в отчёте §4.2-4.3. Обязательный gate
-   implementation-milestone: F-S4-3 (GC-arm frame/window restore, C7
-   зелёный D+RF). Пункт STATUS F1-correction остаётся открытым до
-   миграции.
+   main) подтверждает P1-P5b по проверяемому behavior/exit class
+   D+RF (P4 stderr panic/backtrace различается). Ревью: ACCEPT +
+   RECORD research; typed предпочтителен для доказанного пути,
+   product-модель ещё требует согласования владельца. Исходные cuts
+   1-4 в отчёте §4.2-4.3 нельзя публиковать буквально: GC terminal
+   restore (F-S4-3, C7 зелёный D+RF) должен войти в первый cut с
+   typed propagation. Дальнейшие проверки boundary ownership указаны
+   в STATUS. Пункт F1-correction остаётся открытым до миграции.
 
 F2 (`lua_settop`/`lua_closeslot` error transport) остаётся открытым bounded
 parity-дефектом; F3 (forced-close region ownership) закрыт `9b1bad7`.

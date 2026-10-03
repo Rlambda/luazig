@@ -119,6 +119,21 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   заявлен); 2 pre-existing утечки checkpanic sub-VM; committed-
   binaries repo condition; decoded-string-literal codegen; pristine
   parser underscore-literal.
+  GC CORRECTION (review reopened `b9e68c4`; CLOSED `cc03d60`,
+  2026-10-03): gcCallFinalizerProtected перехватывал КАЖДЫЙ
+  MainDestined — верно только для собственной GCTM boundary
+  GC-потока. Fix: дискриминация по err-OWNER (consume при owner ==
+  GC-running thread, иначе relay с gc_stp/gc_running skip по PUC
+  luaD_throw bypass GCTM setjmp); каскад DispatchError!void;
+  gcControlRelay; luazigGcFixed через cRelayMainDestined. Попутно:
+  builtinCollectgarbage PUC-parity (nil latch/-1/integer 0),
+  builtinCoroutineClose zombie-сообщение. Suite 40 G1-G7. Координатор
+  верифицировал лично: GC-oracle /tmp/f1_gc_repro.c byte-identical PUC
+  (пересборка); C7 rc=0; suite 40 + DIFF_TESTS IDENTICAL D/RF;
+  360/360 D+RF (6-падения = tmpfs DiskQuota, устранены); smoke 91/91;
+  matrix zig_fail=0; api580 GREEN; perf -0.75% шум. ELF-бинарники
+  suite 40 убраны из трекинга (history-rewrite отклонён — blocker
+  владельцу зафиксирован в f1gc_report §ELF).
 
 - [ ] **F1 GC review correction — GC on a coroutine consumes a MAIN-destined
   cross-thread closer error at the wrong boundary (BLOCKER, FIX-NOW;

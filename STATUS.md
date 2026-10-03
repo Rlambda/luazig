@@ -319,6 +319,29 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   его заменили на fallible `pushlstring`. Требуется модель light C
   function и общий inventory call/type/equality/GC/dump sites,
   отдельный milestone после утверждения дизайна.
+  RESEARCH VERDICT (vlcf, 2026-10-03, к `38b4aa6`; отчёт
+  /tmp/opencode/vlcf_report.md, oracle /tmp/opencode/vlcf_oracle.c +
+  raw): FO6 подтверждён и изолирован freeze-oracle — ERRMEM возникает
+  ровно на allocCclosure (vm.zig:11741 <- api.zig:1403), НЕ на росте
+  стека/pcall-машине (контроли A4/A5 status=0 оба движка; координатор
+  верифицировал лично B11/B12 identity-FAIL zig vs OK PUC). PUC n==0 —
+  setfvalue без allocation и без luaC_checkGC. Identity-класс РАСШИРЯЕТ
+  FO6 (HIGH, тот же корень): два push одного C-указателя в zig —
+  разные heap-объекты → rawequal=0, table-key miss, topointer!=f
+  (PUC: всё true); отдельно lua_topointer возвращает NULL для ВСЕХ
+  closure (.Closure уходит в else). Рекомендация — D1: отдельный
+  Value.LightCFunction вариант (nullable fn-ptr, 16B Value сохранён,
+  публичный ABI нетронут); D2 (nested union) не помещается в 16B;
+  D3 (intern-таблица) — второй mutable owner; cFuncEqual-hack
+  (угадывание light по upvalues.len==0) удаляется. 4 самостоятельно
+  зелёных cuts с negative/positive acceptance — в отчёте; gates: unit,
+  C API differential, matrix, api580 переизмерение, paired
+  instructions для hot dispatch. Смежные findings (не в этап):
+  tostring(function) формат (MEDIUM, ORDINARY — все function values);
+  require как CClosure vs PUC VLCF (MEDIUM — решение в этапе);
+  loadlib probe return-форма (UNCONFIRMED). STOP не сработал:
+  ABI/GC-ownership/call-frame совместимы — implementation prompt можно
+  выдавать без повторного inventory.
 
 - [ ] **C API header completeness: `luaL_optstring` macro передаёт
   аргументы в неверном порядке (BLOCKER, pre-existing,

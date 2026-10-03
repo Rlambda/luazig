@@ -188,8 +188,8 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
    C-кадр, все промежуточные Zig defer исполняются, owner err-state =
    main) подтверждает P1-P5b по проверяемому behavior/exit class
    D+RF (P4 stderr panic/backtrace различается). Ревью: ACCEPT +
-   RECORD research; typed предпочтителен для доказанного пути,
-   product-модель ещё требует согласования владельца. Исходные cuts
+   RECORD research; владелец утвердил typed-направление 2026-10-03.
+   Исходные cuts
    1-4 в отчёте §4.2-4.3 нельзя публиковать буквально: GC terminal
    restore (F-S4-3, C7 зелёный D+RF) должен войти в первый cut с
    typed propagation. Дальнейшие проверки boundary ownership указаны

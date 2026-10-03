@@ -89,7 +89,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   (owner-tagged longjmp) для доказанного foreign-thread пути:
   defer-безопасность структурна, missed-signal обнаруживается при
   компиляции. Ревью: ACCEPT + RECORD для research, не принятие
-  прототипа как product. Рекомендация GO к согласованию с владельцем;
+  прототипа как product. Владелец утвердил typed-направление 2026-10-03;
   data flow и исходный cut-порядок — отчёт §4.2-4.3. CUT1 нельзя
   публиковать отдельно от GC terminal restore: C7 уже достижим и
   падает до предложенного CUT3. Обязательный gate первого product cut:

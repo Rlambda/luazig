@@ -465,7 +465,20 @@ pub const State = struct {
 
     /// PUC `lua_gc` (lapi.c:lua_gc): garbage collector control. Maps
     /// LUA_GC* constants to VM GC operations.
-    pub fn gc(self: *State, what: i32, data: i32) i32 {
+    ///
+    /// A full collection can run finalizers, and a finalizer's error on a
+    /// cross-thread close raises a MainDestined transport (PUC ldo.c:130-
+    /// 138: the throw crosses the lua_gc C frame to main's boundary).
+    /// This entry relays that signal through the error union instead of
+    /// aborting: a plain Zig caller propagates/handles `error.MainDestined`
+    /// like any API error. A Zig C-conv callback called from Lua cannot
+    /// return an error union, so it completes the transport by returning
+    /// the -3 sentinel from `callCFunctionWithBoundary`'s shim protocol —
+    /// the callback's boundary decodes it to `error.MainDestined`, which
+    /// propagates to the pcall consumer on main (the same transport the
+    /// C ABI's lua_gc gives C embedders). Never longjmp out of this call
+    /// directly: the jump would cross arbitrary Zig defers.
+    pub fn gc(self: *State, what: i32, data: i32) error{MainDestined}!i32 {
         return self.vm.apiGc(what, data);
     }
 
@@ -2375,4 +2388,152 @@ test "api integration coroutine resume yield roundtrip" {
     try std.testing.expectEqual(Status.ok, st.@"resume"(1, 1));
     try st.xmove(1, null, 1);
     try std.testing.expectEqual(@as(i64, 42), st.tointeger(-1).?);
+}
+
+// The Zig embedding lane of the main-destined closer transport: a Zig
+// C-conv callback running ON A WORKER COROUTINE drives the GC through
+// `State.gc` (the public Zig API), a finalizer's cross-thread settop on a
+// suspended target raises a main-destined error, and `State.gc` must relay
+// it (error.MainDestined) instead of aborting — the callback completes the
+// transport with the -3 sentinel, and the armed pcall on main observes
+// false + the closer error object. The C-ABI lane (lua_gc) and the Lua
+// lane (collectgarbage) of the same scenario are the permanent C
+// differential suite tests/c_api/40_maindestined_transport.c; the PUC
+// etalon trace below was verified byte-identical against PUC 5.5.0.
+var gc_relay_target_handle: ?*vm_mod.lua_State = null;
+var gc_relay_witnessed = false;
+
+fn gcRelayKdone(L: ?*vm_mod.lua_State, status: c_int, ctx: isize) callconv(.c) c_int {
+    _ = L;
+    _ = status;
+    _ = ctx;
+    return 0;
+}
+
+// PUC target_body: lua_toclose(L, 1) + lua_yieldk(L, 0, 0, k) — the TBC
+// mark lives in the target's own suspended C frame, so a cross-thread
+// settop(0) closes it (the suite-40 shape).
+fn gcRelayTargetBody(L: ?*vm_mod.lua_State) callconv(.c) c_int {
+    const s = State.fromHandle(L.?);
+    const vm = s.vm;
+    const th = vm.current_thread.?;
+    // PUC lua_toclose(L, 1): mark the OBJ argument's slot TBC in THIS C
+    // frame (the same chain append c_api's lua_toclose performs).
+    const abs_slot = vm_mod.Vm.cWindowSlot(th, 1) orelse return -1;
+    const fi = th.call_frames.len() - 1;
+    th.c_tbc_chain.append(vm.alloc, .{ .frame_slot = .{
+        .cframe_idx = fi,
+        .slot_idx = abs_slot,
+    } }) catch return -1;
+    // PUC lua_yieldk(L, 0, 0, k): the shared entry reports a successful
+    // yield as error.Yield; convert to the -2 yield sentinel.
+    vm.luaYieldKShared(th, &.{}, 0, gcRelayKdone, 0) catch |e| switch (e) {
+        error.Yield => return -2,
+        else => return -1,
+    };
+    unreachable; // luaYieldKShared never returns without yielding
+}
+
+// PUC zgc: the worker's GC entry — restart + collect through State.gc.
+fn gcRelayZgcEntry(L: ?*vm_mod.lua_State) callconv(.c) c_int {
+    var s = State.fromHandle(L.?);
+    _ = s.gc(1, 0) catch return -1; // LUA_GCRESTART (runs no GC)
+    _ = s.gc(2, 0) catch |e| switch (e) {
+        // The fix under test: State.gc relays the main-destined closer
+        // error through its error union; complete the transport with the
+        // -3 sentinel (the boundary decodes it to error.MainDestined and
+        // propagates to the pcall consumer on main).
+        error.MainDestined => {
+            gc_relay_witnessed = true;
+            return -3;
+        },
+    };
+    return 0; // never reached when the relay fires
+}
+
+// PUC zcross: the finalizer body — cross-truncate the suspended target.
+fn gcRelayZcrossEntry(L: ?*vm_mod.lua_State) callconv(.c) c_int {
+    _ = L;
+    var ts = State.fromHandle(gc_relay_target_handle.?);
+    ts.settop(0) catch |e| switch (e) {
+        // Relay through the finalizer's own boundary toward the GC entry.
+        error.MainDestined => return -3,
+        else => return -1,
+    };
+    return 0; // never reached when the raise relays
+}
+
+test "api gc on a coroutine relays a main-destined closer error" {
+    var st = State.init(.{ .allocator = std.heap.c_allocator });
+    defer st.deinit();
+    gc_relay_witnessed = false;
+    // The bare VM has no bytecode compiler (the C ABI's lua_newstate and
+    // the CLI install it); the chunk's `load` needs one.
+    st.vm.setDynamicBytecodeCompiler(vm_mod.defaultBytecodeCompiler);
+
+    // GC stopped: the finalizer must run only at the worker's explicit
+    // collect (deterministic scenario setup, same as the C etalon).
+    _ = st.gc(0, 0) catch 0;
+
+    // OBJ: a table whose __close errors (chunk name = the source text,
+    // matching luaL_dostring's naming so the error object matches PUC).
+    const obj_src = "OBJ = setmetatable({}, {__close = function() error('closer-boom') end})";
+    try std.testing.expectEqual(Status.ok, st.loadbuffer(obj_src, obj_src));
+    try std.testing.expectEqual(Status.ok, st.pcall(0, 0));
+
+    // target: suspended with a TBC mark whose __close errors
+    try st.newthread();
+    const th = st.tothread(1) orelse return error.TestUnexpectedResult;
+    try st.vm.ensureThreadApiHandle(th);
+    gc_relay_target_handle = th.api_handle.?;
+    var ts = State.fromHandle(gc_relay_target_handle.?);
+    try ts.pushcfunction(gcRelayTargetBody);
+    _ = try ts.getglobal("OBJ");
+    try std.testing.expectEqual(Status.yielded, st.@"resume"(1, 1));
+    try st.setglobal("GTARGET"); // roots the target for the whole case
+
+    try st.pushcfunction(gcRelayZgcEntry);
+    try st.setglobal("ZGC");
+    try st.pushcfunction(gcRelayZcrossEntry);
+    try st.setglobal("ZCROSS");
+
+    const chunk =
+        \\local LOG = {}
+        \\local fin = setmetatable({}, {__gc = ZCROSS})
+        \\fin = nil
+        \\local worker = coroutine.create(function() ZGC() end)
+        \\local ok, err = pcall(function()
+        \\  local rok, rerr = coroutine.resume(worker)
+        \\  LOG[#LOG + 1] = "resume-result " .. tostring(rok) .. " " .. tostring(rerr)
+        \\end)
+        \\LOG[#LOG + 1] = "pcall " .. tostring(ok) .. " " .. tostring(err)
+        \\LOG[#LOG + 1] = "worker-status " .. coroutine.status(worker)
+        \\LOG[#LOG + 1] = "target-status " .. coroutine.status(GTARGET)
+        \\LOG[#LOG + 1] = "count " .. tostring(collectgarbage("count"))
+        \\LOG[#LOG + 1] = "reuse " .. tostring(load("return 2+2")())
+        \\return table.concat(LOG, "\n")
+    ;
+    try std.testing.expectEqual(Status.ok, st.loadbuffer(chunk, "=api-gc-relay"));
+    try std.testing.expectEqual(Status.ok, st.pcall(0, 1));
+
+    // PUC-verified etalon trace: the relay bypasses the worker's frames
+    // (no "resume-result" line — the pcall'd function is abandoned
+    // mid-frame), the pcall on main catches false + the closer error, the
+    // zombie worker reports "normal", the target died with the closer
+    // error (PUC resetthread), the interrupted full GC leaves
+    // collectgarbage('count') nil, and the VM still runs code after it.
+    const want =
+        "pcall false [string \"OBJ = setmetatable({}, {__close = function() ...\"]:1: closer-boom\n" ++
+        "worker-status normal\n" ++
+        "target-status dead\n" ++
+        "count nil\n" ++
+        "reuse 4";
+    try std.testing.expectEqualStrings(want, st.tostring(-1) orelse return error.TestUnexpectedResult);
+
+    // The focused witness: State.gc surfaced error.MainDestined (relayed,
+    // not aborted, not absorbed).
+    try std.testing.expect(gc_relay_witnessed);
+    // The target died with LUA_ERRRUN (PUC luaE_resetthread + luaD_throw
+    // status carry).
+    try std.testing.expectEqual(@as(c_int, 2), th.api_status);
 }

@@ -5494,6 +5494,24 @@ pub const Vm = struct {
     /// `lua_atpanic` (lapi.c:lua_atpanic). Returns the previous panic function.
     c_panicf: ?*const fn (?*lua_State) callconv(.c) c_int = null,
 
+    /// The thread a `MainDestined` transport was raised FROM (the thread
+    /// whose frame a cross-thread close was truncating when its closer
+    /// errored) — PUC `luaD_throw`'s no-handler branch (ldo.c:139-146)
+    /// calls `g->panic` with that ORIGINAL throwing target L, not with
+    /// main. Set only by `crossCloseErrorRaise`'s UNARMED arm right
+    /// before returning `error.MainDestined`: that arm is the only raise
+    /// site whose transport can terminate at a no-boundary panic
+    /// (`cRelayMainDestined`'s no-pad branch in c_api.zig). The armed
+    /// arm's transport always lands on the raising thread's own C pad or
+    /// a Zig consumer on main, never at the no-pad terminal, so it does
+    /// not set this field. The field is fresh at every read: the no-pad
+    /// terminal is reachable only from a host-context raise (main
+    /// unprotected), which is exactly the unarmed arm. The error object
+    /// is NOT stored here: the unarmed raise already publishes it at the
+    /// thrower's window top (PUC resetthread's seterrorobj), where the
+    /// panic hook reads it.
+    main_destined_thrower: ?*Thread = null,
+
     /// The active `lua_State` handle for C function calls. `callCFunction`
     /// passes `cur_handle` to the C function as its `?*lua_State` argument,
     /// matching PUC's `(*f)(L)` contract. Set by `setupMainHandle` (main
@@ -7535,11 +7553,12 @@ pub const Vm = struct {
     }
 
     /// Infallible wrapper for callers that cannot propagate a relayed
-    /// MainDestined through their i32 return: the tests/CLI/apiGc entry
-    /// points (which never run the GC on a coroutine with a pending
-    /// cross-thread closer error) and LUA_GCPARAM (which runs no GC).
-    /// The Lua builtin (builtinCollectgarbage) and the C-ABI entry
-    /// (luazigGcFixed) use gcControlRelay and relay the signal properly.
+    /// MainDestined through their i32 return: the tests/CLI entry points
+    /// (which never run the GC on a coroutine with a pending cross-thread
+    /// closer error) and LUA_GCPARAM (which runs no GC). The Lua builtin
+    /// (builtinCollectgarbage), the C-ABI entry (luazigGcFixed) and the
+    /// Zig API entry (apiGc) use gcControlRelay and relay the signal
+    /// properly.
     pub fn gcControl(self: *Vm, what: i32, param: i32, value: i32) i32 {
         return self.gcControlRelay(what, param, value) catch |e| switch (e) {
             error.MainDestined => @panic(
@@ -7548,13 +7567,18 @@ pub const Vm = struct {
         };
     }
 
-    /// Legacy 2-arg entry point for the Zig API (`api.State.gc`). Delegates
-    /// to `gcControl` with param=value=0 (unused for non-GCPARAM options).
-    pub fn apiGc(self: *Vm, what: i32, data: i32) i32 {
+    /// Zig API entry for `api.State.gc` (PUC `lua_gc` for Zig embedders).
+    /// Relays a MainDestined from a finalizer through the error union —
+    /// the same transport `luazigGcFixed` gives the C ABI: a Zig
+    /// C-conv callback called from Lua completes the transport by
+    /// returning the -3 sentinel (see `callCFunctionWithBoundary`),
+    /// which decodes to `error.MainDestined` at the callback's boundary
+    /// and propagates to the pcall consumer on main.
+    pub fn apiGc(self: *Vm, what: i32, data: i32) error{MainDestined}!i32 {
         // For LUA_GCSTEP, `data` carries the step size (PUC's vararg n).
         // For LUA_GCPARAM, `data` is unused (param/value come separately).
-        if (what == 5) return self.gcControl(what, data, -1);
-        return self.gcControl(what, 0, -1);
+        if (what == 5) return self.gcControlRelay(what, data, -1);
+        return self.gcControlRelay(what, 0, -1);
     }
 
     pub fn apiCall(self: *Vm, ccall_mode: Thread.CCallMode, callee: Value, args: []const Value) Error![]Value {
@@ -8521,6 +8545,15 @@ pub const Vm = struct {
         main.err_source = null;
         main.err_line = -1;
         self.err = if (last == .String) last.String.bytes() else null;
+        // Record the ORIGINAL throwing target for the no-handler terminal
+        // (PUC ldo.c:139-146: g->panic receives this L, not main). Only
+        // this arm's transport can terminate at a no-boundary panic; see
+        // `main_destined_thrower`. The object the hook reads stays at the
+        // thrower's window top (published above, PUC seterrorobj) — main's
+        // window is not touched for the no-handler branch (PUC copies onto
+        // main only for the armed-mainthread re-throw, ldo.c:131-133, which
+        // took the armed arm above).
+        self.main_destined_thrower = th;
         return error.MainDestined;
     }
 
@@ -48933,7 +48966,11 @@ pub const Vm = struct {
             // error occurred (the object is already in the VM error
             // state, c_error_value is null), -2 = yield (values in
             // th.yielded), -3 = a main-destined closer error relayed from
-            // a continuation script (the object is in MAIN's err state).
+            // a continuation script OR from a Zig C-conv embedding
+            // callback that caught `error.MainDestined` from a relaying
+            // API entry (e.g. `api.State.gc`) and completes the transport
+            // with this sentinel instead of longjmping across its own
+            // Zig defers (the object is in MAIN's err state).
             // The old i32 passthrough encoded these as
             // plain negatives; the union maps them to the same outcomes
             // without colliding with ThreadSwitch.

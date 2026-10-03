@@ -1777,22 +1777,31 @@ pub export fn lua_pushlightuserdata(L: ?*lua_State, p: ?*anyopaque) void {
 /// crossed C activation a zombie (PUC abandons it). The jump crosses
 /// exactly ONE C frame — from this shim to the innermost landing pad —
 /// never arbitrary Zig defers. Without an active pad there is no armed
-/// boundary on the path: PUC aborts through the panic hook on the MAIN
-/// thread with the object at its top; mirror that (best-effort publish of
-/// the in-flight object onto main's window, then the hook and the
-/// terminal panic).
+/// boundary on the path: PUC's no-handler branch (ldo.c:139-146) calls
+/// `g->panic` with the ORIGINAL throwing target L — the thread whose
+/// frame the cross-thread close was truncating — with the error object
+/// at ITS top (published by the unarmed raise, PUC resetthread's
+/// seterrorobj); MAIN's stack is not touched (PUC copies the object onto
+/// main only for the armed-mainthread re-throw, ldo.c:131-133, which took
+/// the pad branch above). Mirror that: the thrower is
+/// `vm.main_destined_thrower` (set by `crossCloseErrorRaise`'s unarmed
+/// arm — the only raise site whose transport can reach this terminal),
+/// and the hook receives the thrower's handle with its already-published
+/// object.
 fn cRelayMainDestined(vm: *Vm) noreturn {
     if (vm.c_error_jmp) |jb| {
         _longjmp(@ptrCast(jb), 4);
     }
-    const mt = vm.main_thread.?;
-    if (mt.err_has_obj) {
-        vm.cWindowPush(mt, mt.err_obj) catch {};
-    }
-    if (mt.api_handle) |mh| {
-        cPanicOn(vm, mh, null);
-    }
-    @panic("main-destined error without an armed C-function boundary");
+    // PUC ldo.c:139-146: g->panic(ORIGINAL throwing target), not main.
+    // Defensive fallback to main covers a MainDestined that did not come
+    // from crossCloseErrorRaise's unarmed arm (none exists today — the
+    // armed arm's transport always lands on its own pad or a Zig
+    // consumer).
+    const thrower = vm.main_destined_thrower orelse vm.main_thread.?;
+    vm.ensureThreadApiHandle(thrower) catch {
+        @panic("main-destined error without an armed C-function boundary");
+    };
+    cPanicOn(vm, thrower.api_handle.?, null);
 }
 
 fn cThrowOn(vm: *Vm, throwing: *vm_mod.lua_State, err: api.ApiError) noreturn {

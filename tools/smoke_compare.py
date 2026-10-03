@@ -80,28 +80,48 @@ UDATATEST_SRC = "lua-5.5.0/testes/libs/udatatest.c"
 UDATATEST_PUC_DIR = "lua-5.5.0/testes/libs"
 UDATATEST_ZIG_DIR = "tests/smoke/zig-libs"
 
+# Package-loader C-module fixtures (93_package_c_loaders.lua): one source
+# compiled into several module names per runtime; see the header of
+# cloaders.c for the module set and the negative-path guarantees.
+CLOADERS_SRC = "tests/smoke/cloaders.c"
+CLOADERS_MODULES = (
+    "cload_ok",      # searcher_C hit
+    "cload_missing", # searcher_C ERRFUNC (luaopen symbol absent)
+    "croot_a",       # searcher_Croot hit for "croot_a.sub"
+    "croot_b",       # searcher_Croot miss for "croot_b.sub"
+    "cload_ig-v2",   # IGMARK '-' prefix fallback
+)
 
-def build_udatatest_modules(root: Path) -> None:
-    """Compile the two per-runtime udatatest.so builds (see comment above)."""
-    src = root / UDATATEST_SRC
-    if not src.exists():
-        raise FileNotFoundError(str(src))
+# (source, output module names) built into each per-runtime module dir
+SMOKE_C_MODULES = (
+    (UDATATEST_SRC, ("udatatest",)),
+    (CLOADERS_SRC, CLOADERS_MODULES),
+)
+
+
+def build_smoke_c_modules(root: Path) -> None:
+    """Compile the per-runtime C-module fixtures (see comments above)."""
     for out_dir, include_dir in (
         (UDATATEST_PUC_DIR, "lua-5.5.0/src"),
         (UDATATEST_ZIG_DIR, "src/lua"),
     ):
         out = root / out_dir
         out.mkdir(parents=True, exist_ok=True)
-        subprocess.check_call(
-            [
-                "gcc", "-O2", "-Wall",
-                "-I", str(root / include_dir),
-                "-fPIC", "-shared",
-                "-o", str(out / "udatatest.so"),
-                str(src),
-            ],
-            cwd=str(root),
-        )
+        for src_rel, modules in SMOKE_C_MODULES:
+            src = root / src_rel
+            if not src.exists():
+                raise FileNotFoundError(str(src))
+            for mod in modules:
+                subprocess.check_call(
+                    [
+                        "gcc", "-O2", "-Wall",
+                        "-I", str(root / include_dir),
+                        "-fPIC", "-shared",
+                        "-o", str(out / f"{mod}.so"),
+                        str(src),
+                    ],
+                    cwd=str(root),
+                )
 
 
 def udatatest_cpath_preamble(root: Path, *, zig: bool) -> str:
@@ -144,7 +164,7 @@ def main() -> int:
     if not args.no_build:
         subprocess.check_call(["make", "-s", "lua-c"], cwd=str(root))
         subprocess.check_call(["zig", "build", "-Doptimize=ReleaseFast"], cwd=str(root))
-        build_udatatest_modules(root)
+        build_smoke_c_modules(root)
 
     # Per-runtime module selection preambles (see udatatest_cpath_preamble),
     # delivered via LUA_INIT_5_5. Applied to every file: harmless for scripts

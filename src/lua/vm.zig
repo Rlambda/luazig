@@ -178,7 +178,6 @@ pub const BuiltinId = enum(u8) {
     dofile,
     loadfile,
     load,
-    require,
     package_searchpath,
     package_loadlib,
     setmetatable,
@@ -368,7 +367,6 @@ pub const BuiltinId = enum(u8) {
             .dofile => "dofile",
             .loadfile => "loadfile",
             .load => "load",
-            .require => "require",
             .package_searchpath => "package.searchpath",
             .package_loadlib => "package.loadlib",
             .setmetatable => "setmetatable",
@@ -1649,6 +1647,13 @@ const CloseMode = enum { return_close, error_escape };
 
 /// PUC `CallInfo.u.c` — C function frame state.
 /// Only valid when `callstatus & CIST_C != 0`.
+/// Heap cell for a C activation's armed return-tail transport: the
+/// exact-size result buffer reserved by cReturnTailReserve. A pointer
+/// cell (not an inline slice) keeps CFrameState extern-layout-clean and
+/// the CallFrame at 88 B; allocated only by the rare reserving
+/// activations (the package openers / require).
+const CResultTransport = struct { vals: []Value = &.{} };
+
 pub const CFrameState = extern struct {
     /// PUC `u.c.k`: continuation function, called on resume after yield.
     /// null = no continuation (plain yield or non-yieldable call).
@@ -1684,6 +1689,19 @@ pub const CFrameState = extern struct {
     /// interrupted TBC close. null when CIST_CLSRET is not set.
     /// Must be freed by freeCFrameOwnedState on C-frame pop.
     clsret_state: ?*CClsretState = null,
+    /// Return-tail transport armed by THIS activation via
+    /// cReturnTailReserve (see there for the publication-order contract).
+    /// Ownership is per-activation: the buffer is armed before the
+    /// callback's first publication and handed to callCFunction's
+    /// normal-return epilogue (exact-size match) as its result copy;
+    /// every other exit releases it exactly once — the error, yield and
+    /// thread-switch arms of callCFunction, and every C-frame teardown
+    /// path through freeCFrameOwnedState (pop, unwind, recovery, thread
+    /// close/death). Because the cell lives on the frame, a nested
+    /// reserve (a metamethod re-entering require from inside this
+    /// activation's publication) arms the nested activation's own frame
+    /// and cannot release or consume this one.
+    c_result_transport: ?*CResultTransport = null,
 };
 
 /// PUC `L->tbclist` entry (lstate.h: the to-be-closed chain threaded
@@ -3060,9 +3078,10 @@ const TestcContState = struct {
 // the LuaString P16.17 bug class). The assert compiles in EVERY build
 // mode; offsets are part of the representation contract (u-variant at 32).
 comptime {
-    // 80 B — the window model keeps every C frame's stack on
-    // th.stack (PUC: the shared L->stack).
-    std.debug.assert(@sizeOf(CallFrame) == 80);
+    // 88 B — the window model keeps every C frame's stack on
+    // th.stack (PUC: the shared L->stack); the C arm carries the
+    // per-activation return-tail transport pointer.
+    std.debug.assert(@sizeOf(CallFrame) == 88);
     std.debug.assert(@offsetOf(CallFrame, "u") == 32);
     std.debug.assert(@alignOf(CallFrame) == 8);
 }
@@ -4300,7 +4319,7 @@ comptime {
     std.debug.assert(@sizeOf(Closure) == 48);
     std.debug.assert(@sizeOf(Cell) == 48);
     std.debug.assert(@sizeOf(Userdata) == 56);
-    std.debug.assert(@sizeOf(Thread) == 3872);
+    std.debug.assert(@sizeOf(Thread) == 4128);
 }
 
 /// Result of compiling a text chunk through the host-selected bytecode
@@ -4488,6 +4507,13 @@ const TestcAllocControl = struct {
     /// base-allocator path. Zero cost when not armed: one branch on this
     /// field per charged allocation.
     poison_unmap: bool = false,
+
+    /// One-shot oracle (test machinery, default-off): when set, the first
+    /// allocation failure disarms the countdown BEFORE the emergency-GC
+    /// retry, so exactly one attempt fails, the emergency collect runs,
+    /// and the retry succeeds — a transient-failure scenario without the
+    /// sticky refusal a bare armed countdown gives through the retry.
+    disarm_after_emergency: bool = false,
 };
 
 /// PUC `lua_newstate`'s allocator contract for C-created states: route
@@ -4754,6 +4780,7 @@ const TestcAllocAdapter = struct {
         // init), gcstopem maps to gc_busy/testc_emergency_active.
         if (self.vm.emergencyCollectAllowed()) {
             self.vm.emergencyCollect();
+            if (self.ctrl.disarm_after_emergency) self.ctrl.alloc_count = -1;
             if (self.attemptAlloc(len, alignment, ra)) |mem| return mem;
         }
         return null;
@@ -8208,6 +8235,64 @@ pub const Vm = struct {
         try exposeDispatchResult(void, self.growBcStackCapSlow(th, needed));
     }
 
+    /// Reserve a C activation's infallible RETURN TAIL. PUC's
+    /// publication-order contract (loadlib.c luaopen_package / ll_require
+    /// over luaD_checkstack): a C function that publishes globals calls
+    /// this BEFORE its first publication — every fallible step precedes
+    /// the publications, and after them only stack moves remain (PUC's
+    /// luaD_poscall moveresults allocates nothing). The reserve covers the
+    /// whole tail of `nresults` returned values: the window slots for
+    /// their pushes, a root-scope capacity for their re-protect, and the
+    /// exact-size result transport that callCFunction's normal return
+    /// consumes instead of its fresh heap copy. After a successful reserve
+    /// a memory failure can no longer leave a published global behind a
+    /// failed call. The transport is owned by the arming activation's own
+    /// C-frame (CFrameState.c_result_transport): a re-reserve on the same
+    /// activation releases its previous buffer, while a nested reserve (a
+    /// metamethod re-entering the mechanism from inside this activation's
+    /// publication) arms the nested activation's frame and leaves this
+    /// one intact.
+    pub fn cReturnTailReserve(self: *Vm, th: *Thread, nresults: usize) Error!void {
+        try self.cWindowEnsure(th, nresults);
+        const transport = try self.alloc.create(CResultTransport);
+        errdefer self.alloc.destroy(transport);
+        transport.vals = try self.alloc.alloc(Value, nresults);
+        errdefer self.alloc.free(transport.vals);
+        try self.gc_root_values.ensureUnusedCapacity(self.infraAlloc(), nresults);
+        // The arming activation: the innermost C-frame (the reserve is
+        // armed by the running C callback with every nested frame
+        // returned). No C-frame on the thread means no activation to
+        // reserve for — drop the buffer.
+        var cidx = th.call_frames.len();
+        while (cidx > 0 and !th.call_frames.getConstPtr(cidx - 1).isC()) cidx -= 1;
+        if (cidx == 0) {
+            self.alloc.free(transport.vals);
+            self.alloc.destroy(transport);
+            return;
+        }
+        const fr = th.call_frames.getPtr(cidx - 1);
+        if (fr.u.c.c_result_transport) |old| self.releaseResultTransport(old);
+        fr.u.c.c_result_transport = transport;
+    }
+
+    /// Free a transport cell and its buffer (the single release path —
+    /// every owner hand-off goes through here or the epilogue consume).
+    fn releaseResultTransport(self: *Vm, t: *CResultTransport) void {
+        self.alloc.free(t.vals);
+        self.alloc.destroy(t);
+    }
+
+    /// Release this activation's armed result transport (its own C-frame's
+    /// CFrameState.c_result_transport) on the exits that bypass the
+    /// normal-return consumption (error, yield, thread switch). Nested
+    /// activations' reserves live on their own frames and are untouched.
+    fn cResultTransportRelease(self: *Vm, fr: *CallFrame) void {
+        if (fr.u.c.c_result_transport) |t| {
+            self.releaseResultTransport(t);
+            fr.u.c.c_result_transport = null;
+        }
+    }
+
     /// Push one value onto the window (PUC `api_incr_top`: *L->top = v;
     /// L->top++ — with growth). The pushed slot has no open upvalue.
     pub fn cWindowPush(self: *Vm, th: *Thread, v: Value) Error!void {
@@ -9694,30 +9779,6 @@ pub const Vm = struct {
         return error.RuntimeError;
     }
 
-    /// PUC `luaL_error` equivalent: throws a formatted error message WITHOUT
-    /// source prefix. Unlike `fail` (which is `luaG_runerror` and adds
-    /// "source:line: " via `luaG_addinfo`), `luaL_error` calls `lua_error`
-    /// directly without `luaG_addinfo`. Used by C library functions like
-    /// `require` (loadlib.c) and `assert` (lauxlib.c) where PUC does not
-    /// add source location to the error object.
-    fn failLib(self: *Vm, comptime fmt: []const u8, args: anytype) Error {
-        // Fresh error: reset LUA_ERRERR signal before invokeErrfunc.
-        self.errThread().err_is_errerr = false;
-        self.errThread().err_is_oom = false;
-        var tmp: [2048]u8 = undefined;
-        const msg = std.fmt.bufPrint(tmp[0..], fmt, args) catch "runtime error";
-        self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
-        const istr = try self.internStr(self.err.?);
-        self.errThread().err_obj = .{ .String = istr };
-        self.errThread().err_has_obj = true;
-        // PUC luaL_error: no source prefix (luaG_addinfo not called).
-        self.errThread().err_source = null;
-        self.errThread().err_line = -1;
-        self.captureErrorTraceback();
-        try self.invokeErrfunc();
-        return error.RuntimeError;
-    }
-
     /// Push a synthetic CallFrame representing a C function (builtin) call.
     /// In PUC Lua, every function call — including C functions — pushes a
     /// `CallInfo` onto `L->ci`. luazig skips this for builtins as a
@@ -10824,6 +10885,13 @@ pub const Vm = struct {
         vm: *Vm,
         mark: RootMark,
         token: u64,
+        /// Capacity this scope reserved at open time — the legal bound for
+        /// its protect* calls. Debug builds assert every protect* lands
+        /// inside the reserve: an appendAssumeCapacity past it is UB that
+        /// otherwise only surfaces as vector corruption when the surplus
+        /// capacity happens to run out.
+        reserved_values: usize,
+        reserved_cells: usize,
         active: bool = true,
 
         /// Infallible value root; requires the capacity reserved by
@@ -10834,6 +10902,7 @@ pub const Vm = struct {
         /// any LATER allocation cannot sweep it.
         pub fn protectValueAssumeCapacity(self: *RootScope, v: Value) ValueRoot {
             const index = self.vm.gc_root_values.items.len;
+            std.debug.assert(index < self.mark.values_len + self.reserved_values); // protect past the scope's reserve
             self.vm.gc_root_values.appendAssumeCapacity(.{
                 .value = v,
                 .owner_token = self.token,
@@ -10845,6 +10914,7 @@ pub const Vm = struct {
         /// same discipline; payload + token in one append).
         pub fn protectCellAssumeCapacity(self: *RootScope, cell: *Cell) CellRoot {
             const index = self.vm.gc_root_cells.items.len;
+            std.debug.assert(index < self.mark.cells_len + self.reserved_cells); // protect past the scope's reserve
             self.vm.gc_root_cells.appendAssumeCapacity(.{
                 .cell = cell,
                 .owner_token = self.token,
@@ -10907,7 +10977,13 @@ pub const Vm = struct {
         self.gc_root_seq = token;
         self.gc_root_depth += 1;
         self.gc_root_top = token;
-        return .{ .vm = self, .mark = mark, .token = token };
+        return .{
+            .vm = self,
+            .mark = mark,
+            .token = token,
+            .reserved_values = value_capacity,
+            .reserved_cells = cell_capacity,
+        };
     }
 
     /// Read-only root-state snapshot for protected C boundaries: taken
@@ -26389,7 +26465,6 @@ pub const Vm = struct {
             .dofile => return try self.builtinDofile(args),
             .loadfile => try self.builtinLoadfile(args, outs),
             .load => try self.builtinLoad(args, outs),
-            .require => try self.builtinRequire(args, outs),
             .package_searchpath => try self.builtinPackageSearchpath(args, outs),
             .package_loadlib => try self.builtinPackageLoadlib(args, outs),
             .setmetatable => try self.builtinSetmetatable(args, outs),
@@ -26966,7 +27041,9 @@ pub const Vm = struct {
         try self.setGlobal("dofile", .{ .Builtin = .dofile });
         try self.setGlobal("loadfile", .{ .Builtin = .loadfile });
         try self.setGlobal("load", .{ .Builtin = .load });
-        try self.setGlobal("require", .{ .Builtin = .require });
+        // `require` is no longer a Builtin global: openPackageLibrary below
+        // publishes the PUC require C closure (upvalue 1: the package table)
+        // into _G.require.
         try self.setGlobal("setmetatable", .{ .Builtin = .setmetatable });
         try self.setGlobal("getmetatable", .{ .Builtin = .getmetatable });
         try self.setGlobal("pairs", .{ .Builtin = .pairs });
@@ -26974,36 +27051,27 @@ pub const Vm = struct {
         try self.setGlobal("rawget", .{ .Builtin = .rawget });
         try self.setGlobal("rawset", .{ .Builtin = .rawset });
 
-        // package = { path = "..." }
-        const package_tbl = try self.allocTableNoGc();
-        // PUC `setpath` (loadlib.c:274): read LUA_PATH_5_5 / LUA_PATH env var,
-        // with `;;` → default substitution. Falls back to default if unset.
-        // When `self.noenv` is set (`-E`), `resolveEnvPath` returns the
-        // default directly without reading env vars.
-        const path_val = try self.resolveEnvPath("LUA_PATH_5_5", "LUA_PATH", LUA_PATH_DEFAULT);
-        try self.setField(package_tbl, "path", .{ .String = path_val });
-        const cpath_val = try self.resolveEnvPath("LUA_CPATH_5_5", "LUA_CPATH", LUA_CPATH_DEFAULT);
-        try self.setField(package_tbl, "cpath", .{ .String = cpath_val });
-        try self.setField(package_tbl, "config", .{ .String = try self.internStr("/\n;\n?\n!\n-\n") });
-        try self.setField(package_tbl, "searchpath", .{ .Builtin = .package_searchpath });
-        // PUC package.loadlib: dynamic library loading via std.DynLib (Zig's
-        // dlopen/dlsym wrapper). Opens the .so, looks up the luaopen_*
-        // symbol, and wraps the C function pointer in a Closure so it
-        // integrates with the existing C function dispatch (B1/B2).
-        try self.setField(package_tbl, "loadlib", .{ .Builtin = .package_loadlib });
-        const loaded_tbl = try self.allocTableNoGc();
-        const preload_tbl = try self.allocTableNoGc();
-        try self.setField(package_tbl, "loaded", .{ .Table = loaded_tbl });
-        try self.setField(package_tbl, "preload", .{ .Table = preload_tbl });
-        // PUC stores loaded/preload in the registry (LUA_REGISTRYINDEX,
-        // LUA_LOADED_TABLE / LUA_PRELOAD_TABLE) so that require still works
-        // even if someone replaces the global `package` table. PUC creates
-        // them at package-load time (luaL_getsubtable); bootstrapGlobals is
-        // our package-load point, so the same shape: create here, publish
-        // into the registry slot's table.
+        // PUC luaopen_package (loadlib.c:724-747): build the package table —
+        // path/cpath (setpath), config, searchpath/loadlib, loaded/preload
+        // (registry get-or-create), the 4-entry searchers table and the
+        // require C closure, each closure carrying the package table as
+        // upvalue 1. openPackageLibrary also publishes _G.require (PUC
+        // luaL_setfuncs over ll_funcs); the caller publishes _G.package
+        // (PUC leaves that global to the host's library-opening sequence).
+        const package_tbl = try self.openPackageLibrary();
+        try self.setGlobal("package", .{ .Table = package_tbl });
+        // loaded/preload now live in the registry (openPackageLibrary's
+        // get-or-create); re-derive `loaded_tbl` for the "_G" entry below
+        // and the eager stdlib preload at the end of bootstrapGlobals.
+        // openPackageLibrary just created/verified the table, so a miss or
+        // a non-table here is an internal invariant breach, not a Lua error.
         const reg = self.registryTable().?;
-        try self.setField(reg, "_LOADED", .{ .Table = loaded_tbl });
-        try self.setField(reg, "_PRELOAD", .{ .Table = preload_tbl });
+        const loaded_v = self.getFieldOpt(reg, "_LOADED") orelse
+            return self.fail("registry _LOADED missing after openPackageLibrary", .{});
+        const loaded_tbl = switch (loaded_v) {
+            .Table => |t| t,
+            else => return self.fail("registry _LOADED is not a table after openPackageLibrary", .{}),
+        };
         // PUC registers the globals table in package.loaded under "_G"
         // (lbaselib.c luaopen_base: `lua_pushvalue(L, LUA_GLOBALSINDEX);
         // lua_setfield(L, -2, "_G")` on the loaded table). This is what
@@ -27011,7 +27079,6 @@ pub const Vm = struct {
         // what pushglobalfuncname's loaded-table search walks to resolve
         // global functions (setmetatable, error, ...) to their names.
         try self.setField(loaded_tbl, "_G", self.registryGlobalsValue());
-        try self.setGlobal("package", .{ .Table = package_tbl });
 
         // os = core process/filesystem helpers
         const os_tbl = try self.allocTableNoGc();
@@ -27239,12 +27306,6 @@ pub const Vm = struct {
 
     fn createDebugTableNoGc(self: *Vm) DispatchError!*Table {
         const mod = try self.allocTableNoGc();
-        try self.fillDebugTable(mod);
-        return mod;
-    }
-
-    fn createDebugTable(self: *Vm) DispatchError!*Table {
-        const mod = try self.allocTable();
         try self.fillDebugTable(mod);
         return mod;
     }
@@ -28675,6 +28736,176 @@ pub const Vm = struct {
         return n;
     }
 
+    /// Shared prologue for the package-library C closures (require and the
+    /// four searchers): the running closure is the top C-frame's callee at
+    /// its func_slot, upvalue 1 is the package table the closure was created
+    /// with (PUC ll_funcs/createfuncname — NOT _G.package, so replacing the
+    /// global never re-points an existing require), and the call's arguments
+    /// are the C window slots above the callee ([func_slot+1, th.top)).
+    /// `args` aliases th.stack: consumers read it synchronously (every impl
+    /// starts with shimCheckStringArg, before any allocation that could
+    /// reallocate the stack) and never touch the slice afterwards.
+    const PackageShimContext = struct {
+        pkg: *Table,
+        args: []const Value,
+    };
+
+    fn packageShimContext(self: *Vm) ?PackageShimContext {
+        const th = self.activeBytecodeThread();
+        if (th.call_frames.len() == 0) return null;
+        const fr_idx = th.call_frames.len() - 1;
+        const fr = th.call_frames.getConstPtr(fr_idx);
+        if (!fr.isC() or fr.func_slot >= th.top or th.stack[fr.func_slot] != .Closure) return null;
+        const cl = th.stack[fr.func_slot].Closure;
+        if (cl.upvalues.len != 1 or cl.upvalues[0].value != .Table) return null;
+        return .{
+            .pkg = cl.upvalues[0].value.Table,
+            .args = th.stack[fr.func_slot + 1 .. th.top],
+        };
+    }
+
+    /// Shared tail for the package-library C closures: push the impl's
+    /// result values onto the calling C window (PUC leaves a C function's
+    /// results on L->stack above ci->func) with the auxwrap error mapping:
+    /// a RuntimeError is already installed in the VM error state (plain -1
+    /// return); OOM installs MEMERRMSG and longjmps with status 4; a
+    /// ThreadSwitch (a __close metamethod in a loader's graph switched
+    /// threads) longjmps with signal 3; MainDestined returns the typed
+    /// -3 relay sentinel for callCFunctionWithBoundary. The result values are rooted across
+    /// the window push: its stack-growth allocation can fail, run an
+    /// emergency full GC (luaM_realloc_ tryagain) and succeed on retry —
+    /// until the values land on th.stack they are visible only to this Zig
+    /// frame (the intern table is weak; fresh strings would be swept).
+    /// `vals` is this frame's owned allocation: the longjmp exits below
+    /// bypass Zig defers, so every jump arm frees it explicitly BEFORE
+    /// raising (an abandoned root scope is restored by the C landing pad's
+    /// restoreRoots; the slice has no such net).
+    fn packageShimReturn(self: *Vm, res: DispatchError![]Value) c_int {
+        const th = self.activeBytecodeThread();
+        const vals = res catch |e| switch (e) {
+            error.RuntimeError => return -1,
+            error.MainDestined => return -3,
+            error.OutOfMemory => {
+                if (self.c_error_jmp) |jb| {
+                    self.setOutOfMemoryError();
+                    // Same raise-window latch as auxwrap: this C frame is
+                    // the raising frame if the error crosses a lua_resume
+                    // boundary with it live.
+                    self.latchErrmemRaiseWindow(th);
+                    self.c_error_value = self.errThread().err_obj;
+                    self.c_error_status = 4; // LUA_ERRMEM
+                    _longjmp(@ptrCast(jb), 1);
+                }
+                std.process.abort();
+            },
+            error.ThreadSwitch => {
+                if (self.c_error_jmp) |jb| {
+                    _longjmp(@ptrCast(jb), 3);
+                }
+                std.process.abort();
+            },
+            error.Yield => {
+                // apiCall(.nonyieldable) converts yield attempts to
+                // RuntimeErrors; a Yield here is an invariant breach.
+                _ = self.failC("package shim: unexpected yield", .{}) catch {};
+                return -1;
+            },
+        };
+        defer self.alloc.free(vals);
+        // Root the results across the push (see the doc comment above);
+        // openRootScope reserves the capacity up front so the protects
+        // below are infallible.
+        var scope = self.openRootScope(vals.len, 0) catch {
+            // The jump below bypasses the defer — release the owned
+            // slice first (the values are lost with the ERRMEM; the
+            // window itself is restored by the landing pad).
+            self.alloc.free(vals);
+            if (self.c_error_jmp) |jb| {
+                self.setOutOfMemoryError();
+                self.latchErrmemRaiseWindow(th);
+                self.c_error_value = self.errThread().err_obj;
+                self.c_error_status = 4; // LUA_ERRMEM
+                _longjmp(@ptrCast(jb), 1);
+            }
+            std.process.abort();
+        };
+        defer scope.close();
+        for (vals) |v| _ = scope.protectValueAssumeCapacity(v);
+        self.cWindowPushSlice(th, vals) catch {
+            // Same ownership rule as the scope-open arm: free before the
+            // jump (a partial window copy is rolled back by the landing
+            // pad's stack restore, not by this slice).
+            self.alloc.free(vals);
+            if (self.c_error_jmp) |jb| {
+                self.setOutOfMemoryError();
+                self.latchErrmemRaiseWindow(th);
+                self.c_error_value = self.errThread().err_obj;
+                self.c_error_status = 4; // LUA_ERRMEM
+                _longjmp(@ptrCast(jb), 1);
+            }
+            std.process.abort();
+        };
+        return @intCast(vals.len);
+    }
+
+    /// PUC `ll_require` (loadlib.c:650-677) — the C target of the require
+    /// closure created by openPackageLibrary.
+    fn requireShim(L: ?*lua_State) callconv(.c) c_int {
+        const h = L orelse return 0;
+        const self = h.vm;
+        const ctx = self.packageShimContext() orelse {
+            _ = self.failC("require: missing package upvalue", .{}) catch {};
+            return -1;
+        };
+        return self.packageShimReturn(self.llRequire(ctx.pkg, ctx.args));
+    }
+
+    /// PUC `searcher_preload` (loadlib.c:604-615) — the C target of
+    /// searchers[1].
+    fn searcherPreloadShim(L: ?*lua_State) callconv(.c) c_int {
+        const h = L orelse return 0;
+        const self = h.vm;
+        const ctx = self.packageShimContext() orelse {
+            _ = self.failC("searcher: missing package upvalue", .{}) catch {};
+            return -1;
+        };
+        return self.packageShimReturn(self.searcherPreloadImpl(ctx.pkg, ctx.args));
+    }
+
+    /// PUC `searcher_Lua` (loadlib.c:539-545) — the C target of searchers[2].
+    fn searcherLuaShim(L: ?*lua_State) callconv(.c) c_int {
+        const h = L orelse return 0;
+        const self = h.vm;
+        const ctx = self.packageShimContext() orelse {
+            _ = self.failC("searcher: missing package upvalue", .{}) catch {};
+            return -1;
+        };
+        return self.packageShimReturn(self.searcherLuaImpl(ctx.pkg, ctx.args));
+    }
+
+    /// PUC `searcher_C` (loadlib.c:574-579) — the C target of searchers[3].
+    fn searcherCShim(L: ?*lua_State) callconv(.c) c_int {
+        const h = L orelse return 0;
+        const self = h.vm;
+        const ctx = self.packageShimContext() orelse {
+            _ = self.failC("searcher: missing package upvalue", .{}) catch {};
+            return -1;
+        };
+        return self.packageShimReturn(self.searcherCImpl(ctx.pkg, ctx.args));
+    }
+
+    /// PUC `searcher_Croot` (loadlib.c:582-601) — the C target of
+    /// searchers[4].
+    fn searcherCrootShim(L: ?*lua_State) callconv(.c) c_int {
+        const h = L orelse return 0;
+        const self = h.vm;
+        const ctx = self.packageShimContext() orelse {
+            _ = self.failC("searcher: missing package upvalue", .{}) catch {};
+            return -1;
+        };
+        return self.packageShimReturn(self.searcherCrootImpl(ctx.pkg, ctx.args));
+    }
+
     /// PUC `luaB_auxwrap` body: resume the wrapped thread with the wrap
     /// call's arguments; on success return the resume results MINUS the
     /// boolean as an owned slice (PUC auxresume: luaD_poscall of the
@@ -28858,9 +29089,13 @@ pub const Vm = struct {
         // P15.78 Task 13: Clear per-C-frame testc_state (continuation state
         // for callk/pcallk/yieldk). Free heap-allocated slices to prevent
         // leaks. Each C-frame may carry its own state (chained callk).
+        // An armed return-tail transport on a surviving frame is abandoned
+        // with the thread's continuation state — release it here too.
         for (0..th.call_frames.len()) |i| {
             const fr = th.call_frames.getPtr(i);
-            if (fr.isC() and fr.u.c.testc_state != null) {
+            if (fr.isC() and (fr.u.c.testc_state != null or
+                fr.u.c.c_result_transport != null))
+            {
                 self.freeCFrameOwnedState(fr);
             }
         }
@@ -36852,351 +37087,97 @@ pub const Vm = struct {
         }
     }
 
-    fn builtinRequire(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
-        if (outs.len == 0) return;
-        if (args.len == 0) return self.fail("require expects module name", .{});
-        const name = switch (args[0]) {
-            .String => |s| s.bytes(),
-            else => return self.fail("require expects module name", .{}),
-        };
-
-        // PUC ll_require (loadlib.c:650-656): gets loaded/preload from
-        // LUA_REGISTRYINDEX, NOT from the global `package` table. This means
-        // require keeps working even if someone replaces `package = {}`.
-        // PUC reads them with lua_getfield — a non-table registry slot or a
-        // missing/non-table entry surfaces as the standard index error
-        // ("attempt to index a nil/... value"), not a custom message.
-        const reg = self.registryTable() orelse
-            return self.fail("attempt to index a nil value", .{});
-        const loaded_v = self.getFieldOpt(reg, "_LOADED") orelse .Nil;
-        const loaded_tbl = switch (loaded_v) {
-            .Table => |t| t,
-            else => return self.fail("attempt to index a {s} value", .{loaded_v.typeName()}),
-        };
-        const preload_v = self.getFieldOpt(reg, "_PRELOAD") orelse .Nil;
-        const preload_tbl = switch (preload_v) {
-            .Table => |t| t,
-            else => return self.fail("attempt to index a {s} value", .{preload_v.typeName()}),
-        };
-
-        // PUC ll_require checks package.searchers is a table.
-        // Our search is hardcoded but we validate the field for compatibility.
-        const package_v = try self.getGlobal("package");
-        if (package_v == .Table) {
-            if (self.getFieldOpt(package_v.Table, "searchers")) |searchers| {
-                if (searchers != .Table) {
-                    return self.failLib("'package.searchers' must be a table", .{});
-                }
-            }
-        }
-
-        // Built-in modules.
-        if (std.mem.eql(u8, name, "debug")) {
-            if (self.getFieldOpt(loaded_tbl, name)) |v| {
-                if (v != .Nil) {
-                    outs[0] = v;
-                    return;
-                }
-            }
-
-            const mod = try self.createDebugTable();
-            const v: Value = .{ .Table = mod };
-            try self.setField(loaded_tbl, name, v);
-            outs[0] = v;
-            return;
-        }
-
-        if (self.getFieldOpt(loaded_tbl, name)) |v| {
-            // PUC ll_require (loadlib.c:655): uses lua_toboolean to check
-            // if already loaded. This means false is treated as "not loaded"
-            // — require will reload the module (matching PUC semantics).
-            if (isTruthy(v)) {
-                outs[0] = v;
-                return;
-            }
-        }
-
-        if (self.getFieldOpt(preload_tbl, name)) |loader| {
-            // Root the interned strings across each other's internStr and
-            // the loader call (native arrays are invisible to the GC — see
-            // builtinLoadfile's note).
-            var scope = try self.openRootScope(2, 0);
-            defer scope.close();
-            const preload_str = try self.internStr(":preload:");
-            _ = scope.protectValueAssumeCapacity(.{ .String = preload_str });
-            const name_str = try self.internStr(name);
-            _ = scope.protectValueAssumeCapacity(.{ .String = name_str });
-            switch (loader) {
-                .Builtin => |id| {
-                    var loader_args = [_]Value{ .{ .String = name_str }, .{ .String = preload_str } };
-                    var loader_out: [2]Value = .{ .Nil, .Nil };
-                    const loader_bres = try self.callBuiltin(id, loader_args[0..], loader_out[0..], .host, 0);
-                    _ = self.consumeBuiltinResult(loader_bres, loader_out[0..]);
-                    const v: Value = if (loader_out[0] != .Nil) loader_out[0] else .{ .Bool = true };
-                    try self.setField(loaded_tbl, name, v);
-                    // P16.39 Cut 3 (correctness): the nested callBuiltin's
-                    // C-frame push may have reallocated stack — re-derive
-                    // the outs window before writing results.
-                    const outw = self.refreshBuiltinOuts() orelse outs;
-                    outw[0] = v;
-                    if (outw.len > 1) outw[1] = .{ .String = preload_str };
-                    self.last_builtin_out_count = @min(outw.len, 2);
-                    return;
-                },
-                .Closure => |cl| {
-                    var loader_args = [_]Value{ .{ .String = name_str }, .{ .String = preload_str } };
-                    const ret = try self.runClosure(cl, loader_args[0..], 0);
-                    defer self.alloc.free(ret);
-                    // PUC ll_require: if loader returned non-nil, set loaded.
-                    // Then re-read loaded[name]; if nil, default to true.
-                    if (ret.len > 0 and ret[0] != .Nil) {
-                        try self.setField(loaded_tbl, name, ret[0]);
-                    }
-                    const final_val: Value = self.getFieldOpt(loaded_tbl, name) orelse v: {
-                        try self.setField(loaded_tbl, name, .{ .Bool = true });
-                        break :v .{ .Bool = true };
-                    };
-                    // P16.39 Cut 3 (correctness): runClosure may have
-                    // reallocated stack — re-derive before writing.
-                    const outw = self.refreshBuiltinOuts() orelse outs;
-                    outw[0] = final_val;
-                    if (outw.len > 1) outw[1] = .{ .String = preload_str };
-                    self.last_builtin_out_count = @min(outw.len, 2);
-                    return;
-                },
-                else => {},
-            }
-        }
-
-        const pkg: ?*Table = if (package_v == .Table) package_v.Table else null;
-        const path_val = if (pkg) |p| self.getFieldOpt(p, "path") else null;
-        const path = switch (path_val orelse .Nil) {
-            .String => |s| s,
-            else => return self.failLib("module '{s}' not found:\n\tno field package.preload['{s}']\n\tno file 'package.path'", .{ name, name }),
-        };
-        const cpath: []const u8 = if (pkg) |p| if (self.getFieldOpt(p, "cpath")) |cv| switch (cv) {
-            .String => |s| s.bytes(),
-            else => "",
-        } else "" else "";
-
-        var searchpath_out: [2]Value = .{ .Nil, .Nil };
-        try self.builtinPackageSearchpath(&[_]Value{ .{ .String = try self.internStr(name) }, .{ .String = path } }, searchpath_out[0..]);
-        if (searchpath_out[0] == .String) {
-            const file_path = searchpath_out[0].String.bytes();
-            var tmp: [2]Value = .{ .Nil, .Nil };
-            // builtinLoadfile → builtinLoad → builtinLoadEx uses
-            // refreshBuiltinOuts() to re-derive outs after nested calls.
-            // Since `tmp` is a local stack variable (NOT in stack), reset
-            // builtin_outs_on_stack so refreshBuiltinOuts returns null and
-            // results are written to our local `tmp` array.
-            const saved_on_bc = self.builtin_outs_on_stack;
-            self.builtin_outs_on_stack = false;
-            defer self.builtin_outs_on_stack = saved_on_bc;
-            try self.builtinLoadfile(&[_]Value{.{ .String = try self.internStr(file_path) }}, tmp[0..]);
-            const cl = switch (tmp[0]) {
-                .Closure => |c| c,
-                else => {
-                    // PUC ll_require (loadlib.c): when loadfile fails (syntax
-                    // error or read error), format the message as:
-                    //   "error loading module '{name}' from file '{path}':\n\t{err}"
-                    const err_detail: []const u8 = if (tmp[1] == .String)
-                        tmp[1].String.bytes()
-                    else
-                        "unknown error";
-                    return self.fail(
-                        "error loading module '{s}' from file '{s}':\n\t{s}",
-                        .{ name, file_path, err_detail },
-                    );
-                },
-            };
-
-            // Pin the loaded closure against GC: the internStr calls below
-            // can trigger a cycle, and the closure in tmp[0] is a Zig-local,
-            // not a GC root.
-            var scope = try self.openRootScope(1, 0);
-            defer scope.close();
-            _ = scope.protectValueAssumeCapacity(tmp[0]);
-
-            const run_args = [_]Value{ .{ .String = try self.internStr(name) }, .{ .String = try self.internStr(file_path) } };
-            const ret = try self.runClosure(cl, run_args[0..], 0);
-            defer self.alloc.free(ret);
-            // PUC ll_require (loadlib.c:666-674): if the loader returned a
-            // non-nil value, set loaded[name] = that value. Otherwise leave
-            // loaded[name] alone — the loader may have set it itself (e.g.
-            // C.lua: "package.loaded[...] = 25"). Then read loaded[name]
-            // again; if still nil, default to true.
-            //
-            // TODO(refactor): extract finalizeLoaderResult(loaded_tbl, name, ret)
-            // helper to deduplicate this block across preload/lua-path/C-path
-            // (3 instances).
-            if (ret.len > 0 and ret[0] != .Nil) {
-                try self.setField(loaded_tbl, name, ret[0]);
-            }
-            const final_val: Value = self.getFieldOpt(loaded_tbl, name) orelse v: {
-                try self.setField(loaded_tbl, name, .{ .Bool = true });
-                break :v .{ .Bool = true };
-            };
-            // P16.39 Cut 3 (correctness): runClosure may have reallocated
-            // stack — re-derive before writing.
-            const outw = self.refreshBuiltinOuts() orelse outs;
-            outw[0] = final_val;
-            if (outw.len > 1) {
-                const istr = try self.internStr(file_path);
-                outw[1] = .{ .String = istr };
-            }
-            return;
-        }
-
-        // Copy error messages to safe buffers before any further GC-triggering
-        // operations (internStr in cpath search can collect LuaStrings).
-        // Using `?[]u8` (rather than a sentinel-empty slice) avoids two bugs:
-        //  - `alloc.dupe(u8, "")` still allocates a 0-byte slice that must be
-        //    freed; a `len > 0` guard on the defer would leak it.
-        //  - Always allocating a 0-byte slice when the value is not a String
-        //    wastes an allocation on every require.
-        const perr_path: ?[]u8 = if (searchpath_out[1] == .String)
-            try self.alloc.dupe(u8, searchpath_out[1].String.bytes())
-        else
-            null;
-        defer if (perr_path) |p| self.alloc.free(p);
-        var cpath_err: ?[]u8 = null;
-        defer if (cpath_err) |e| self.alloc.free(e);
-
-        // PUC ll_require searcher_C path (loadlib.c): try the C library path.
-        // If package.cpath is set, search for a .so file and, if found, call
-        // luaopen_<modname>(modname, filepath) via package.loadlib.
-        if (cpath.len != 0) {
-            var csearch_out: [2]Value = .{ .Nil, .Nil };
-            try self.builtinPackageSearchpath(
-                &[_]Value{ .{ .String = try self.internStr(name) }, .{ .String = try self.internStr(cpath) } },
-                csearch_out[0..],
-            );
-
-            if (csearch_out[0] == .String) {
-                if (try self.tryCLoad(csearch_out[0].String.bytes(), name, loaded_tbl, outs)) return;
-            } else if (csearch_out[1] == .String) {
-                cpath_err = try self.alloc.dupe(u8, csearch_out[1].String.bytes());
-            }
-        }
-
-        // PUC searcher_Croot (loadlib.c:582-601): if the module name has a dot,
-        // try the ROOT package. E.g. "lib1.sub" → search for "lib1" on cpath,
-        // then look for luaopen_lib1_sub in that .so. This handles C submodules
-        // where the parent .so contains all luaopen_*_child entry points.
-        if (cpath.len != 0) {
-            if (std.mem.indexOfScalar(u8, name, '.')) |dot_pos| {
-                const root_name = name[0..dot_pos];
-                var croot_out: [2]Value = .{ .Nil, .Nil };
-                try self.builtinPackageSearchpath(
-                    &[_]Value{ .{ .String = try self.internStr(root_name) }, .{ .String = try self.internStr(cpath) } },
-                    croot_out[0..],
-                );
-
-                if (croot_out[0] == .String) {
-                    if (try self.tryCLoad(croot_out[0].String.bytes(), name, loaded_tbl, outs)) return;
-                }
-            }
-        }
-
-        const msg = try std.fmt.allocPrint(
-            self.alloc,
-            "module '{s}' not found:\n\tno field package.preload['{s}']{s}{s}",
-            .{ name, name, perr_path orelse "", cpath_err orelse "" },
-        );
-        return self.failLib("{s}", .{msg});
-    }
-
-    /// Shared helper for searcher_C and searcher_Croot (PUC loadlib.c).
-    /// Given a C library file path and module name, builds the `luaopen_*`
-    /// symbol (dots→underscores, LUA_IGMARK candidate splitting), calls
-    /// `package.loadlib`, and if successful invokes the loader and
-    /// finalizes the result in `loaded[modname]`.
-    /// Returns `true` if the loader was found and called successfully;
-    /// `false` if the symbol wasn't found (caller continues searching).
-    fn tryCLoad(
-        self: *Vm,
-        c_file_path: []const u8,
-        modname: []const u8,
-        loaded_tbl: *Table,
-        outs: []Value,
-    ) DispatchError!bool {
-        // The caller passes `c_file_path` as a slice into a `LuaString`'s
-        // backing buffer (e.g. `csearch_out[0].String.bytes()`). The
-        // `internStr` / `allocPrint` / `builtinPackageLoadlib` calls below
-        // can trigger a GC cycle, which may collect that LuaString and
-        // invalidate the slice. Dupe it into a GC-independent buffer up
-        // front so all subsequent uses are safe. This mirrors the `perr_path`
-        // / `cpath_err` defensive copies in the caller.
-        const file_path = try self.alloc.dupe(u8, c_file_path);
-        defer self.alloc.free(file_path);
-
-        // PUC loadfunc: dots → underscores in the module name.
-        const modname_norm = try self.alloc.dupe(u8, modname);
-        defer self.alloc.free(modname_norm);
-        for (modname_norm) |*ch| if (ch.* == '.') {
-            ch.* = '_';
-        };
-
-        // LUA_IGMARK ('-'): try prefix before dash, then suffix.
-        // E.g. "lib2-v2" → try "luaopen_lib2" first, then "luaopen_v2".
-        var candidates: [2][]const u8 = .{ modname_norm, "" };
-        var n_candidates: usize = 1;
-        if (std.mem.indexOfScalar(u8, modname_norm, '-')) |dash_pos| {
-            candidates[0] = modname_norm[0..dash_pos];
-            candidates[1] = modname_norm[dash_pos + 1 ..];
-            n_candidates = 2;
-        }
-
-        var loadlib_outs: [3]Value = .{ .Nil, .Nil, .Nil };
-        for (candidates[0..n_candidates]) |cand| {
-            if (cand.len == 0) continue;
-            const open_name = try std.fmt.allocPrint(self.alloc, "luaopen_{s}", .{cand});
-            defer self.alloc.free(open_name);
-
-            loadlib_outs = .{ .Nil, .Nil, .Nil };
-            try self.builtinPackageLoadlib(
-                &[_]Value{
-                    .{ .String = try self.internStr(file_path) },
-                    .{ .String = try self.internStr(open_name) },
-                },
-                loadlib_outs[0..],
-            );
-            if (loadlib_outs[0] == .Closure) break;
-        }
-
-        if (loadlib_outs[0] != .Closure) return false;
-
-        // Pin the C closure against GC (internStr calls below can trigger a cycle).
+    /// PUC luaL_getsubtable (lauxlib.c:986-997) over the registry: reuse the
+    /// existing table at `name`, or replace a missing/non-table field with a
+    /// fresh table. Both the read and the publish write are metamethod-aware
+    /// (luaL_getsubtable uses lua_getfield/lua_setfield), with metamethods
+    /// running under cGetField/cSetField's nonyieldable unit. The returned
+    /// table is unrooted on return — the caller protects it before its next
+    /// allocation.
+    fn registrySubtable(self: *Vm, reg: *Table, name: []const u8) DispatchError!*Table {
+        const v = try self.cGetField(reg, name);
+        if (v == .Table) return v.Table;
         var scope = try self.openRootScope(1, 0);
         defer scope.close();
-        _ = scope.protectValueAssumeCapacity(loadlib_outs[0]);
+        const t = try self.allocTable();
+        _ = scope.protectValueAssumeCapacity(.{ .Table = t });
+        try self.cSetField(reg, name, .{ .Table = t });
+        return t;
+    }
 
-        // PUC ll_require: calls the loader with (modname, filepath).
-        const call_args = [_]Value{
-            .{ .String = try self.internStr(modname) },
-            .{ .String = try self.internStr(file_path) },
-        };
-        const ret = try self.runClosure(loadlib_outs[0].Closure, call_args[0..], 0);
-        defer self.alloc.free(ret);
+    /// PUC luaopen_package (loadlib.c:724-747): build a FRESH package table
+    /// on every call — path/cpath from the environment (setpath), config,
+    /// the searchpath/loadlib functions, loaded/preload from the registry
+    /// (luaL_getsubtable: repeated calls share the tables), a searchers
+    /// table of exactly 4 C closures each carrying THIS package table as
+    /// its single upvalue, and a require C closure with the same upvalue
+    /// published into _G.require (PUC luaL_setfuncs over ll_funcs). The
+    /// caller publishes _G.package (bootstrapGlobals or the C host's
+    /// library-opening sequence) — PUC leaves that global to the host too.
+    ///
+    /// Every intermediate is rooted for the whole construction (PUC anchors
+    /// them on L->stack); on failure the objects become unreachable garbage
+    /// (non-moving GC — a legal teardown) and no publication happened: the
+    /// only externally visible writes (registry subtables, _G.require) sit
+    /// after every fallible step of their own object graph. The setField
+    /// writes below target the FRESH package table, which cannot carry a
+    /// metatable yet — observably identical to PUC's lua_setfield there.
+    pub fn openPackageLibrary(self: *Vm) DispatchError!*Table {
+        // Value roots: 2 registry subtables + pkg + 2 env path strings +
+        // the searchers table + 4 searcher closures (the loop) + the
+        // require closure = 11.
+        var scope = try self.openRootScope(11, 0);
+        defer scope.close();
 
-        // PUC ll_require: if loader returned non-nil, set loaded[name].
-        // Then read loaded[name]; default to true if still nil.
-        if (ret.len > 0 and ret[0] != .Nil) {
-            try self.setField(loaded_tbl, modname, ret[0]);
-        }
-        const final_val: Value = self.getFieldOpt(loaded_tbl, modname) orelse v: {
-            try self.setField(loaded_tbl, modname, .{ .Bool = true });
-            break :v .{ .Bool = true };
+        const reg = self.registryTable() orelse
+            return self.fail("attempt to index a nil value", .{});
+        const loaded_tbl = try self.registrySubtable(reg, "_LOADED");
+        _ = scope.protectValueAssumeCapacity(.{ .Table = loaded_tbl });
+        const preload_tbl = try self.registrySubtable(reg, "_PRELOAD");
+        _ = scope.protectValueAssumeCapacity(.{ .Table = preload_tbl });
+
+        const pkg = try self.allocTable();
+        _ = scope.protectValueAssumeCapacity(.{ .Table = pkg });
+
+        // PUC setpath (loadlib.c:274): LUA_PATH_5_5 / LUA_PATH with `;;` →
+        // default substitution; resolveEnvPath also handles `-E` (noenv).
+        const path_val = try self.resolveEnvPath("LUA_PATH_5_5", "LUA_PATH", LUA_PATH_DEFAULT);
+        _ = scope.protectValueAssumeCapacity(.{ .String = path_val });
+        try self.setField(pkg, "path", .{ .String = path_val });
+        const cpath_val = try self.resolveEnvPath("LUA_CPATH_5_5", "LUA_CPATH", LUA_CPATH_DEFAULT);
+        _ = scope.protectValueAssumeCapacity(.{ .String = cpath_val });
+        try self.setField(pkg, "cpath", .{ .String = cpath_val });
+        try self.setField(pkg, "config", .{ .String = try self.internStr("/\n;\n?\n!\n-\n") });
+        try self.setField(pkg, "searchpath", .{ .Builtin = .package_searchpath });
+        try self.setField(pkg, "loadlib", .{ .Builtin = .package_loadlib });
+        try self.setField(pkg, "loaded", .{ .Table = loaded_tbl });
+        try self.setField(pkg, "preload", .{ .Table = preload_tbl });
+
+        // PUC createsearcherstable (loadlib.c:712-722): exactly 4 searchers,
+        // each a C closure with the package table as its only upvalue —
+        // require keeps using the package it was opened with even after
+        // _G.package is replaced.
+        const searchers = try self.allocTable();
+        _ = scope.protectValueAssumeCapacity(.{ .Table = searchers });
+        const searcher_fns = [4]*const fn (?*lua_State) callconv(.c) c_int{
+            &searcherPreloadShim,
+            &searcherLuaShim,
+            &searcherCShim,
+            &searcherCrootShim,
         };
-        // P16.39 Cut 3 (correctness): the C loader's runClosure may have
-        // reallocated stack — re-derive before writing.
-        const outw = self.refreshBuiltinOuts() orelse outs;
-        outw[0] = final_val;
-        if (outw.len > 1) {
-            const istr = try self.internStr(file_path);
-            outw[1] = .{ .String = istr };
+        for (searcher_fns, 1..) |shim, i| {
+            const cl = try self.allocCclosure(shim, &.{.{ .Table = pkg }});
+            _ = scope.protectValueAssumeCapacity(.{ .Closure = cl });
+            try self.rawSet(searchers, .{ .Int = @intCast(i) }, .{ .Closure = cl });
         }
-        return true;
+        try self.setField(pkg, "searchers", .{ .Table = searchers });
+
+        // PUC publishes require into the globals table here (luaL_setfuncs
+        // over ll_funcs with the package as upvalue).
+        const require_cl = try self.allocCclosure(&requireShim, &.{.{ .Table = pkg }});
+        _ = scope.protectValueAssumeCapacity(.{ .Closure = require_cl });
+        try self.setGlobal("require", .{ .Closure = require_cl });
+        return pkg;
     }
 
     fn builtinPackageSearchpath(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -37220,6 +37201,41 @@ pub const Vm = struct {
             else => return self.fail("bad argument #4 to 'searchpath' (string expected)", .{}),
         } else "/";
 
+        // `name`/`path`/`sep`/`rep` alias args (rooted by the caller's
+        // window); searchpathCore only allocates Zig-side buffers, so they
+        // stay valid for its duration.
+        const res = try self.searchpathCore(name, path, sep, rep);
+        switch (res) {
+            .found => |istr| {
+                if (outs.len > 0) outs[0] = .{ .String = istr };
+            },
+            .miss => |msg| {
+                defer self.alloc.free(msg);
+                if (outs.len > 1) outs[1] = .{ .String = try self.internStr(msg) };
+            },
+        }
+    }
+
+    const SearchpathResult = union(enum) {
+        /// Interned readable candidate; unrooted on return — the caller
+        /// protects it before its next allocation.
+        found: *LuaString,
+        /// PUC pusherrornotfound composition: "no file 'p1'\n\tno file 'p2'"
+        /// with NO leading separator (the old public searchpath message
+        /// carried a leading "\n\t" that PUC does not produce — verified
+        /// against the reference binary; findloader adds its own "\n\t"
+        /// separators around searcher messages). Owned by the caller.
+        miss: []u8,
+    };
+
+    /// PUC searchpath (loadlib.c:475-499) shared by package.searchpath and
+    /// the Lua/C/Croot searchers (via findfile): replace `sep` with `rep`
+    /// in `name`, then try each ';'-separated template with the '?' mark
+    /// substituted by the transformed name; the first readable candidate
+    /// wins. `name`/`path` may alias GC-visible strings — the caller keeps
+    /// them rooted for the call's duration (only Zig-side buffers are
+    /// allocated here, plus the found candidate's intern).
+    fn searchpathCore(self: *Vm, name: []const u8, path: []const u8, sep: []const u8, rep: []const u8) DispatchError!SearchpathResult {
         var modname_buf = std.ArrayList(u8).empty;
         defer modname_buf.deinit(self.alloc);
         if (sep.len != 0) {
@@ -37240,6 +37256,7 @@ pub const Vm = struct {
 
         var err_buf = std.ArrayList(u8).empty;
         defer err_buf.deinit(self.alloc);
+        var first_miss = true;
         var it = std.mem.splitScalar(u8, path, ';');
         while (it.next()) |templ| {
             var cand_buf = std.ArrayList(u8).empty;
@@ -37258,21 +37275,14 @@ pub const Vm = struct {
             }
             const candidate = cand_buf.items;
             std.Io.Dir.cwd().access(stdio.activeIo(), candidate, .{}) catch {
-                try appendFmt(self.alloc, &err_buf, "\n\tno file '{s}'", .{candidate});
+                if (!first_miss) try err_buf.appendSlice(self.alloc, "\n\t");
+                first_miss = false;
+                try appendFmt(self.alloc, &err_buf, "no file '{s}'", .{candidate});
                 continue;
             };
-            if (outs.len > 0) {
-                const istr = try self.internFmt("{s}", .{candidate});
-                outs[0] = .{ .String = istr };
-            }
-            if (outs.len > 1) outs[1] = .Nil;
-            return;
+            return .{ .found = try self.internStr(candidate) };
         }
-
-        if (outs.len > 1) {
-            const istr2 = try self.internFmt("{s}", .{err_buf.items});
-            outs[1] = .{ .String = istr2 };
-        }
+        return .{ .miss = try err_buf.toOwnedSlice(self.alloc) };
     }
 
     /// PUC `ll_loadlib` (loadlib.c): dynamic library loading.
@@ -37314,48 +37324,77 @@ pub const Vm = struct {
             else => return self.fail("bad argument #2 to 'loadlib' (string expected)", .{}),
         };
 
-        // PUC lookforfunc (loadlib.c:384): check the CLIBS cache first. If the
-        // library at `lib_path` was already opened (by a previous probe or
-        // load), reuse the cached handle instead of re-dlopen'ing. This is
-        // essential for the probe→load pattern: the probe opens with
-        // RTLD_GLOBAL, and subsequent loads must see those global symbols.
+        // `lib_path`/`func_name` alias args (rooted by the caller's window);
+        // lookforfuncCore dupes them up front before any allocation that
+        // could run a GC.
+        const res = try self.lookforfuncCore(lib_path, func_name);
+        switch (res) {
+            .func => |cl| {
+                if (outs.len > 0) outs[0] = .{ .Closure = cl };
+                self.last_builtin_out_count = @min(outs.len, 1);
+            },
+            // The public loadlib messages keep their "\n\t" prefix (PUC
+            // gsub-based pusherror adds it at the public boundary); the
+            // core returns separator-free details for the searchers.
+            .open_err => |msg| {
+                defer self.alloc.free(msg);
+                if (outs.len > 0) outs[0] = .Nil;
+                if (outs.len > 1) outs[1] = .{ .String = try self.internFmt("\n\t{s}", .{msg}) };
+                if (outs.len > 2) outs[2] = .{ .String = try self.internStr("open") };
+                self.last_builtin_out_count = @min(outs.len, 3);
+            },
+            .sym_err => |msg| {
+                defer self.alloc.free(msg);
+                if (outs.len > 0) outs[0] = .Nil;
+                if (outs.len > 1) outs[1] = .{ .String = try self.internFmt("\n\t{s}", .{msg}) };
+                if (outs.len > 2) outs[2] = .{ .String = try self.internStr("init") };
+                self.last_builtin_out_count = @min(outs.len, 3);
+            },
+        }
+    }
+
+    const LookforResult = union(enum) {
+        /// C closure wrapping the resolved symbol (or the accessibility
+        /// probe's no-op); unrooted on return — the caller protects it
+        /// before its next allocation.
+        func: *Closure,
+        /// dlopen failed; owned detail message WITHOUT separator prefix.
+        open_err: []u8,
+        /// dlsym failed; owned detail message WITHOUT separator prefix.
+        sym_err: []u8,
+    };
+
+    /// PUC lookforfunc (loadlib.c:384-402) shared by package.loadlib and the
+    /// C/Croot searchers (via loadfunc): the CLIBS cache (self.c_libs) is
+    /// checked first; a miss dlopens the library (RTLD_GLOBAL for the "*"
+    /// probe so inter-library dependencies resolve) and caches the handle
+    /// permanently (PUC never dlcloses — C extensions may cache pointers to
+    /// their own static data). "*" returns the accessibility no-op closure
+    /// (llAccessible); otherwise the symbol is resolved and wrapped in a C
+    /// closure. `lib_path`/`func_name` may alias GC-visible strings — they
+    /// are duped up front, before any allocation that could run a GC.
+    fn lookforfuncCore(self: *Vm, lib_path: []const u8, func_name: []const u8) DispatchError!LookforResult {
         const path_z = try self.alloc.dupeZ(u8, lib_path);
         defer self.alloc.free(path_z);
 
         const is_probe = std.mem.eql(u8, func_name, "*");
         const seeglb = is_probe; // PUC: lsys_load(L, path, *sym == '*')
 
-        // Look up the cached handle. If found, use it. If not, dlopen with the
-        // appropriate flags and cache the result permanently.
         const handle: ?*anyopaque = blk: {
             if (self.c_libs.get(lib_path)) |h| break :blk h;
-            // PUC lsys_load (loadlib.c:109): RTLD_NOW resolves all symbols at
-            // load time; RTLD_GLOBAL (seeglb) makes the library's symbols
-            // visible to subsequently-loaded libraries. The probe mode ("*")
-            // always uses GLOBAL so that inter-library dependencies (e.g.
-            // lib11.so calling lib1.so's `lib1_export`) resolve correctly.
+            // PUC lsys_load (loadlib.c:109): RTLD_NOW resolves all symbols
+            // at load time; RTLD_GLOBAL (seeglb) makes the library's
+            // symbols visible to subsequently-loaded libraries.
             const flags: std.c.RTLD = if (seeglb)
                 .{ .NOW = true, .GLOBAL = true }
             else
                 .{ .NOW = true };
-
             const h = std.c.dlopen(path_z, flags) orelse {
-                if (outs.len > 0) outs[0] = .Nil;
-                if (outs.len > 1) {
-                    const istr = try self.internStr(
-                        try std.fmt.allocPrint(self.alloc, "\n\tcannot open '{s}'", .{lib_path}),
-                    );
-                    outs[1] = .{ .String = istr };
-                }
-                if (outs.len > 2) {
-                    const istr = try self.internStr("open");
-                    outs[2] = .{ .String = istr };
-                }
-                self.last_builtin_out_count = @min(outs.len, 3);
-                return;
+                const msg = try std.fmt.allocPrint(self.alloc, "cannot open '{s}'", .{lib_path});
+                return .{ .open_err = msg };
             };
-            // Cache the handle permanently (PUC CLIBS never closes). The key
-            // is owned by the HashMap; the path string is duped.
+            // Cache the handle permanently (PUC CLIBS never closes). The
+            // key is owned by the HashMap; the path string is duped.
             const key = try self.alloc.dupe(u8, lib_path);
             try self.c_libs.put(self.alloc, key, h);
             break :blk h;
@@ -37364,48 +37403,493 @@ pub const Vm = struct {
         // PUC lookforfunc: probe mode ("*") just verifies the library loads.
         // Return a no-op closure (PUC's ll_accessible).
         if (is_probe) {
-            // P16.50 transactional + symmetric charge (see llAccessible note).
             const cl = try self.alloc.create(Closure);
             cl.* = .{ .upvalues = &.{}, .c_func = &llAccessible };
             self.gcRegisterCommit(.{ .closure = cl });
             self.gcNoteAlloc(@sizeOf(Closure));
             self.testc_obj_functions += 1;
-            if (outs.len > 0) outs[0] = .{ .Closure = cl };
-            self.last_builtin_out_count = @min(outs.len, 1);
-            return;
+            return .{ .func = cl };
         }
 
-        // Normal loadlib: look up the C symbol via dlsym. The type must match
-        // our lua_CFunction signature: `fn (?*Vm) callconv(.c) c_int`.
         const func_name_z = try self.alloc.dupeZ(u8, func_name);
         defer self.alloc.free(func_name_z);
         const sym = std.c.dlsym(handle, func_name_z) orelse {
-            if (outs.len > 0) outs[0] = .Nil;
-            if (outs.len > 1) {
-                const istr = try self.internStr(
-                    try std.fmt.allocPrint(self.alloc, "\n\tsymbol '{s}' not found in '{s}'", .{ func_name, lib_path }),
-                );
-                outs[1] = .{ .String = istr };
-            }
-            if (outs.len > 2) {
-                const istr2 = try self.internStr("init");
-                outs[2] = .{ .String = istr2 };
-            }
-            self.last_builtin_out_count = @min(outs.len, 3);
-            return;
+            const msg = try std.fmt.allocPrint(self.alloc, "symbol '{s}' not found in '{s}'", .{ func_name, lib_path });
+            return .{ .sym_err = msg };
         };
         const c_func: *const fn (?*lua_State) callconv(.c) c_int = @ptrCast(@alignCast(sym));
 
         // Wrap the C function pointer in a Closure so it can be called via
         // the normal runClosure → callCFunction dispatch path.
-        // P16.50 transactional + symmetric charge.
         const cl = try self.alloc.create(Closure);
         cl.* = .{ .upvalues = &.{}, .c_func = c_func };
         self.gcRegisterCommit(.{ .closure = cl });
         self.gcNoteAlloc(@sizeOf(Closure));
         self.testc_obj_functions += 1;
-        if (outs.len > 0) outs[0] = .{ .Closure = cl };
-        self.last_builtin_out_count = @min(outs.len, 1);
+        return .{ .func = cl };
+    }
+
+    /// PUC luaL_checkstring(L, 1) as used by ll_require and the searchers:
+    /// strings pass through; numbers coerce to their string form (freshly
+    /// interned — the caller roots it before its next allocation); a
+    /// missing argument raises "...got no value", anything else
+    /// "...got <type>". The function name in the message is the one PUC's
+    /// pushglobalfuncname resolves: 'require' for the require closure (it
+    /// is published in _G), '?' for the searchers (they live only in
+    /// package.searchers). Positioning is failArgerror (luaL_where(1) —
+    /// the immediate caller of the shim's C-frame).
+    fn shimCheckStringArg(self: *Vm, args: []const Value, fname: []const u8) DispatchError!*LuaString {
+        if (args.len == 0)
+            return self.failArgerror("bad argument #1 to '{s}' (string expected, got no value)", .{fname});
+        return switch (args[0]) {
+            .String => |s| s,
+            .Int, .Num => try self.valueToInternedStr(args[0]),
+            else => return self.failArgerror(
+                "bad argument #1 to '{s}' (string expected, got {s})",
+                .{ fname, args[0].typeName() },
+            ),
+        };
+    }
+
+    /// PUC findfile (loadlib.c:516-525): read package.<field> from the
+    /// searcher's upvalue table with lua_tostring coercion (numbers pass);
+    /// anything else raises "'package.<field>' must be a string". The field
+    /// read is metamethod-aware (findfile uses lua_getfield). The coerced
+    /// string is freshly interned — the caller roots it.
+    fn packagePathString(self: *Vm, pkg: *Table, field: []const u8) DispatchError!*LuaString {
+        const v = try self.cGetField(pkg, field);
+        return switch (v) {
+            .String => |s| s,
+            .Int, .Num => try self.valueToInternedStr(v),
+            else => return self.failArgerror("'package.{s}' must be a string", .{field}),
+        };
+    }
+
+    const FindLoaderResult = struct {
+        loader: Value,
+        data: Value,
+    };
+
+    /// PUC findloader (loadlib.c:618-647): walk pkg.searchers (the upvalue
+    /// package's field, NOT _G.package) via rawgeti from 1; the first nil
+    /// entry stops the walk and raises the not-found error with every
+    /// string message the searchers produced. The message buffer starts
+    /// with "\n\t" and each string result appends its message plus "\n\t";
+    /// the trailing separator is rolled back (luaL_buffsub(&msg, 2)) —
+    /// giving PUC's exact "module 'X' not found:\n\tmsg1\n\tmsg2" shape. A
+    /// searcher's first result being a function (Builtin or C/Lua closure)
+    /// ends the search with (loader, data); a string OR NUMBER result
+    /// (lua_isstring accepts both) is appended to the message via tostring
+    /// coercion; anything else is silently skipped. Searcher errors
+    /// propagate as-is (PUC lua_call is unprotected here).
+    ///
+    /// The returned loader/data are unrooted — llRequire protects them at
+    /// its next statement (no allocation in between).
+    /// The chosen searchers table stays rooted for the whole search loop —
+    /// a searcher may drop the package field (or every other reference)
+    /// and force a full GC between iterations, while the rawGet below keeps
+    /// reading this exact table. Only the table's lifetime is pinned:
+    /// elements are re-read every iteration, so content mutations stay
+    /// visible (PUC keeps the table at a stack slot across the whole loop
+    /// the same way).
+    fn findloader(self: *Vm, pkg: *Table, name_str: *LuaString) DispatchError!FindLoaderResult {
+        // PUC findloader: lua_getfield(upvalue(1), "searchers") — the read is
+        // metamethod-aware; the returned table is unrooted only across the
+        // scope open below (an uncounted reserve, no GC can run there).
+        const searchers_v = try self.cGetField(pkg, "searchers");
+        const searchers = switch (searchers_v) {
+            .Table => |t| t,
+            else => return self.failArgerror("'package.searchers' must be a table", .{}),
+        };
+        var table_scope = try self.openRootScope(1, 0);
+        defer table_scope.close();
+        _ = table_scope.protectValueAssumeCapacity(.{ .Table = searchers });
+        var msg_buf = std.ArrayList(u8).empty;
+        defer msg_buf.deinit(self.alloc);
+        try msg_buf.appendSlice(self.alloc, "\n\t");
+        const name_arg = [_]Value{.{ .String = name_str }};
+        var i: i64 = 1;
+        while (true) : (i += 1) {
+            const searcher = self.rawGet(searchers, .{ .Int = i });
+            if (searcher == .Nil) {
+                // PUC luaL_buffsub(&msg, 2): drop the trailing separator
+                // (the initial prefix when no searcher produced a message).
+                msg_buf.shrinkRetainingCapacity(msg_buf.items.len - 2);
+                return self.failArgerror("module '{s}' not found:{s}", .{ name_str.bytes(), msg_buf.items });
+            }
+            // Per-iteration roots: the searcher across apiCall's prologue
+            // allocations (a mutation during the search may have dropped it
+            // from the table) and the fresh result values across the
+            // message append below (the intern table is weak).
+            var scope = try self.openRootScope(3, 0);
+            defer scope.close();
+            _ = scope.protectValueAssumeCapacity(searcher);
+            const ret = try self.apiCall(.nonyieldable, searcher, name_arg[0..]);
+            defer self.alloc.free(ret);
+            const r1: Value = if (ret.len > 0) ret[0] else .Nil;
+            const r2: Value = if (ret.len > 1) ret[1] else .Nil;
+            _ = scope.protectValueAssumeCapacity(r1);
+            _ = scope.protectValueAssumeCapacity(r2);
+            switch (r1) {
+                .Builtin, .Closure => return .{ .loader = r1, .data = r2 },
+                .String => |s| {
+                    try msg_buf.appendSlice(self.alloc, s.bytes());
+                    try msg_buf.appendSlice(self.alloc, "\n\t");
+                },
+                .Int => |n| {
+                    var buf: [32]u8 = undefined;
+                    const t = std.fmt.bufPrint(buf[0..], "{d}", .{n}) catch unreachable;
+                    try msg_buf.appendSlice(self.alloc, t);
+                    try msg_buf.appendSlice(self.alloc, "\n\t");
+                },
+                .Num => |n| {
+                    const t = try self.numberToStringAlloc(n);
+                    defer self.alloc.free(t);
+                    try msg_buf.appendSlice(self.alloc, t);
+                    try msg_buf.appendSlice(self.alloc, "\n\t");
+                },
+                // nil/false/table/...: PUC silently skips the searcher
+                // (lua_pop(L, 2) — no message, no separator).
+                else => {},
+            }
+        }
+    }
+
+    /// PUC ll_require (loadlib.c:650-677): the require closure's body.
+    /// A truthy registry-_LOADED cache hit returns just the module (PUC
+    /// `return 1`); a fresh load calls loader(name, data), stores a
+    /// non-nil first result into _LOADED[name], defaults a still-NIL entry
+    /// to true (a stored `false` stays `false` — the check is nil, not
+    /// truthiness) and returns (module, loader data). Errors are raised
+    /// with failArgerror positioning: the require shim's C-frame is the
+    /// top C-frame, so the message gets the require caller's
+    /// "source:line:" prefix (verified against the reference binary).
+    fn llRequire(self: *Vm, pkg: *Table, args: []const Value) DispatchError![]Value {
+        // Value roots: name, _LOADED, loader, loader data, loader result,
+        // plus the truthy-cache fast return's cached value = 6.
+        var scope = try self.openRootScope(6, 0);
+        defer scope.close();
+        const name_str = try self.shimCheckStringArg(args, "require");
+        _ = scope.protectValueAssumeCapacity(.{ .String = name_str });
+        const reg = self.registryTable() orelse
+            return self.failArgerror("attempt to index a nil value", .{});
+        // PUC ll_require:651 lua_getfield(LUA_REGISTRYINDEX, _LOADED) — the
+        // registry read is metamethod-aware.
+        const loaded_v = try self.cGetField(reg, "_LOADED");
+        const loaded_tbl = switch (loaded_v) {
+            .Table => |t| t,
+            else => return self.failArgerror("attempt to index a {s} value", .{loaded_v.typeName()}),
+        };
+        // _LOADED is rooted for the whole load: both of its owners are
+        // mutable from Lua (a loader may nil debug.getregistry()._LOADED
+        // and package.loaded, then force a full GC), while the field writes
+        // below keep writing this exact table — PUC keeps it at a
+        // stack slot across lua_call the same way. `pkg` needs no root
+        // here: it is the running require closure's upvalue, and that
+        // closure sits at the C-frame func_slot inside the active
+        // thread's [0..top) mark window for the whole call.
+        _ = scope.protectValueAssumeCapacity(.{ .Table = loaded_tbl });
+        // PUC ll_require:654 lua_getfield(LOADED, name): a truthy cached
+        // module returns immediately with a single result (false/nil
+        // entries re-run the search). The read is metamethod-aware; the
+        // fresh value is rooted across the result allocation.
+        const cached = try self.cGetField(loaded_tbl, name_str.bytes());
+        if (isTruthy(cached)) {
+            _ = scope.protectValueAssumeCapacity(cached);
+            const res = try self.allocOwnedResult(1);
+            res[0] = cached;
+            return res;
+        }
+        const fl = try self.findloader(pkg, name_str);
+        _ = scope.protectValueAssumeCapacity(fl.loader);
+        _ = scope.protectValueAssumeCapacity(fl.data);
+        // PUC ll_require: loader(name, data); a missing first result reads
+        // as nil (only a non-nil result is stored into _LOADED).
+        const call_args = [_]Value{ .{ .String = name_str }, fl.data };
+        const ret = try self.apiCall(.nonyieldable, fl.loader, call_args[0..]);
+        defer self.alloc.free(ret);
+        const r1: Value = if (ret.len > 0) ret[0] else .Nil;
+        _ = scope.protectValueAssumeCapacity(r1);
+        // PUC ll_require publication order: every fallible step — the
+        // result slice and the return-tail reserve — precedes the first
+        // _LOADED write; after the field writes only infallible writes
+        // remain (a __newindex callback raising a Lua error is a
+        // PUC-visible error, not hidden partial state), so a memory
+        // failure cannot leave a cached module behind a failed require.
+        const res = try self.allocOwnedResult(2);
+        errdefer self.alloc.free(res);
+        try self.cReturnTailReserve(self.activeBytecodeThread(), 2);
+        if (r1 != .Nil) {
+            // PUC ll_require:667 lua_setfield(LOADED, name, result) —
+            // metamethod-aware.
+            try self.cSetField(loaded_tbl, name_str.bytes(), r1);
+        }
+        // PUC ll_require:670 lua_getfield(LOADED, name): the final result is
+        // _LOADED[name] (the loader may have stored a different value than
+        // it returned); a still-nil entry defaults to true (673
+        // lua_setfield — aware).
+        var final_val = try self.cGetField(loaded_tbl, name_str.bytes());
+        if (final_val == .Nil) {
+            try self.cSetField(loaded_tbl, name_str.bytes(), .{ .Bool = true });
+            final_val = .{ .Bool = true };
+        }
+        res[0] = final_val;
+        res[1] = fl.data;
+        return res;
+    }
+
+    /// PUC searcher_preload (loadlib.c:604-615): the preload table lives in
+    /// the registry (LUA_PRELOAD_TABLE). A nil entry misses with the
+    /// "no field package.preload" message; any other value is returned as
+    /// the loader candidate with ":preload:" as its data (findloader then
+    /// classifies non-function values per the message/skip rules). Both the
+    /// registry-_PRELOAD read and the preload[name] read are
+    /// metamethod-aware (searcher_preload uses lua_getfield twice).
+    fn searcherPreloadImpl(self: *Vm, pkg: *Table, args: []const Value) DispatchError![]Value {
+        _ = pkg;
+        // Roots: name, _PRELOAD table, preload entry.
+        var scope = try self.openRootScope(3, 0);
+        defer scope.close();
+        const name_str = try self.shimCheckStringArg(args, "?");
+        _ = scope.protectValueAssumeCapacity(.{ .String = name_str });
+        const reg = self.registryTable() orelse
+            return self.failArgerror("attempt to index a nil value", .{});
+        const preload_v = try self.cGetField(reg, "_PRELOAD");
+        const preload_tbl = switch (preload_v) {
+            .Table => |t| t,
+            else => return self.failArgerror("attempt to index a {s} value", .{preload_v.typeName()}),
+        };
+        _ = scope.protectValueAssumeCapacity(.{ .Table = preload_tbl });
+        const val = try self.cGetField(preload_tbl, name_str.bytes());
+        if (val == .Nil) {
+            const res = try self.allocOwnedResult(1);
+            errdefer self.alloc.free(res);
+            res[0] = .{ .String = try self.internFmt("no field package.preload['{s}']", .{name_str.bytes()}) };
+            return res;
+        }
+        _ = scope.protectValueAssumeCapacity(val);
+        const res = try self.allocOwnedResult(2);
+        errdefer self.alloc.free(res);
+        res[0] = val;
+        res[1] = .{ .String = try self.internStr(":preload:") };
+        return res;
+    }
+
+    /// PUC searcher_Lua (loadlib.c:539-545) + findfile + checkload: search
+    /// pkg.path (the upvalue package's field) for the module file; on a hit
+    /// load it with loadfile and return (chunk, filename); on a load error
+    /// raise "error loading module ... from file ..."; on a path miss
+    /// return the searchpath message.
+    fn searcherLuaImpl(self: *Vm, pkg: *Table, args: []const Value) DispatchError![]Value {
+        var scope = try self.openRootScope(4, 0);
+        defer scope.close();
+        const name_str = try self.shimCheckStringArg(args, "?");
+        _ = scope.protectValueAssumeCapacity(.{ .String = name_str });
+        const path_str = try self.packagePathString(pkg, "path");
+        _ = scope.protectValueAssumeCapacity(.{ .String = path_str });
+        const sr = try self.searchpathCore(name_str.bytes(), path_str.bytes(), ".", "/");
+        switch (sr) {
+            .miss => |msg| {
+                defer self.alloc.free(msg);
+                const res = try self.allocOwnedResult(1);
+                errdefer self.alloc.free(res);
+                res[0] = .{ .String = try self.internStr(msg) };
+                return res;
+            },
+            .found => |file_str| {
+                _ = scope.protectValueAssumeCapacity(.{ .String = file_str });
+                // builtinLoadfile re-derives its outs window after nested
+                // execution (refreshBuiltinOuts); `tmp` is a Zig-local
+                // buffer, so the on-stack window state must be off for the
+                // duration (a stale outer registration would capture the
+                // results) — same ceremony as apiCloseThread.
+                var tmp: [2]Value = .{ .Nil, .Nil };
+                const saved_on_stack = self.builtin_outs_on_stack;
+                self.builtin_outs_on_stack = false;
+                defer self.builtin_outs_on_stack = saved_on_stack;
+                try self.builtinLoadfile(&[_]Value{.{ .String = file_str }}, tmp[0..]);
+                switch (tmp[0]) {
+                    .Closure => |cl| {
+                        _ = scope.protectValueAssumeCapacity(tmp[0]);
+                        const res = try self.allocOwnedResult(2);
+                        res[0] = .{ .Closure = cl };
+                        res[1] = .{ .String = file_str };
+                        return res;
+                    },
+                    else => {
+                        // PUC checkload: the load error message (loadfile's
+                        // second result) is embedded verbatim as the detail.
+                        _ = scope.protectValueAssumeCapacity(tmp[1]);
+                        const detail: []const u8 = if (tmp[1] == .String) tmp[1].String.bytes() else "unknown error";
+                        return self.failArgerror(
+                            "error loading module '{s}' from file '{s}':\n\t{s}",
+                            .{ name_str.bytes(), file_str.bytes(), detail },
+                        );
+                    },
+                }
+            },
+        }
+    }
+
+    /// PUC searcher_C (loadlib.c:574-579): search pkg.cpath for the module
+    /// file; on a hit resolve luaopen_<mangled> in it (loadfunc). Any
+    /// loadfunc failure — library open OR symbol (PUC checkload treats
+    /// both as real errors here, unlike searcher_Croot) — raises the
+    /// error-loading form; a path miss returns the searchpath message.
+    fn searcherCImpl(self: *Vm, pkg: *Table, args: []const Value) DispatchError![]Value {
+        var scope = try self.openRootScope(4, 0);
+        defer scope.close();
+        const name_str = try self.shimCheckStringArg(args, "?");
+        _ = scope.protectValueAssumeCapacity(.{ .String = name_str });
+        const cpath_str = try self.packagePathString(pkg, "cpath");
+        _ = scope.protectValueAssumeCapacity(.{ .String = cpath_str });
+        const sr = try self.searchpathCore(name_str.bytes(), cpath_str.bytes(), ".", "/");
+        switch (sr) {
+            .miss => |msg| {
+                defer self.alloc.free(msg);
+                const res = try self.allocOwnedResult(1);
+                errdefer self.alloc.free(res);
+                res[0] = .{ .String = try self.internStr(msg) };
+                return res;
+            },
+            .found => |file_str| {
+                _ = scope.protectValueAssumeCapacity(.{ .String = file_str });
+                const lf = try self.loadfuncCore(file_str.bytes(), name_str.bytes());
+                switch (lf) {
+                    .func => |cl| {
+                        _ = scope.protectValueAssumeCapacity(.{ .Closure = cl });
+                        const res = try self.allocOwnedResult(2);
+                        res[0] = .{ .Closure = cl };
+                        res[1] = .{ .String = file_str };
+                        return res;
+                    },
+                    .open_err, .sym_err => |detail| {
+                        defer self.alloc.free(detail);
+                        return self.failArgerror(
+                            "error loading module '{s}' from file '{s}':\n\t{s}",
+                            .{ name_str.bytes(), file_str.bytes(), detail },
+                        );
+                    },
+                }
+            },
+        }
+    }
+
+    /// PUC searcher_Croot (loadlib.c:582-601): for dotted names search the
+    /// ROOT module's file on cpath and resolve luaopen_<full mangled name>
+    /// in it. A missing symbol is a soft miss ("no module ... in file ...")
+    /// so the not-found message can list it; a library-open failure is a
+    /// real error; a root-file miss returns the root's searchpath message.
+    /// Dotless names return nothing (the name IS a root — searcher_C
+    /// already covered it).
+    fn searcherCrootImpl(self: *Vm, pkg: *Table, args: []const Value) DispatchError![]Value {
+        var scope = try self.openRootScope(4, 0);
+        defer scope.close();
+        const name_str = try self.shimCheckStringArg(args, "?");
+        _ = scope.protectValueAssumeCapacity(.{ .String = name_str });
+        const name = name_str.bytes();
+        const dot = std.mem.indexOfScalar(u8, name, '.') orelse
+            return try self.allocOwnedResult(0);
+        const root_str = try self.internStr(name[0..dot]);
+        _ = scope.protectValueAssumeCapacity(.{ .String = root_str });
+        const cpath_str = try self.packagePathString(pkg, "cpath");
+        _ = scope.protectValueAssumeCapacity(.{ .String = cpath_str });
+        const sr = try self.searchpathCore(root_str.bytes(), cpath_str.bytes(), ".", "/");
+        switch (sr) {
+            .miss => |msg| {
+                defer self.alloc.free(msg);
+                const res = try self.allocOwnedResult(1);
+                errdefer self.alloc.free(res);
+                res[0] = .{ .String = try self.internStr(msg) };
+                return res;
+            },
+            .found => |file_str| {
+                _ = scope.protectValueAssumeCapacity(.{ .String = file_str });
+                const lf = try self.loadfuncCore(file_str.bytes(), name);
+                switch (lf) {
+                    .func => |cl| {
+                        _ = scope.protectValueAssumeCapacity(.{ .Closure = cl });
+                        const res = try self.allocOwnedResult(2);
+                        res[0] = .{ .Closure = cl };
+                        res[1] = .{ .String = file_str };
+                        return res;
+                    },
+                    .sym_err => |detail| {
+                        defer self.alloc.free(detail);
+                        const res = try self.allocOwnedResult(1);
+                        errdefer self.alloc.free(res);
+                        res[0] = .{ .String = try self.internFmt("no module '{s}' in file '{s}'", .{ name, file_str.bytes() }) };
+                        return res;
+                    },
+                    .open_err => |detail| {
+                        defer self.alloc.free(detail);
+                        return self.failArgerror(
+                            "error loading module '{s}' from file '{s}':\n\t{s}",
+                            .{ name, file_str.bytes(), detail },
+                        );
+                    },
+                }
+            },
+        }
+    }
+
+    const LoadfuncResult = union(enum) {
+        func: *Closure,
+        /// dlopen failed (PUC ERRLIB); owned detail message.
+        open_err: []u8,
+        /// dlsym failed (PUC ERRFUNC); owned detail message.
+        sym_err: []u8,
+    };
+
+    /// PUC loadfunc (loadlib.c:556-571): mangle the module name (dots →
+    /// underscores), then resolve "luaopen_<name>" in the library at
+    /// `filename`; a '-' ignore mark first tries the prefix before it and
+    /// falls back to the suffix on a symbol miss (an open failure returns
+    /// immediately). The reported symbol failure is the LAST candidate's.
+    /// `filename`/`modname` may alias GC-visible strings — they are duped
+    /// up front, before any allocation that could run a GC.
+    fn loadfuncCore(self: *Vm, filename: []const u8, modname: []const u8) DispatchError!LoadfuncResult {
+        const file_path = try self.alloc.dupe(u8, filename);
+        defer self.alloc.free(file_path);
+        const modname_norm = try self.alloc.dupe(u8, modname);
+        defer self.alloc.free(modname_norm);
+        for (modname_norm) |*ch| if (ch.* == '.') {
+            ch.* = '_';
+        };
+
+        // LUA_IGMARK ('-'): try prefix before dash, then suffix.
+        // E.g. "lib2-v2" → try "luaopen_lib2" first, then "luaopen_v2".
+        var candidates: [2][]const u8 = .{ modname_norm, "" };
+        var n_candidates: usize = 1;
+        if (std.mem.indexOfScalar(u8, modname_norm, '-')) |dash_pos| {
+            candidates[0] = modname_norm[0..dash_pos];
+            candidates[1] = modname_norm[dash_pos + 1 ..];
+            n_candidates = 2;
+        }
+        var last_sym_err: ?[]u8 = null;
+        errdefer if (last_sym_err) |m| self.alloc.free(m);
+        for (candidates[0..n_candidates]) |cand| {
+            const open_name = try std.fmt.allocPrint(self.alloc, "luaopen_{s}", .{cand});
+            defer self.alloc.free(open_name);
+            const res = try self.lookforfuncCore(file_path, open_name);
+            switch (res) {
+                .func => |cl| {
+                    if (last_sym_err) |m| self.alloc.free(m);
+                    return .{ .func = cl };
+                },
+                .open_err => |msg| {
+                    if (last_sym_err) |m| self.alloc.free(m);
+                    return .{ .open_err = msg };
+                },
+                .sym_err => |msg| {
+                    if (last_sym_err) |m| self.alloc.free(m);
+                    last_sym_err = msg;
+                },
+            }
+        }
+        // Every candidate's dlsym failed (last_sym_err is always set —
+        // dlsym("luaopen_...") failing is the only way past the loop).
+        return .{ .sym_err = last_sym_err.? };
     }
 
     fn builtinSetmetatable(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -40518,6 +41002,69 @@ pub const Vm = struct {
     fn setField(self: *Vm, tbl: *Table, name: []const u8, val: Value) DispatchError!void {
         const key: Value = .{ .String = try self.internStr(name) };
         return self.rawSet(tbl, key, val);
+    }
+
+    /// PUC `lua_getfield` from C code (lapi.c auxgetstr → luaV_finishget →
+    /// luaT_callTMres with a C frame current → luaD_callnoyield): a
+    /// metamethod-aware field read whose `__index` call runs under a
+    /// nonyieldable C-call unit, so a yield attempt inside `__index` raises
+    /// the C-call boundary error instead of suspending the running thread.
+    /// The fast path — a raw hit, no metatable, or a flags-cached `__index`
+    /// miss — never enters the unit and never allocates past the key intern.
+    /// The returned Value is fresh on the metamethod path: the caller roots
+    /// it across its next allocation.
+    pub fn cGetField(self: *Vm, tbl: *Table, name: []const u8) DispatchError!Value {
+        const key: Value = .{ .String = try self.internStr(name) };
+        const raw = self.tableGetRawValue(tbl, key);
+        if (raw != .Nil) return raw;
+        const mt = tbl.metatable orelse return .Nil;
+        if (self.fastTm(mt, .index) == null) return .Nil;
+        // The metamethod slow path allocates (stack staging in
+        // stageBytecodeCall, including an emergency-GC retry) before the
+        // key reaches the thread stack — the fresh long-string key is
+        // otherwise unrooted there. No allocation can run between the
+        // intern above and the publications below (reads and the flags
+        // probe only; openRootScope itself is NoGC infra), so arming the
+        // root scope here still gives the key an infallible publication
+        // ahead of the first MayGC step — the non-moving analog of PUC
+        // auxgetstr pushing the key before luaV_finishget. Callers root
+        // the returned value before their own next allocation (same
+        // contract as allocCclosure).
+        var scope = try self.openRootScope(2, 0);
+        defer scope.close();
+        _ = scope.protectValueAssumeCapacity(.{ .Table = tbl });
+        _ = scope.protectValueAssumeCapacity(key);
+        const th = self.activeBytecodeThread();
+        try self.ccallEnter(th, .nonyieldable);
+        defer th.ccallExit(.nonyieldable);
+        return self.indexValue(.{ .Table = tbl }, key);
+    }
+
+    /// PUC `lua_setfield` from C code (luaV_finishset → luaT_callTMres →
+    /// luaD_callnoyield): a metamethod-aware field write; `__newindex` runs
+    /// under the same nonyieldable unit as `cGetField`. A raw hit or a table
+    /// without `__newindex` takes the raw store (no unit, no metamethod).
+    pub fn cSetField(self: *Vm, tbl: *Table, name: []const u8, val: Value) DispatchError!void {
+        // Same rooting discipline as cGetField, plus the stored value: the
+        // table-set path can grow the table (a MayGC rehash) before the
+        // key/value land in their slots, and the __newindex slow path stages
+        // [callee, table, key, value] on the value stack (a growth can run
+        // an emergency GC and retry). PUC auxsetstr keeps key and value on
+        // L's stack across luaV_finishset.
+        var scope = try self.openRootScope(3, 0);
+        defer scope.close();
+        _ = scope.protectValueAssumeCapacity(.{ .Table = tbl });
+        const key: Value = .{ .String = try self.internStr(name) };
+        _ = scope.protectValueAssumeCapacity(key);
+        _ = scope.protectValueAssumeCapacity(val);
+        if (self.tableGetRawValue(tbl, key) != .Nil or tbl.metatable == null)
+            return self.tableSetValue(tbl, key, val);
+        if (self.fastTm(tbl.metatable.?, .newindex) == null)
+            return self.tableSetValue(tbl, key, val);
+        const th = self.activeBytecodeThread();
+        try self.ccallEnter(th, .nonyieldable);
+        defer th.ccallExit(.nonyieldable);
+        return self.setIndexValue(.{ .Table = tbl }, key, val);
     }
 
     // Coerce a `next()`/`rawnext()` control key into the canonical form used
@@ -48505,7 +49052,7 @@ pub const Vm = struct {
     ///   * **Bytecode/IR closure** (`proto != null`): executed via
     ///     `runBytecodeInternal` (host recursion, like PUC's `luaV_execute`).
     ///
-    /// All ~30 call sites (OP_CALL no-proto path, `builtinRequire`, metamethod
+    /// All ~30 call sites (OP_CALL no-proto path, metamethod
     /// dispatch, `apiCall`, pcall/xpcall, table.sort/gsub, ...) funnel through
     /// here, so handling `c_func` centrally — rather than scattering checks at
     /// each site — mirrors PUC's single `luaD_precall` dispatch and keeps the
@@ -48589,15 +49136,16 @@ pub const Vm = struct {
         return ptr;
     }
 
-    /// P15.80: Free the heap-owned `TestcContState` and its owned slices.
-    /// Sets the C-frame's `testc_state` to null after freeing.
-    /// Safe to call when `testc_state` is already null (no-op).
-    /// P15.82: Free all heap-allocated state owned by a C-frame.
+    /// P15.80: Free all heap-allocated state owned by a C-frame.
     /// This includes:
     /// - `testc_state` (P15.80: heap-allocated TestcContState)
     /// - `clsret_state` (P15.82: heap-allocated CClsretState for CIST_CLSRET)
+    /// - `c_result_transport` (the activation's armed return-tail reserve —
+    ///   every teardown path that pops, unwinds, recovers or destroys the
+    ///   frame releases it here exactly once; the normal-return epilogue
+    ///   consumes it first, so this is a no-op there)
     /// Called before shrinking `call_frames` (popBuiltinCFrame, precover).
-    /// Null-safe: does nothing if both pointers are null.
+    /// Null-safe: does nothing if all pointers are null.
     fn freeCFrameOwnedState(self: *Vm, fr: *CallFrame) void {
         if (fr.u.c.testc_state) |tcs| {
             // No stack_prefix free — the window lives on its
@@ -48610,6 +49158,10 @@ pub const Vm = struct {
             self.alloc.free(cs.results);
             self.alloc.destroy(cs);
             fr.u.c.clsret_state = null;
+        }
+        if (fr.u.c.c_result_transport) |t| {
+            self.releaseResultTransport(t);
+            fr.u.c.c_result_transport = null;
         }
     }
 
@@ -49122,7 +49674,11 @@ pub const Vm = struct {
             // so `finishCcall` can invoke k on the next resume; the window
             // (args + live TBC slots) lives on in th.stack — PUC: the slots
             // live on the shared L->stack and survive the suspension
-            // naturally.
+            // naturally. The resume delivers results through finishCcall,
+            // not this epilogue — release the armed tail reserve (the
+            // parked frame's delivery lanes never read it; the buffer's
+            // lifetime stays bounded to the synchronous activation).
+            self.cResultTransportRelease(th.call_frames.getPtr(my_cframe_idx));
             return error.Yield;
         }
 
@@ -49133,7 +49689,9 @@ pub const Vm = struct {
             // lives on in th.stack; `finishCcall`'s k==NULL path delivers
             // the switch-back values as this call's results on the next
             // resume. The switch itself is processed by the active
-            // trampoline (error.ThreadSwitch).
+            // trampoline (error.ThreadSwitch). Same as the yield arm: the
+            // results bypass this epilogue — release the tail reserve.
+            self.cResultTransportRelease(th.call_frames.getPtr(my_cframe_idx));
             return error.ThreadSwitch;
         }
 
@@ -49150,11 +49708,16 @@ pub const Vm = struct {
             // coroutine.close), and the error object is NOT folded here —
             // it is already canonically owned by MAIN's thread error
             // state. The consumer on main (or the next relay) decides the
-            // fate; this arm only propagates the kind.
+            // fate; this arm only propagates the kind. The abandoned
+            // activation cannot consume its reserved return tail.
+            self.cResultTransportRelease(th.call_frames.getPtr(my_cframe_idx));
             return error.MainDestined;
         }
 
         if (nret_signed == .lua_err) {
+            // The errored activation's return tail is void — release its
+            // armed reserve before any error-state work below.
+            self.cResultTransportRelease(th.call_frames.getPtr(my_cframe_idx));
             // A protected Lua error (lua_error or cThrow). Fold the thrown
             // object into the VM error state first — both the YPCALL and
             // non-YPCALL paths below need it.
@@ -49230,16 +49793,41 @@ pub const Vm = struct {
         const wbase = fs + 1;
         const result_start: usize = if (th.top >= nret and th.top - nret >= wbase) th.top - nret else wbase;
         const actual_nret: usize = th.top - result_start;
-        // P16.50-review-4 BLOCKER 5: the result-copy OOM previously exited
-        // with the C-frame still linked and no error object installed. The
-        // transfer is transactional now: on OOM the frame unwinds exactly
-        // like the structural error path (pop; no close — the TBC marks
-        // close at whichever boundary catches the error) and the fixed
-        // MEMERRMSG is installed before returning the OOM kind.
-        const saved_results = self.alloc.dupe(Value, th.stack[result_start .. result_start + actual_nret]) catch {
-            self.popBuiltinCFrame();
-            self.setOutOfMemoryError();
-            return error.OutOfMemory;
+        // PUC luaD_poscall finalizes a C call with pure stack moves
+        // (moveresults) — no allocation. The generic transport below is a
+        // fresh heap copy, a fallible step AFTER the callback's own code:
+        // for a callback that published globals it would be an allocation
+        // point PUC does not have. A callback that reserved its return
+        // tail (cReturnTailReserve) armed THIS activation's own frame with
+        // an exact-size transport, handed over here instead, keeping the
+        // post-publication tail allocation-free. A reserve armed by
+        // another activation lives on its own frame and is not visible
+        // here — this activation falls back to the generic copy.
+        const saved_results: []Value = blk: {
+            const my_fr = th.call_frames.getPtr(my_cframe_idx);
+            if (my_fr.u.c.c_result_transport) |t| {
+                my_fr.u.c.c_result_transport = null;
+                if (t.vals.len == actual_nret) {
+                    const buf = t.vals;
+                    self.alloc.destroy(t);
+                    @memcpy(buf, th.stack[result_start .. result_start + actual_nret]);
+                    break :blk buf;
+                }
+                // The callback did not return what it reserved —
+                // drop the mismatched reserve and copy.
+                self.releaseResultTransport(t);
+            }
+            // P16.50-review-4 BLOCKER 5: the result-copy OOM previously exited
+            // with the C-frame still linked and no error object installed. The
+            // transfer is transactional now: on OOM the frame unwinds exactly
+            // like the structural error path (pop; no close — the TBC marks
+            // close at whichever boundary catches the error) and the fixed
+            // MEMERRMSG is installed before returning the OOM kind.
+            break :blk self.alloc.dupe(Value, th.stack[result_start .. result_start + actual_nret]) catch {
+                self.popBuiltinCFrame();
+                self.setOutOfMemoryError();
+                return error.OutOfMemory;
+            };
         };
         // results_owned: once a yielding closer's CClsretState takes the
         // results, the errdefer must not free them.
@@ -53946,11 +54534,10 @@ pub const Vm = struct {
     /// test suites run Debug), and the failure mode without the assert is
     /// a stale-window use-after-free, not silent misbehavior.
     ///
-    /// Transitive members: .loadfile and .require route through
-    /// builtinLoad → builtinLoadEx; .require also calls builtinLoadfile and
-    /// tryCLoad directly; .str_arith_* route through strArithMetamethod;
+    /// Transitive members: .loadfile routes through
+    /// builtinLoad → builtinLoadEx; .str_arith_* route through strArithMetamethod;
     /// .testc_testC's loadstring arm calls builtinLoadEx directly.
-    /// .require/.pairs/.collectgarbage re-derive after nested execution
+    /// .pairs/.collectgarbage re-derive after nested execution
     /// (runClosure / nested callBuiltin / GC finalizers) before writing
     /// their results (P16.39 Cut 3 correctness fix).
     /// P16.50-review-7 BLOCKER 4: .pcall/.xpcall/.dofile are GONE — they
@@ -53966,12 +54553,12 @@ pub const Vm = struct {
     const builtin_may_refresh_outs: [@typeInfo(BuiltinId).@"enum".fields.len]bool = blk: {
         var t = [_]bool{false} ** @typeInfo(BuiltinId).@"enum".fields.len;
         for ([_]BuiltinId{
-            .tostring,        .load,          .loadfile,
-            .require,         .pairs,         .collectgarbage,
-            .str_arith_add,   .str_arith_sub, .str_arith_mul,
-            .str_arith_mod,   .str_arith_pow, .str_arith_div,
-            .str_arith_idiv,  .str_arith_unm, .testc_testC,
-            .coroutine_close, .string_gsub,   .string_format,
+            .tostring,      .load,           .loadfile,
+            .pairs,         .collectgarbage, .str_arith_add,
+            .str_arith_sub, .str_arith_mul,  .str_arith_mod,
+            .str_arith_pow, .str_arith_div,  .str_arith_idiv,
+            .str_arith_unm, .testc_testC,    .coroutine_close,
+            .string_gsub,   .string_format,
         }) |rid| t[@intFromEnum(rid)] = true;
         break :blk t;
     };
@@ -54067,7 +54654,6 @@ pub const Vm = struct {
         t[@intFromEnum(BuiltinId.testc_gcstate)] = 1;
         t[@intFromEnum(BuiltinId.loadfile)] = 2;
         t[@intFromEnum(BuiltinId.load)] = 2;
-        t[@intFromEnum(BuiltinId.require)] = 2;
         t[@intFromEnum(BuiltinId.package_searchpath)] = 2;
         t[@intFromEnum(BuiltinId.setmetatable)] = 1;
         t[@intFromEnum(BuiltinId.getmetatable)] = 1;
@@ -56472,8 +57058,160 @@ test "vm: P16.15 T6 transactional staged activation — failure between staging 
 // The iterative fail_index approach exhaustively tests every OOM point.
 // =========================================================================
 
-/// Compile a simple proto from source. Returns a finished proto with
-/// ref_count == 1 (the producing reference).
+// Package-lane key rooting: the fresh long field key produced by
+// cGetField/cSetField must survive a one-shot allocation failure on the
+// metamethod staging path (emergency GC + successful retry) while the
+// thread stack sits at its capacity boundary — the non-moving analog of
+// PUC auxgetstr/auxsetstr publishing the key on L's stack before
+// luaV_finishget/finishset. poison_unmap makes any use of a swept key
+// fault deterministically. Internal deterministic proof: the boundary
+// and the transient failure are not expressible through the public C
+// API, so this is not a PUC differential — the observable Lua-level
+// metamethod semantics are covered by smoke 92's meta blocks.
+test "package field key rooted across metamethod staging (get)" {
+    const key_src = "this is a deliberately long package module name beyond forty bytes";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const proto = try compileTestProto(alloc, "local _, k = ...; return k\n");
+    var vm = Vm.init(alloc, false);
+    defer vm.deinit();
+    const cl = try alloc.create(Closure);
+    cl.* = .{ .proto = proto, .upvalues = &.{} };
+    _ = vm.retainTreeForClosure(proto);
+    vm.gcRegisterClosure(cl);
+    try vm.resolveProtoConstants(proto);
+    const mt = try vm.allocTableNoGc();
+    try vm.setField(mt, "__index", .{ .Closure = cl });
+    const tbl = try vm.allocTableNoGc();
+    tbl.metatable = mt;
+    var tbl_scope = try vm.openRootScope(1, 0);
+    defer tbl_scope.close();
+    _ = tbl_scope.protectValueAssumeCapacity(.{ .Table = tbl });
+    vm.installTestcAdapter();
+    vm.testc_alloc_adapter.?.ctrl.poison_unmap = true;
+    const th = vm.activeBytecodeThread();
+
+    // Boundary: staging [func, tbl, key] at th.top must grow the stack.
+    const old_top = th.top;
+    th.top = th.stack.len - 2;
+    // One-shot transient failure one allocation after the key intern
+    // (the growth): emergency GC sweeps, retry succeeds. Without the
+    // cGetField root scope the emergency pass collects the unrooted long
+    // key and the retry stages a freed (poison-unmapped) string.
+    vm.testc_alloc_adapter.?.ctrl.disarm_after_emergency = true;
+    vm.testc_alloc_adapter.?.ctrl.alloc_count = 1;
+    const result = vm.cGetField(tbl, key_src);
+    vm.testc_alloc_adapter.?.ctrl.alloc_count = -1;
+    th.top = old_top;
+    const returned = try result;
+    try std.testing.expect(returned == .String);
+    try std.testing.expectEqualStrings(key_src, returned.String.bytes());
+
+    // The VM stays usable after the emergency cycle: a plain no-GC
+    // control call on the same boundary.
+    th.top = th.stack.len - 2;
+    const again = try vm.cGetField(tbl, key_src);
+    th.top = old_top;
+    try std.testing.expect(again == .String);
+    try std.testing.expectEqualStrings(key_src, again.String.bytes());
+}
+
+test "package field key rooted across metamethod staging (set)" {
+    const key_src = "another deliberately long package module name past forty bytes";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var vm = Vm.init(alloc, false);
+    defer vm.deinit();
+    const cl = try alloc.create(Closure);
+    cl.* = .{ .proto = null, .c_func = &testFieldKeyNewindexShim, .upvalues = &.{} };
+    vm.gcRegisterClosure(cl);
+    const mt = try vm.allocTableNoGc();
+    try vm.setField(mt, "__newindex", .{ .Closure = cl });
+    const tbl = try vm.allocTableNoGc();
+    tbl.metatable = mt;
+    var tbl_scope = try vm.openRootScope(1, 0);
+    defer tbl_scope.close();
+    _ = tbl_scope.protectValueAssumeCapacity(.{ .Table = tbl });
+    vm.installTestcAdapter();
+    vm.testc_alloc_adapter.?.ctrl.poison_unmap = true;
+    const th = vm.activeBytecodeThread();
+
+    // Distinct fresh keys per phase: the shim-validated store makes the
+    // key a raw hit for later writes, so every phase drives the full
+    // metamethod path on a key the table has never seen.
+    const key_b = "b-key deliberately long package module name past forty bytes";
+    const key_c = "c-key deliberately long package module name past forty bytes";
+    const old_top = th.top;
+
+    // (a) Transient failure one allocation after the key intern (the
+    // staging growth of [func, t, k, v] past the capacity boundary):
+    // emergency GC + retry, then the metamethod receives the exact
+    // key/value and applies the store.
+    th.top = th.stack.len - 2;
+    test_fieldkey_set_ok = false;
+    test_fieldkey_expected = key_src;
+    vm.testc_alloc_adapter.?.ctrl.disarm_after_emergency = true;
+    vm.testc_alloc_adapter.?.ctrl.alloc_count = 1;
+    try vm.cSetField(tbl, key_src, .{ .Int = 42 });
+    vm.testc_alloc_adapter.?.ctrl.alloc_count = -1;
+    th.top = old_top;
+    try std.testing.expect(test_fieldkey_set_ok);
+    const probe = try vm.internStr(key_src);
+    const stored = vm.tableGetRawValue(tbl, .{ .String = probe });
+    try std.testing.expect(stored == .Int and stored.Int == 42);
+
+    // (b) Sticky refusal through the retry: ERRMEM, and the VM survives.
+    th.top = th.stack.len - 2;
+    test_fieldkey_set_ok = false;
+    test_fieldkey_expected = key_b;
+    vm.testc_alloc_adapter.?.ctrl.disarm_after_emergency = false;
+    vm.testc_alloc_adapter.?.ctrl.alloc_count = 1;
+    const sticky = vm.cSetField(tbl, key_b, .{ .Int = 43 });
+    vm.testc_alloc_adapter.?.ctrl.alloc_count = -1;
+    th.top = old_top;
+    try std.testing.expectError(error.OutOfMemory, sticky);
+    try std.testing.expect(!test_fieldkey_set_ok);
+    const probe_b = try vm.internStr(key_b);
+    try std.testing.expect(vm.tableGetRawValue(tbl, .{ .String = probe_b }) == .Nil);
+
+    // (c) Recovery: the same full path succeeds without the countdown.
+    th.top = th.stack.len - 2;
+    test_fieldkey_set_ok = false;
+    test_fieldkey_expected = key_c;
+    try vm.cSetField(tbl, key_c, .{ .Int = 44 });
+    th.top = old_top;
+    try std.testing.expect(test_fieldkey_set_ok);
+    const probe2 = try vm.internStr(key_c);
+    const stored2 = vm.tableGetRawValue(tbl, .{ .String = probe2 });
+    try std.testing.expect(stored2 == .Int and stored2.Int == 44);
+}
+
+/// Test-only __newindex shim: receives (table, key, value) through the C
+/// window and validates that the key is the exact fresh long string the
+/// test interned (any dangling key faults under poison_unmap). Applies
+/// the store so the table reflects the write.
+var test_fieldkey_set_ok: bool = false;
+var test_fieldkey_expected: []const u8 = "";
+fn testFieldKeyNewindexShim(L: ?*lua_State) callconv(.c) c_int {
+    const h = L orelse return 0;
+    const self = h.vm;
+    const th = self.activeBytecodeThread();
+    if (th.call_frames.len() == 0) return -1;
+    const fr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
+    if (!fr.isC()) return -1;
+    const args = th.stack[fr.func_slot + 1 .. th.top];
+    if (args.len != 3) return -1;
+    const t = args[0].Table;
+    const k = args[1];
+    const v = args[2];
+    if (k != .String or !std.mem.eql(u8, k.String.bytes(), test_fieldkey_expected)) return -1;
+    test_fieldkey_set_ok = true;
+    self.tableSetValue(t, k, v) catch return -1;
+    return 0;
+}
+
 fn compileTestProto(alloc: std.mem.Allocator, src_bytes: []const u8) !*bc.Proto {
     const Source = @import("source.zig").Source;
     const Lexer = @import("lexer.zig").Lexer;
@@ -62113,9 +62851,12 @@ test "P16.50-review-3 R2: exported throwing APIs under callCFunction OOM sweeps"
                 vm.alloc.free(result);
                 // Teardown (T2 idiom): the fresh stack was auto-restored by
                 // callCFunction's normal return, so only the Thread and its
-                // handle remain to undo.
+                // handle remain to undo. Capture the handle BEFORE the
+                // teardown — p50TeardownThread destroys the Thread, and a
+                // large Thread allocation is unmapped on free.
+                const h2 = th2.api_handle.?;
                 p50TeardownThread(vm, th2, false);
-                vm.freeStateHandle(th2.api_handle.?);
+                vm.freeStateHandle(h2);
                 try testing.expectEqual(frames0, th.call_frames.len());
                 try testing.expectEqual(@as(c_int, 0), th.api_status);
                 try snap.assertRestored(vm);
@@ -62151,8 +62892,12 @@ test "P16.50-review-3 R2: exported throwing APIs under callCFunction OOM sweeps"
                     if (o == .thread and o.thread != vm.main_thread.?) th2_opt = o.thread;
                 }
                 if (th2_opt) |th2| {
+                    // Capture the handle before the teardown (the Thread
+                    // allocation is unmapped on free — same T2 idiom as the
+                    // success arm above).
+                    const h2 = th2.api_handle.?;
                     p50TeardownThread(vm, th2, false);
-                    vm.freeStateHandle(th2.api_handle.?);
+                    vm.freeStateHandle(h2);
                 }
                 try testing.expectEqual(frames0, th.call_frames.len());
                 try testing.expectEqual(@as(c_int, 0), th.api_status);
@@ -67960,7 +68705,7 @@ test "P16.50-review-11 3: gen-minor close over BLACK children of every old age i
         cells[i] = try p50r9MkOpenCell(&vm, th, base_slot + i);
     }
     const child_old = try vm.allocTableNoGc();
-    var scope = try vm.openRootScope(1, 4);
+    var scope = try vm.openRootScope(2, 4);
     defer scope.close();
     for (0..4) |i| {
         _ = scope.protectCellAssumeCapacity(cells[i]);

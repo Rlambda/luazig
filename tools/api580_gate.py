@@ -103,7 +103,7 @@ def run_size_probe() -> int:
                 return 1
             print(f"PASS [{mode}]: comptime size invariants hold "
                   "(LuaString=48, LSTRFIX=32, GcHeader=16, Closure=48, "
-                  "Cell=48, Table=80, Userdata=56, Thread=3864, "
+                  "Cell=48, Table=80, Userdata=56, Thread=4128, "
                   "Upvaldesc=16, Proto=184, CallFrame<=104, Node=32)")
     return 0
 

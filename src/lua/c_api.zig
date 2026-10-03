@@ -3546,41 +3546,59 @@ pub export fn luaL_callmeta(L: ?*lua_State, obj: c_int, event: [*:0]const u8) c_
 
 pub export fn luaL_requiref(L: ?*lua_State, modname: [*:0]const u8, openf: ?*const fn (?*lua_State) callconv(.c) c_int, glb: c_int) void {
     var s = api.State.fromHandle(L orelse return);
-    // PUC luaL_requiref: every step (pushcfunction / pushstring / call /
-    // setfield / setglobal) throws on failure — no silent early return
-    // leaving a half-pushed stack (P16.50-review-5 B2).
-    s.pushcfunction(openf) catch |e| cThrowOn(s.vm, L.?, e);
-    s.pushstring(std.mem.span(modname)) catch |e| cThrowOn(s.vm, L.?, e);
-    s.call(1, 1) catch |e| switch (e) {
+    // PUC luaL_requiref (lauxlib.c:1006-1023): check the registry _LOADED
+    // table (luaL_getsubtable — get-or-create); on a falsy entry call
+    // openf(modname) and store the result into _LOADED[modname] (the
+    // REGISTRY table, not the global package.loaded — require reads the
+    // registry one); if glb, also publish _G[modname]. The module is left
+    // on top. Every step throws on failure — no silent early return
+    // leaving a half-pushed stack.
+    const name = std.mem.span(modname);
+    // luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_LOADED_TABLE)
+    s.getregistry() catch |e| cThrowOn(s.vm, L.?, e);
+    _ = s.getfield(-1, "_LOADED") catch |e| switch (e) {
         error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
         else => {},
     };
-    // Store in package.loaded[modname]
-    _ = s.getglobal("package") catch |e| cThrowOn(s.vm, L.?, e);
-    if (s.typeOf(-1)) |t| if (t == .table) {
-        _ = s.getfield(-1, "loaded") catch |e| switch (e) {
+    if (s.typeOf(-1)) |t| if (t != .table) {
+        // Missing or non-table: replace with a fresh table (PUC
+        // luaL_getsubtable get-or-create semantics).
+        s.pop(1) catch {};
+        s.newtable() catch |e| cThrowOn(s.vm, L.?, e);
+        s.setfield(-2, "_LOADED") catch |e| switch (e) {
             error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
             else => {},
         };
-        if (s.typeOf(-1)) |t2| if (t2 == .table) {
-            _ = s.pushvalue(-3) catch |e| switch (e) {
-                error.OutOfMemory => cThrowOn(s.vm, L.?, e),
-                else => {},
-            };
-            s.setfield(-2, std.mem.span(modname)) catch |e| switch (e) {
-                error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
-                else => {},
-            };
-        };
-        s.curThread().top -= 1; // PUC auxsetstr-family: plain pop
     };
-    s.curThread().top -= 1; // PUC auxsetstr-family: plain pop
-    if (glb != 0) {
-        _ = s.pushvalue(-1) catch |e| switch (e) {
-            error.OutOfMemory => cThrowOn(s.vm, L.?, e),
+    // Drop the registry push: PUC addresses the registry by pseudo-index
+    // and pushes only the subtable (stack: [loaded]).
+    s.remove(-2) catch {};
+    _ = s.getfield(-1, name) catch |e| switch (e) {
+        error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        else => {},
+    };
+    // Stack: [loaded, module-or-nil]
+    if (!s.toboolean(-1)) {
+        // Package not already loaded: pop the field, call openf(modname).
+        s.pop(1) catch {};
+        s.pushcfunction(openf) catch |e| cThrowOn(s.vm, L.?, e);
+        s.pushstring(name) catch |e| cThrowOn(s.vm, L.?, e);
+        s.call(1, 1) catch |e| switch (e) {
+            error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
             else => {},
         };
-        s.setglobal(std.mem.span(modname)) catch |e| switch (e) {
+        // Stack: [loaded, module] — store a copy into _LOADED[modname].
+        _ = s.pushvalue(-1) catch |e| cThrowOn(s.vm, L.?, e);
+        s.setfield(-3, name) catch |e| switch (e) {
+            error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+            else => {},
+        };
+    }
+    // lua_remove(L, -2): drop the LOADED table below the module.
+    s.remove(-2) catch {};
+    if (glb != 0) {
+        _ = s.pushvalue(-1) catch |e| cThrowOn(s.vm, L.?, e);
+        s.setglobal(name) catch |e| switch (e) {
             error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
             else => {},
         };
@@ -4304,13 +4322,41 @@ pub export fn luaopen_base(L: ?*lua_State) c_int {
     return 1;
 }
 
-/// PUC `luaopen_package` (loadlib.c): opens the package library.
-/// The `package` table is already in `_G.package`; push it.
+/// PUC `luaopen_package` (loadlib.c:724-747): opens the package library —
+/// builds a FRESH package table (path/cpath, config, searchpath/loadlib,
+/// loaded/preload from the registry, the 4-entry searchers table and the
+/// require closure, each carrying the package table as upvalue 1) and
+/// pushes it. _G.package is left to the caller (PUC hosts publish it via
+/// luaL_requiref's glb flag).
 pub export fn luaopen_package(L: ?*lua_State) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    // PUC pushes the module table — OOM is LUA_ERRMEM
-    // (P16.50-review-5 B2 — the old `catch return 0` pushed nothing).
-    _ = s.getglobal("package") catch |e| cThrowOn(s.vm, L.?, e);
+    // PUC publication-order contract (loadlib.c luaopen_package over
+    // luaD_checkstack): every fallible step — the return-tail reserve,
+    // the rooting scope, the whole constructor — precedes the
+    // constructor's global publication (its setGlobal("require") is the
+    // final fallible act); the tail protect/push/result handoff is
+    // allocation-free, so a failed open leaves _G byte-exact.
+    s.vm.cReturnTailReserve(Vm.handleThread(L.?), 1) catch |e|
+        cThrowOn(s.vm, L.?, api.mapVmError(e));
+    var scope = s.vm.openRootScope(1, 0) catch cThrowOn(s.vm, L.?, error.OutOfMemory);
+    defer scope.close();
+    const pkg = s.vm.openPackageLibrary() catch |e| switch (e) {
+        error.OutOfMemory => cThrowOn(s.vm, L.?, error.OutOfMemory),
+        error.RuntimeError => cThrowOn(s.vm, L.?, error.Runtime),
+        error.MainDestined => cRelayMainDestined(s.vm),
+        // The constructor runs no user code: coroutine control flow cannot
+        // legitimately cross this boundary — fail loudly instead of
+        // silently re-labeling it as ERRRUN.
+        error.Yield, error.ThreadSwitch => @panic(
+            "luaopen_package: coroutine control flow crossed the constructor boundary",
+        ),
+    };
+    // Root the fresh table across the window push: until the value lands
+    // on the thread stack it is visible only to this C frame (the
+    // constructor's root scope has closed). Abandoned scopes on a throw
+    // are cleaned by the C landing pad's restoreRoots.
+    _ = scope.protectValueAssumeCapacity(.{ .Table = pkg });
+    s.vm.cWindowPush(Vm.handleThread(L.?), .{ .Table = pkg }) catch |e| cThrowOn(s.vm, L.?, api.mapVmError(e));
     return 1;
 }
 
@@ -4394,15 +4440,25 @@ pub export fn luaopen_utf8(L: ?*lua_State) c_int {
 pub export fn luaL_openselectedlibs(L: ?*lua_State, load: c_int, preload: c_int) void {
     var s = api.State.fromHandle(L orelse return);
 
-    // PUC: luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_PRELOAD_TABLE)
-    // Get the PRELOAD table from the registry. The VM stores it under
-    // "_PRELOAD" in the debug registry (see Vm.init package setup).
+    // PUC: luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_PRELOAD_TABLE) —
+    // get-or-create the PRELOAD table in the registry (the VM's
+    // openPackageLibrary normally created it; a stripped or mutated
+    // registry still gets a fresh table here, exactly like PUC).
     // PUC luaL_getsubtable throws on OOM (P16.50-review-5 B2 — the old
     // early returns left the library set half-open with no error).
     s.getregistry() catch |e| cThrowOn(s.vm, L.?, e);
     _ = s.getfield(-1, "_PRELOAD") catch |e| switch (e) {
         error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
         else => {},
+    };
+    if (s.typeOf(-1)) |t| if (t != .table) {
+        // Missing or non-table: replace with a fresh table.
+        s.pop(1) catch {};
+        s.newtable() catch |e| cThrowOn(s.vm, L.?, e);
+        s.setfield(-2, "_PRELOAD") catch |e| switch (e) {
+            error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+            else => {},
+        };
     };
     // Stack: [registry, preload_table]
 
@@ -5324,6 +5380,8 @@ fn r13StageUserdata(L: ?*lua_State) callconv(.c) c_int {
 /// metatable). __gc is the `type` builtin — deliberately silent: registered
 /// finalizers run at lua_close, and a printing __gc would write to raw
 /// stdout (corrupting the zig-build-test RPC stream in listen mode).
+/// Protects the metatable into the CALLER's scope (counts against its
+/// value reserve).
 fn r13NewMt(vm: *vm_mod.Vm, scope: *vm_mod.Vm.RootScope) !*vm_mod.Table {
     const mt = try vm.apiNewTable();
     _ = scope.protectValueAssumeCapacity(.{ .Table = mt });
@@ -5370,7 +5428,7 @@ test "c api lua_setmetatable OOM transaction matrix (table + userdata, every res
         const L = luaL_newstate() orelse return error.OutOfMemory;
         defer lua_close(L);
         const vm = L.vm;
-        var scope = try vm.openRootScope(1, 0);
+        var scope = try vm.openRootScope(2, 0);
         defer scope.close();
         // Generational mode; a full collect promotes the rooted owner
         // OLD/black so every gen reserve arms for a young/white metatable.
@@ -5436,7 +5494,7 @@ test "c api lua_setmetatable OOM transaction matrix (table + userdata, every res
         defer lua_close(L);
         const vm = L.vm;
         var s = api.State.fromHandle(L);
-        var scope = try vm.openRootScope(1, 0);
+        var scope = try vm.openRootScope(2, 0);
         defer scope.close();
         _ = luazigGcFixed(L, 7, 0); // LUA_GCGENERATIONAL
         _ = luazigGcFixed(L, 2, 0); // LUA_GCCOLLECT

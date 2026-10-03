@@ -184,7 +184,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   historical ELF rewrite remains an explicit owner decision; the files
   are untracked from `cc03d60` onward.
 
-- [ ] **F1 GC public-entry correction — Zig `State.gc` panics on a relayed
+- [x] **F1 GC public-entry correction — Zig `State.gc` panics on a relayed
   MAIN-destined error (BLOCKER, FIX-NOW; review of `cc03d60`, 2026-10-03).**
   `api.State.gc` (`api.zig:468`) calls `Vm.apiGc` → the new infallible
   `Vm.gcControl` wrapper (`vm.zig:7544`), whose `MainDestined` arm calls
@@ -196,7 +196,9 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   C differential; audit the newly reachable no-handler `lua_gc` path so
   `atpanic` receives PUC's original throwing `lua_State` (currently
   `cRelayMainDestined` passes MAIN at `c_api.zig:1793`). Keep G1–G7 and
-  main-GC C7 parity. See the root `prompt.md` for bounded scope.
+  main-GC C7 parity. CLOSED by `216502d` as recorded in the GC-ENTRIES
+  CORRECTION paragraph above; this paragraph preserves the review's
+  original negative-before evidence.
 
 - [x] **C-S3 correction: ERRMEM из живой C-continuation портит TBC slot
   при `lua_resume` (BLOCKER, FIX-NOW; review `9057be2`).** Suite 39
@@ -344,17 +346,228 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   live-block transition нужны до implementation; см. радар
   `ARCHITECTURE_DEBT.md` (Embedding §1).
 
-- [ ] **Stdlib completeness: `package.searchers` отсутствует, `require`
-  использует hardcoded search path (BLOCKER, pre-existing,
-  ARCHITECTURAL-BACKLOG).** PUC создаёт ordered table из preload/Lua/C/
-  Croot searchers и вызывает её актуальное содержимое при `require`;
-  Zig не публикует `package.searchers`, а `builtinRequire` лишь
-  проверяет тип подставленной таблицы и продолжает собственный путь.
-  Reviewer oracle `/tmp/reviewer_langfull.lua`: PUC `searchers table`,
-  custom loader `true 73`; Zig `searchers nil`, custom loader `false`.
-  Контроль `package.preload` в `/tmp/reviewer_langfull2.lua` работает
-  на обеих реализациях. Нужен единый изменяемый owner searcher chain,
-  включая loader data, порядок, ошибки и re-entry; см. радар.
+- [x] **Stdlib completeness: `package.searchers`/`require` parity
+  (BLOCKER, correction после implementation).** Миграция
+  `ba3f80d`→`d41e8c1` (ветка `research/package-loader-architecture`,
+  2026-10-03) удалила hardcoded поиск, но ревью `09343cc` дало
+  CORRECT: новый путь имеет GC UAF, недостаточный reserve roots и
+  обходит метаметоды полей. Correction завершена: `8539d27` (roots),
+  `e1e172e` (field semantics), `8edc3e8` (C-result ownership) — все
+  четыре исходных blocker-пункта ниже закрыты focused proofs. Ревью
+  correction `b8621d2`: CORRECT — обязательный C API differential gate
+  suite 40 красный; закрыт gate-корrection'ом (env-гейт диагностики +
+  ненулевой exit, пункт suite 40 ниже) — дифференциал 40 зелёный на
+  Debug и ReleaseFast. Review `5aa218b`: CORRECT — доказанный GC-key
+  UAF в `cGetField`/`cSetField` (пункт ниже); закрыт key-rooting
+  correction'ом (RootScope на всём key lifetime, постоянные
+  boundary-proof тесты get/set, мутационно чувствительны) — батарея
+  зелёная (unit 361/361 D+RF, smoke, matrix, c_api+40, api580;
+  perf A/B require-микса ≈0). Milestone закрыт. Новая
+  PUC-модель — `openPackageLibrary` (свежая package table на каждый
+  вызов, registry `_LOADED`/`_PRELOAD` get-or-create, 4 searcher
+  C-closure + require C-closure с upvalue = эта таблица, публикация
+  `_G.require`), `llRequire`/`findloader`/searcher-impls поверх общих
+  `searchpathCore`/`loadfuncCore`; legacy `builtinRequire`/`tryCLoad`/
+  `BuiltinId.require` удалены (−387 строк). Evidence: 21 research-оракул
+  + 3 пробы byte-identical PUC (Debug+ReleaseFast, identities
+  `/tmp/plr_oracles/BUILD.txt`); постоянные тесты smoke
+  92/93 (searchers-семантика, реальные C-loaders) и c_api
+  40_package_openf (openf identity/upvalue/requiref-кеш/
+  openselectedlibs-битмаски/OOM-rollback N=1..40, оба рантайма
+  0 failures); matrix --testc 33 pass (big.lua both_fail pre-existing);
+  smoke 93/93; unit 359/359. Research-пункты ниже (GC-poison,
+  yield-through, кеш-арity/тексты) закрыты той же миграцией.
+  Исходная формулировка (до research): PUC создаёт ordered table из
+  preload/Lua/C/Croot searchers и вызывает её актуальное содержимое;
+  Zig не публиковал `package.searchers`, builtinRequire шёл hardcoded
+  путём; reviewer oracle `/tmp/reviewer_langfull.lua` (`searchers
+  table`, custom loader `true 73` vs Zig `false`).
+
+- [x] **`require`: неукоренённые свежие строки в окне GC —
+  детерминированный poison loader-data (BLOCKER, pre-existing).**
+  CLOSED (миграция `d41e8c1`): вся новая модель (`llRequire`,
+  `findloader`, searcher-impls, `packageShimReturn`) держит каждое
+  промежуточное Value в `RootScope` на всём окне жизнь — per-iteration
+  scope в findloader (searcher через `apiCall`, свежие результаты через
+  append), scope в каждом impl, result-rooting в shim-хвосте
+  (emergency-GC в `cWindowPush`). Positive-after: оракул
+  `/tmp/plr_oracles/cases/19_gc_pressure.lua` чист в Debug и RF
+  (negative-before: Debug 0xAA×40 детерминированно 5/5 на identity
+  `9eb2a381…`); постоянный gc-in-loader блок в smoke 92.
+
+- [x] **`require` пропускает yield из loader/searcher и теряет контракт
+  (HIGH, pre-existing).** CLOSED (миграция `d41e8c1`): вызовы searcher
+  и loader идут через `apiCall(.nonyieldable, …)` — общий owner
+  C-boundary (не собственный unit в shim'ах, двойной вход запрещён);
+  yield-попытка даёт PUC-exact `attempt to yield across a C-call
+  boundary` на yield-сайте. Positive-after: оракулы 16/17 byte-identical
+  PUC (resume1 ok=false, корутина dead, loaded не записан); постоянные
+  yield-searcher/yield-loader блоки в smoke 92. Побочно устранён класс
+  «результаты loader'а идут в call-site через degenerate k==NULL
+  `finishCcall`» — путь больше не существует.
+
+- [x] **`require`: кеш-арity, тексты ошибок и коэрсинг расходятся с PUC
+  (HIGH, pre-existing).** CLOSED (миграция `d41e8c1`): кеш-hit — ровно
+  1 значение (`llRequire`), fresh load — ровно 2; `shimCheckStringArg`
+  даёт `bad argument #1 to 'require' (string expected, …)` +
+  number-coercion; not-found/arg-ошибки — where-prefixed
+  (`failArgerror`); `packagePathString` — `'package.%s' must be a
+  string` + коэрсинг числа в path; Croot ERRFUNC — `no module '%s' in
+  file '%s'`. Positive-after: оракулы 08/09/10/13/14/15/18/22
+  byte-identical PUC; exact-блоки в smoke 92. Поправка к исходной
+  формулировке (e): preload-значение non-function НЕ даёт `attempt to
+  call` — PUC `findloader` классифицирует первый результат searcher'а
+  (function → loader; string/number → сообщение not-found; прочее —
+  молчаливый skip); прежний «молчаливый else» расходился именно
+  missing-классификацией (число/строка не попадали в сообщение), что
+  миграцией устранено.
+
+- [x] **Package loader: GC UAF при мутации `package.searchers`
+  (BLOCKER, introduced, FIX-NOW).** CLOSED (correction `8539d27`):
+  `findloader` держит выбранную таблицу searchers в собственном
+  RootScope на весь цикл поиска (per-iteration scope вложен; searcher
+  может удалить `package.searchers` и запустить full GC — таблица
+  жива, содержимое перечитывается каждый rawGet, nil-stop сохранён);
+  `llRequire` дополнительно укореняет `loaded_tbl` (оба владельца
+  registry/package Lua-мутабельны — тот же класс). Positive-after:
+  smoke 92 `searchers-lifetime` PUC-identical (`1 nil`), оракулы
+  byte-identical Debug+RF. Raw negative (panic `switch on corrupt
+  value`, rc=134) воспроизведён координатором до исправления.
+
+- [x] **Package loader: недостаточный RootScope reserve конструктора
+  (BLOCKER, introduced, FIX-NOW).** CLOSED (correction `8539d27`):
+  reserve 8→11 по формуле construction flow; RootScope получил
+  `reserved_values`/`reserved_cells` debug-assert на
+  protect-outside-reserve — архитектурный guard для всех
+  construction-сайтов (поймал 2 латентных тест-сайта того же класса:
+  P16.50-review-11 3, setmetatable OOM matrix). Exact-capacity и OOM
+  rollback покрыты 40 STEP 6/7.
+
+- [x] **Package loader: raw field access вместо Lua field semantics
+  (BLOCKER, introduced, FIX-NOW).** CLOSED (correction `e1e172e`):
+  `cGetField`/`cSetField` примитивы (fast raw путь без metatable;
+  slow path — nonyieldable `__index`/`__newindex` цепочки через
+  `indexValue`/`setIndexValue`, yield из метаметода = PUC boundary
+  error) заменяют raw-адаптеры во всех PUC `lua_getfield`/
+  `lua_setfield` точках package-пути: llRequire (кеш/перезапись/
+  записи/финал), findloader (searchers), packagePathString (path/
+  cpath), searcherPreloadImpl, registrySubtable (aware publication
+  по lauxlib.c:986–997); raw остался только в findloader-итерации
+  (PUC `lua_rawgeti`). Positive-after: smoke 92 meta-loaded-index/
+  path/newindex/yield/nested блоки PUC-identical; оракулы
+  02/08/14/16/19 byte-identical Debug+RF.
+
+- [x] **Package loader: C-result ownership на OOM/re-entry
+  (HIGH, introduced, FIX-NOW).** CLOSED (correction `8edc3e8`):
+  per-activation owner `CFrameState.c_result_transport` (heap-cell;
+  повторный reserve освобождает резерв СВОЕГО фрейма, normal return
+  потребляет эпилогом, error/yield/thread-switch/forced-close
+  освобождают через arms `callCFunction` + централизованный
+  `freeCFrameOwnedState`; Thread-singleton удалён); `packageShimReturn`
+  явно освобождает owned slice до каждого OOM `_longjmp`; `errdefer`
+  на всех 7 owned-result сайтах с fallible-шагами после аллокации
+  (`llRequire`, searcher miss-пути — класс пойман новым balance-тестом:
+  negative-before `live=8`). Positive-after: 40 STEP 6/7 — наблюдаемые
+  errmem/success окна (zig 28/12 и 24/16, puc 11/29 и 6/34), alloc/free
+  balance `live=0` после `lua_close` на обоих рантаймах, nested
+  `_LOADED.__newindex` require + OOM на внешнем возврате с recovery
+  и повторным использованием VM.
+
+- [x] **Package loader: suite 40 в `DIFF_TESTS` печатает несовпадающие
+  allocation counts (BLOCKER, introduced by correction, FIX-NOW).**
+  CLOSED (gate correction, 2026-10-03): engine-dependent RESULT-строки
+  (saw_errmem/saw_success/N-диапазоны/alloc-free balance STEP 6/7)
+  выведены из канонического stdout за env-гейт `LUACORACLE_RAW=1`
+  (диагностика доступна для raw evidence, в lane отсутствует);
+  все семантические class-ассерты (ERRMEM и success наблюдаются,
+  поздние точки, классификация всех N, recovery, `live==0` после
+  `lua_close`) остались безусловными и побайтово совпадают; suite 40
+  остался в `DIFF_TESTS`; `main` теперь возвращает nonzero при
+  failures (negative-mutation: временно сломанный ассерт → `ORACLE: 1
+  failures`, rc=1; восстановление → rc=0). Positive-after: точный
+  `diff -u` zig-vs-puc rc=0 на финальных Debug и ReleaseFast
+  (per-config пересборка) при `ORACLE: 0 failures` у обоих;
+  `make test TESTS=40_package_openf` зелёный. Полный `make test-diff`
+  останавливается раньше на pre-existing `14_state_handles` (SIGABRT,
+  воспроизведён до миграции — отдельный открытый пункт), не связан с
+  suite 40.
+
+- [x] **`cGetField`/`cSetField`: свежий длинный ключ собирается до
+  стейджинга Lua-метаметода (BLOCKER, FIX-NOW; review `5aa218b`).**
+  CLOSED (key-rooting correction, 2026-10-03): `cSetField` держит
+  `RootScope(3)` (table+key+value) с reserve до fallible intern и
+  infallible публикацией после — на всём окне включая fast-path
+  tableSetValue (MayGC rehash) и slow-path стейджинг;
+  `cGetField` — `RootScope(2)` (table+key) на slow-ветви: между
+  intern и публикацией ноль MayGC-шагов (raw-чтения и flags-probe;
+  openRootScope — NoGC infra), инвариант «резерв до создания,
+  публикация infallible» сохранён, fast-path кеш-чтения без scope
+  (perf A/B require-микса ≈0 после оптимизации; первая форма с
+  безусловным scope дала +5.7% — устранено). Проверки: постоянные
+  deterministic unit-пробы «package field key rooted across
+  metamethod staging (get/set)» на capacity boundary
+  `th.top=stack.len-2` с one-shot отказом + emergency GC + успешным
+  retry (новый тест-режим `disarm_after_emergency` в
+  TestcAllocControl — test-инфраструктура, не product-ветка),
+  poison_unmap-детект dangling; set-проба покрывает ERRMEM-sticky +
+  recovery + no-GC контроль; обе мутационно чувствительны (откат
+  root-публикации → SIGSEGV/SIGABRT). Оригинальная форма доказательства
+  ревью (`/tmp/luazig-pkg-key-audit`, `/tmp/review_pkg_key_retry_rerun.log`)
+  сохранена как negative-before; внутренний unit-proof честно не
+  называется PUC-differential (boundary не выражается публичным API;
+  Lua-уровневые metamethod-семантики покрыты smoke 92 meta-блоками).
+  Батарея: unit 361/361 Debug+ReleaseFast, smoke PASS, matrix 31 pass
+  (big.lua both_fail pre-existing), c_api green кроме pre-existing
+  `14_state_handles`, suite 40 diff rc=0 (D+RF) + `live=0`, api580
+  GREEN, fmt/diff-check чисты; paired A/B instructions на
+  require-миксе (immutable RF-бинари A=`5aa218b`/B=fix): ≈0%.
+  Исходная формулировка дефекта: `internStr` создаёт новую long
+  string, держимую только в Zig-local; PUC публикует ключ на стеке
+  (auxgetstr/auxsetstr); `ensureBcStackCap` на boundary запускает
+  emergency GC до копирования args → dangling key в метаметоде,
+  SIGSEGV под poison/unmap.
+  REVIEW (2026-10-03, `c4e51fb`): ключевое окно закрыто; reviewer
+  independently rebuilt unit Debug and suite 40 Zig/PUC byte-parity.
+  MEDIUM / ORDINARY-BACKLOG contract note: `cSetField` roots `val`
+  only AFTER `internStr(name)`, which may run emergency GC. All current
+  product callers already root their GC values (registrySubtable's new
+  table, llRequire's loader result; the remaining call passes Bool), so
+  this does not invalidate the key-rooting correction. A future caller
+  with a fresh unrooted GC value must either root it before calling or
+  the helper must publish `val` before interning. The current set test
+  passes Int and does not prove this value-lifetime guarantee.
+
+- [ ] **Perf: `coroutine_yield` +12–14% instructions на всех 21 seeds —
+  pre-existing между `19b9626` (A1.0-correction, gate GREEN:
+  +0.7..+2.8%) и research-базой `0618a5c` (HIGH, UNCONFIRMED
+  origin).** Обязательный paired gate этапа package-loader вернул FAIL
+  только по этому workload (остальные 17 OK; temp_table_alloc −9..−11%
+  улучшение). Bisect-точка: сборка `0618a5c` (до миграции) даёт
+  1.1549e9 instructions ≈ post-migration 1.1705e9 (вклад этапа
+  ~+1.3%, в OK-пороге); baseline-центр 1.0265e9. Кандидатный диапазон:
+  `62588a7`..`c99a151` (F1 SyncCloseContext серия). Gate-сессия:
+  `tools/perf/current-gate.json` (baseline не обновлялся). Fate:
+  отдельное owner-расследование; следующий решающий эксперимент —
+  paired A/B `19b9626` vs `62588a7` на coroutine_yield.
+
+- [ ] **c_api 14_state_handles: zig-сборка падает assertion'ом
+  `check_window_is: lua_gettop(co) == want_top` (crash-класс
+  BLOCKER-кандидат, pre-existing).** Воспроизведено на `0618a5c` (до
+  миграции package-loader; puc-сборка ALL PASS). Точка:
+  `14_state_handles.c:787`, `test_hook_yield_window_general`
+  («hy-line-entry» ждёт top 3). Блокирует полный `make -C tests/c_api
+  test-diff` lane (остальные suites зелёные при отдельном прогоне).
+  Fate: отдельный correction-cut (вероятно соседствует с hook/yield
+  window работой); не переносит этап package-loader.
+
+- [ ] **`luaL_openselectedlibs(L, 0, mask)`: globals публикуются eagerly
+  init'ом — preload-only режим видит глобалы (MEDIUM, embedding
+  parity).** PUC: preload-bit кладёт только `_PRELOAD[name]`; глобал
+  появляется после load. luazig `bootstrapGlobals` всегда публикует все
+  stdlib-глобалы (eager-init модель). Постоянный C-оракул
+  `tests/c_api/40_package_openf.c` фиксирует расхождение исключением
+  STEP-проверки. Fate: ARCHITECTURAL-BACKLOG (eager-init →
+  openselectedlibs-driven публикация — отдельное embedding-решение).
 
 - [ ] **Stdlib completeness: `string.gmatch` не даёт независимые
   итераторы (BLOCKER, pre-existing, ARCHITECTURAL-BACKLOG).**

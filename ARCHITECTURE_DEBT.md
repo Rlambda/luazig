@@ -275,6 +275,67 @@ parity-дефектом; F3 (forced-close region ownership) закрыт `9b1bad
    α+ε как одна owner-миграция до β→γ→δ. Исходный α→β→γ→δ→ε
    небезопасен как публикуемые зелёные cut'ы, поскольку γ делает
    split-owner наблюдаемым до ε.
+4. **`package.searchers`/`require` owner — implementation требует
+   correction (`ba3f80d`→`09343cc`, ревью 2026-10-03).** Hardcoded
+   путь удалён, но новый путь имеет GC UAF при мутации searchers,
+   недостаточный reserve GC roots, raw field access вместо
+   `lua_getfield`/`lua_setfield` и C-result ownership риск при OOM/
+   re-entry; **product-correction выполнена (`8539d27` roots,
+   `e1e172e` field semantics, `8edc3e8` C-result ownership), но
+   ревью `b8621d2` дало CORRECT: suite 40 внутри `DIFF_TESTS` печатает
+   несравнимые allocator counts. Gate исправлен `5aa218b`; ревью
+   подтвердило GC-key UAF в новом `cGetField`/`cSetField` — закрыт
+   key-rooting correction'ом (RootScope на всём key lifetime:
+   slow-path scope в cGetField с доказанным нулём MayGC между intern
+   и публикацией; полный scope в cSetField поверх fast-path rehash;
+   постоянные boundary-proof тесты, мутационно чувствительны;
+   perf A/B require-микса ≈0); milestone закрыт**
+   (STATUS). Целевая PUC 5.5 модель (реализована): `openPackageLibrary`
+   (vm.zig) — свежая package table на каждый вызов (включая повторный
+   `luaopen_package`), registry `_LOADED`/`_PRELOAD` get-or-create,
+   ровно 4 searcher C-closure + require C-closure с upvalue = эта
+   таблица; `llRequire`/`findloader` (rawgeti до первого nil,
+   isfunction/isstring-классификация, число = string-message,
+   `\n\t`-аккумуляция с buffsub-откатом); вызовы searcher/loader через
+   `apiCall(.nonyieldable)`; infallible return-tail
+   (`cReturnTailReserve`: окно+scope+transport до публикаций
+   `_G.require`/`_LOADED` — post-publication хвосты C-активаций без
+   аллокаций, PUC poscall-инвариант); legacy hardcoded путь и
+   `BuiltinId.require` удалены. `luaL_requiref` — registry-кеш с
+   идемпотентностью (lauxlib.c:1006–1023). Evidence: оракулы
+   byte-identical (21 кейс+3 пробы, D+RF), c_api 40 (openf/requiref/
+   openselectedlibs/OOM-rollback N=1..40), smoke 92/93, unit 359/359.
+   Residuals: (a) CLIBS lifetime — handles в Vm-поле никогда не
+   закрываются; PUC 5.5 external-string `freelib` вызывается при
+   dealloc library string, в т.ч. `luaC_freeallobjects` при
+   `lua_close` (loadlib.c:335–365, lgc.c:872–876) — предыдущая оценка
+   «unload фактически никогда» была неверна: наблюдаемое расхождение
+   существует ровно на lua_close (память/handle leak при закрытии
+   state с открытыми .so). Механизм external strings в luazig есть —
+   перенос CLIBS на registry `_CLIBS` + external-string dealloc
+   остаётся отдельным малым cut'ом; судьба ORDINARY-BACKLOG.
+   (b) `luaL_openselectedlibs(L, 0, mask)` — eager-init публикация
+   globals (embedding parity, см. STATUS). (c) loadlib-детали ошибок —
+   синтетические тексты (`cannot open`/`symbol … not found`) vs PUC
+   raw `dlerror()` — наследованный публичный контракт
+   `package.loadlib`, не тронут миграцией (низкий приоритет: текст
+   dlerror не стабилен между libc). (d) `lua_pushcfunction` n=0 OOM
+   вне C-boundary — известный пункт FO6 (STATUS), репро подтверждено
+   при OOM-тестировании этапа. (e) aware-метаметоды через общий
+   c_api `lua_getfield`/`lua_setfield` из C-функции в корутине идут
+   без собственного nonyieldable-юнита (package-путь закрыт
+   собственными `cGetField`/`cSetField`; общая c_api-тема — вне
+   package scope). (f) suite 40 в `DIFF_TESTS` зелёный: engine-
+   dependent диагностика (ERRMEM/success split, N-диапазоны, alloc/
+   free balance STEP 6/7) — за env-гейтом `LUACORACLE_RAW=1` (raw
+   evidence вне побайтовой lane); suite возвращает nonzero при
+   failures. (g) GC-root окно свежего длинного ключа в
+   `cGetField`/`cSetField` подтверждено как BLOCKER/FIX-NOW и
+   закрыто key-rooting correction'ом: ключ и его соседи по окну
+   укоренены RootScope'ом до первого MayGC-шага пути (STATUS:
+   постоянные boundary-proof тесты с one-shot emergency-retry,
+   мутационно чувствительны). PUC держит ключ на стеке `auxgetstr`;
+   Zig-эквивалент — root-публикация до стейджинга метаметода.
 
 ## Не-parity архитектурный backlog
 

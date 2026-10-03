@@ -120,6 +120,26 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   binaries repo condition; decoded-string-literal codegen; pristine
   parser underscore-literal.
 
+- [ ] **F1 GC review correction — GC on a coroutine consumes a MAIN-destined
+  cross-thread closer error at the wrong boundary (BLOCKER, FIX-NOW;
+  review of `2d3aa34`, 2026-10-03).** The F1 `CLOSED` claim above is
+  suspended until this changed path has PUC parity. In `vm.zig:11133`,
+  `gcCallFinalizerProtected` catches every `error.MainDestined`, transfers
+  MAIN's error object back to the GC-running coroutine, restores its
+  finalizer frame and warns. PUC `GCTM` protects only that coroutine;
+  `luaD_throw` resets the unprotected target and rethrows on MAIN,
+  bypassing the coroutine's GCTM protection. Independent C oracle
+  `/tmp/f1_gc_repro.c` (`/tmp/f1_gc_{puc,zig}_exact`, statically linked
+  against the repository PUC 5.5.0 and final Zig libraries): PUC reports
+  main `pcall` false/`closer-boom` and leaves the worker unfinished;
+  Zig warns, returns
+  from `collectgarbage`, and completes the worker. The accepted F1 prompt
+  explicitly required a coroutine-GC owner-boundary differential; suite
+  40 covers GC on MAIN only. Correct the GC transport/terminal boundary
+  and add permanent D+RF PUC differential coverage, preserving main-GC C7.
+  The correction must also remove the two ELF outputs for suite 40 from
+  the milestone commits as required by `AGENTS.md` (source-only test).
+
 - [x] **C-S3 correction: ERRMEM из живой C-continuation портит TBC slot
   при `lua_resume` (BLOCKER, FIX-NOW; review `9057be2`).** Suite 39
   W-OOM проверяет только status и top error, поэтому пропускает close:
@@ -186,7 +206,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   changed error-channel path fails the independently verified nested
   coroutine-caller shape below; the full F1 invariant remains open.
 
-- [ ] **F1 review correction: cross-thread closer error from a coroutine
+- [x] **F1 review correction: cross-thread closer error from a coroutine
   caller reaches the wrong protected boundary (BLOCKER, FIX-NOW).**
   Independent C API differential `/tmp/reviewer_f1_corocaller.c` on
   `c99a151`: a suspended target coroutine owns a TBC mark; a second
@@ -199,11 +219,11 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   st=0`, caller becomes dead. First wrong operation is selecting the
   immediate caller rather than PUC's main-thread armed boundary in
   `vm.zig:crossCloseErrorRaise`; the product comment already documents
-  the divergence. The F1 cut's error-channel invariant and acceptance
-  are unfulfilled. Correction prompt: root `prompt.md`; retain the
-  accepted successful-close behavior and suite 39 coverage. The
-  pre-existing `lua_toclose` cross-thread mark-placement defect remains
-  outside this correction.
+  the divergence. At `c99a151` the F1 cut's error-channel invariant and
+  acceptance were unfulfilled. The typed transport in `2d3aa34` fixes
+  this original caller-boundary shape (suite 40 P1-P3); the new F1 GC
+  correction above keeps the milestone open. The pre-existing
+  `lua_toclose` cross-thread mark-placement defect remains outside it.
 
 - [ ] **Cross-thread `lua_toclose(L, idx)` mark placement (BLOCKER,
   ORDINARY-BACKLOG; pre-existing).** `c_api.zig:lua_toclose` resolves

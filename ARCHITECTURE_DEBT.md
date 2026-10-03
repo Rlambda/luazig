@@ -202,6 +202,13 @@ acceptance и open-count задаёт `STATUS.md`. Запись из радар�
    lua_resume OOM-fold, caller death finalization, testC -1 sentinel,
    66 f1res-комментариев). Suite 40_maindestined_transport IDENTICAL
    PUC D+RF. Пункт STATUS закрыт `d712650`.
+   REVIEW CORRECTION (2026-10-03): the `EXECUTED`/closed claim is
+   provisional. `gcCallFinalizerProtected` consumes a MAIN-destined error
+   while GC runs on a coroutine, whereas PUC bypasses that coroutine's
+   GCTM protection and rethrows on MAIN. The independent C differential
+   and correction scope are recorded in `STATUS.md` under F1 review
+   correction. Do not advance the boundary roadmap until this changed
+   terminal path has parity.
 
 F2 (`lua_settop`/`lua_closeslot` error transport) остаётся открытым bounded
 parity-дефектом; F3 (forced-close region ownership) закрыт `9b1bad7`.

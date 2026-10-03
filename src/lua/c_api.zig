@@ -254,8 +254,10 @@ pub fn luaNewThreadTx(parent: *vm_mod.lua_State, vmp: *Vm) error{ OutOfMemory, R
         // The growth path (growBcStackCapSlow → reallocBcStackArrays) is
         // pure allocation — no dispatch, no Lua code, no GC step — so
         // error.Yield is unreachable here (same provably-non-yieldable
-        // contract as lua_closeslot's apiCall arm).
+        // contract as lua_closeslot's apiCall arm). MainDestined is
+        // unreachable by the same proof (no user code runs).
         error.Yield => unreachable,
+        error.MainDestined => unreachable,
     };
     const th = try vmp.alloc.create(vm_mod.Thread);
     // Full teardown — the allocStateHandle failure window
@@ -399,6 +401,11 @@ pub export fn lua_closethread(L: ?*lua_State, from: ?*lua_State) c_int {
             return 2;
         },
         error.Yield => return 2,
+        // a main-destined closer error raised inside the close's
+        // __gc/__close metamethods re-throws on MAIN's armed boundary
+        // (PUC ldo.c:130-138) — lua_closethread's status return never
+        // happens; the C caller of lua_closethread is abandoned. Relay.
+        error.MainDestined => cRelayMainDestined(vm),
     };
 
     if (result.status == 0) {
@@ -647,6 +654,11 @@ pub export fn lua_callk(
                 }
                 @panic("lua_call OOM without an active C-function boundary");
             },
+            // a main-destined closer error from the callee relays
+            // across this C frame (longjmp value 4) toward MAIN's armed
+            // boundary — this activation becomes a zombie (PUC ldo.c
+            // re-throw bypasses it).
+            error.MainDestined => cRelayMainDestined(vm),
         }
     };
     vm.alloc.free(call_args);
@@ -721,6 +733,9 @@ fn lua_callkImpl(L: ?*lua_State, nargs: c_int, nresults: c_int) void {
                 }
                 @panic("lua_call OOM without an active C-function boundary");
             },
+            // relay a main-destined closer error across this C
+            // frame toward MAIN's armed boundary (zombie activation).
+            error.MainDestined => cRelayMainDestined(vm),
         }
     };
     vm.alloc.free(args);
@@ -990,6 +1005,9 @@ pub export fn lua_load(
     const result = vm.loadChunk(.{ .owned = owned_bytes }, owned_bytes, name, mode_slice, env, null) catch |err| switch (err) {
         error.OutOfMemory => return statusCode(.memory_error),
         error.RuntimeError, error.Yield => return statusCode(.runtime_error),
+        // loading never runs user code, so the kind is unreachable
+        // here — relay (never fold) if a regression ever produces one.
+        error.MainDestined => cRelayMainDestined(vm),
     };
     switch (result) {
         .closure => |cl| {
@@ -1322,27 +1340,48 @@ pub export fn lua_closeslot(L: ?*lua_State, idx: c_int) void {
             return;
         };
         var throw: ?api.ApiError = null;
+        // a MainDestined raised inside the closer (a NESTED
+        // cross-thread close) or by this close's own finalize must relay
+        // to MAIN's armed boundary after the context restore — never fold
+        // into a caller-local throw (PUC: the inner luaD_throw longjmped
+        // straight to main, abandoning this close's error handling).
+        var relay_main_destined = false;
         {
             defer vm.restoreSyncCloseContext(ctx);
             _ = vm.apiCall(.nonyieldable, mm.?.*, call_args[0..]) catch |e| switch (e) {
                 // .nonyieldable contract: apiCall never reports error.Yield here.
                 error.Yield => unreachable,
+                error.MainDestined => {
+                    // A nested main-destined raise already finalized its
+                    // target and installed main's err state — no second
+                    // finalize here.
+                    relay_main_destined = true;
+                },
                 else => {
                     // PUC luaD_throw on the target (no armed boundary of
                     // its own): resetthread semantics + re-raise on the
                     // caller. The arm's normal exit IS the re-raise; a
                     // machinery OOM inside it overrides the transport kind.
                     const fe: Value = if (th.err_has_obj) th.err_obj else .Nil;
-                    const arm_err = if (vm.crossCloseErrorRaise(ctx, th, fe)) error.RuntimeError else |re| re;
-                    throw = if (arm_err == error.OutOfMemory or e == error.OutOfMemory)
-                        error.OutOfMemory
-                    else
-                        error.Runtime;
+                    const arm_err = if (vm.crossCloseErrorRaise(ctx, th, fe)) error.MainDestined else |re| re;
+                    if (arm_err == error.MainDestined) {
+                        // the finalize succeeded — the re-raise is
+                        // main-destined (PUC ldo.c:130-138).
+                        relay_main_destined = true;
+                    } else {
+                        throw = if (arm_err == error.OutOfMemory or e == error.OutOfMemory)
+                            error.OutOfMemory
+                        else
+                            error.Runtime;
+                    }
                 },
             };
         }
-        // Caller context restored: cThrowOn reads the caller's error object
-        // (installed by crossCloseErrorRaise above).
+        // Caller context restored: a main-destined relay jumps to the
+        // innermost pad (the object is in MAIN's err state); an ordinary
+        // throw reads the caller's error object installed by
+        // crossCloseErrorRaise above.
+        if (relay_main_destined) cRelayMainDestined(vm);
         if (throw) |te| cThrowOn(vm, h, te);
         return;
     }
@@ -1351,6 +1390,9 @@ pub export fn lua_closeslot(L: ?*lua_State, idx: c_int) void {
         error.Yield => unreachable,
         error.OutOfMemory => cThrowOn(vm, h, error.OutOfMemory),
         error.RuntimeError => cThrowOn(vm, h, error.Runtime),
+        // a nested main-destined raise inside the closer (a
+        // cross-thread op on another L) relays to MAIN's boundary.
+        error.MainDestined => cRelayMainDestined(vm),
     };
 }
 
@@ -1387,6 +1429,9 @@ pub export fn luaL_loadbufferx(L: ?*lua_State, buff: [*]const u8, sz: usize, nam
     const result = vm.loadChunk(.{ .borrowed = buff[0..sz] }, buff[0..sz], std.mem.span(name), mode_slice, env, null) catch |err| switch (err) {
         error.OutOfMemory => return statusCode(.memory_error),
         error.RuntimeError, error.Yield => return statusCode(.runtime_error),
+        // loading never runs user code, so the kind is unreachable
+        // here — relay (never fold) if a regression ever produces one.
+        error.MainDestined => cRelayMainDestined(vm),
     };
     switch (result) {
         .closure => |cl| {
@@ -1488,6 +1533,14 @@ pub export fn luaL_loadfilex(L: ?*lua_State, filename: [*:0]const u8, mode: ?[*:
             if (prefixed_buf) |b| vm.alloc.free(b);
             return statusCode(.runtime_error);
         },
+        // loading never runs user code — relay (never fold) if a
+        // regression ever produces the kind here.
+        error.MainDestined => {
+            vm.alloc.free(source.name);
+            if (!source_bytes_freed_by_load) vm.alloc.free(source.bytes);
+            if (prefixed_buf) |b| vm.alloc.free(b);
+            cRelayMainDestined(vm);
+        },
     };
     // source.name is borrowed during loadChunk; free it now (loadChunk has
     // either copied it for text or ignored it for binary).
@@ -1558,6 +1611,10 @@ pub export fn lua_settop(L: ?*lua_State, idx: c_int) void {
         // error escapes lua_settop to the enclosing boundary (LUA_ERRRUN).
         // InvalidIndex is PUC api_check — lenient.
         error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        // a cross-thread closer error finalized by the truncation
+        // close is destined for MAIN's armed boundary — relay across this
+        // C frame (longjmp value 4), never a caller-local throw.
+        error.MainDestined => cRelayMainDestined(s.vm),
         else => {},
     };
 }
@@ -1570,6 +1627,8 @@ pub export fn lua_pop(L: ?*lua_State, n: c_int) void {
     // otherwise (see block note).
     s.pop(@intCast(n)) catch |e| switch (e) {
         error.OutOfMemory, error.Runtime => cThrowOn(s.vm, L.?, e),
+        // see lua_settop — relay to MAIN's armed boundary.
+        error.MainDestined => cRelayMainDestined(s.vm),
         else => {},
     };
 }
@@ -1707,6 +1766,35 @@ pub export fn lua_pushlightuserdata(L: ?*lua_State, p: ?*anyopaque) void {
 /// luaD_rawrunprotected analogue) and, with no anchor, calls the
 /// `atpanic` hook then aborts. Matches the existing lua_callkImpl OOM
 /// arm (which sets c_error_value = .Nil and _longjmps).
+/// typed transport: relay a main-destined closer error across the
+/// current C frame to its landing pad (PUC ldo.c:130-138: the re-throw on
+/// MAIN's armed boundary, bypassing every intermediate frame). The error
+/// object is already canonically owned by MAIN's thread error state
+/// (installed by `crossCloseErrorRaise` before the kind started
+/// propagating) — the jump carries NO payload, only the signal (longjmp
+/// value 4); the landing pad's `.main_destined` arm propagates
+/// `error.MainDestined` without touching the error state, leaving the
+/// crossed C activation a zombie (PUC abandons it). The jump crosses
+/// exactly ONE C frame — from this shim to the innermost landing pad —
+/// never arbitrary Zig defers. Without an active pad there is no armed
+/// boundary on the path: PUC aborts through the panic hook on the MAIN
+/// thread with the object at its top; mirror that (best-effort publish of
+/// the in-flight object onto main's window, then the hook and the
+/// terminal panic).
+fn cRelayMainDestined(vm: *Vm) noreturn {
+    if (vm.c_error_jmp) |jb| {
+        _longjmp(@ptrCast(jb), 4);
+    }
+    const mt = vm.main_thread.?;
+    if (mt.err_has_obj) {
+        vm.cWindowPush(mt, mt.err_obj) catch {};
+    }
+    if (mt.api_handle) |mh| {
+        cPanicOn(vm, mh, null);
+    }
+    @panic("main-destined error without an armed C-function boundary");
+}
+
 fn cThrowOn(vm: *Vm, throwing: *vm_mod.lua_State, err: api.ApiError) noreturn {
     // P16.50-review-3 HIGH: the throwing STATE is explicit — cPanic used
     // vm.cur_handle which may differ from the L an exported API received
@@ -1760,6 +1848,10 @@ fn cThrowOn(vm: *Vm, throwing: *vm_mod.lua_State, err: api.ApiError) noreturn {
             }
             cPanicOn(vm, throwing, null);
         },
+        // a main-destined closer error is never a caller-local
+        // throw — relay it across the current C frame toward MAIN's armed
+        // boundary (the object is already in main's err state).
+        error.MainDestined => cRelayMainDestined(vm),
     }
 }
 
@@ -2320,7 +2412,18 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
     // window truncated every C-API resume to 63 results (PUC lua_resume
     // returns ALL results on the stack). Freed via vm.alloc.free (the
     // charged-block registry passes infraAlloc'd blocks through).
-    const res = vm.apiResumeThread(co, args) catch {
+    const res = vm.apiResumeThread(co, args) catch |e| {
+        // typed transport: a main-destined closer error escaping the
+        // resume (the driven coroutine's caller frames are zombies; the
+        // object is in MAIN's err state) relays across this C frame to the
+        // innermost landing pad (PUC ldo.c:130-138: the re-throw on MAIN's
+        // armed boundary — lua_resume's own error publication NEVER runs
+        // for it). The cur_handle restore is manual: the relay's longjmp
+        // bypasses the defer above.
+        if (e == error.MainDestined) {
+            vm.cur_handle = saved_cur_handle;
+            cRelayMainDestined(vm);
+        }
         // apiResumeThread itself failed (owned-slice OOM): the resume's
         // error tail already ran inside apiResumeThread (the thread is
         // dead with its error latched); PUC's transport is infallible
@@ -2518,6 +2621,10 @@ pub export fn lua_yieldk(L: ?*lua_State, nresults: c_int, ctx: isize, k: ?*const
             vm.setOutOfMemoryError();
             return 4;
         },
+        // relay a main-destined closer error toward MAIN's armed
+        // boundary (the yield machinery itself never raises it; the arm
+        // keeps the kind unfolded if a nested path ever produces one).
+        error.MainDestined => cRelayMainDestined(vm),
     };
     return 1; // LUA_YIELD — shouldn't happen
 }
@@ -2643,10 +2750,18 @@ pub export fn lua_pcallk(
             wth0.errfunc = abs0;
             defer wth0.errfunc = saved0;
             var s = api.State.fromHandle(h);
-            return statusCode(s.pcall(@intCast(@max(nargs, 0)), nresults));
+            // a conventional pcall never consumes a main-destined
+            // error on a non-main L — relay toward MAIN's boundary.
+            const st0 = s.pcall(@intCast(@max(nargs, 0)), nresults) catch |pe| switch (pe) {
+                error.MainDestined => cRelayMainDestined(vm),
+            };
+            return statusCode(st0);
         }
         var s = api.State.fromHandle(h);
-        return statusCode(s.pcall(@intCast(@max(nargs, 0)), nresults));
+        const st0 = s.pcall(@intCast(@max(nargs, 0)), nresults) catch |pe| switch (pe) {
+            error.MainDestined => cRelayMainDestined(vm),
+        };
+        return statusCode(st0);
     };
 
     if (k == null or !th.yieldable()) {
@@ -2661,10 +2776,17 @@ pub export fn lua_pcallk(
             wth1.errfunc = abs1;
             defer th.errfunc = saved_errfunc;
             var s = api.State.fromHandle(h);
-            return statusCode(s.pcall(@intCast(@max(nargs, 0)), nresults));
+            // see the no-thread arm above.
+            const st1 = s.pcall(@intCast(@max(nargs, 0)), nresults) catch |pe| switch (pe) {
+                error.MainDestined => cRelayMainDestined(vm),
+            };
+            return statusCode(st1);
         } else {
             var s = api.State.fromHandle(h);
-            return statusCode(s.pcall(@intCast(@max(nargs, 0)), nresults));
+            const st1 = s.pcall(@intCast(@max(nargs, 0)), nresults) catch |pe| switch (pe) {
+                error.MainDestined => cRelayMainDestined(vm),
+            };
+            return statusCode(st1);
         }
     }
 
@@ -2764,6 +2886,12 @@ pub export fn lua_pcallk(
                 vm.setOutOfMemoryError();
                 return 4; // LUA_ERRMEM
             },
+            // a main-destined closer error bypasses the armed
+            // YPCALL frame (PUC ldo.c:130-138 — the re-throw is on MAIN's
+            // boundary; this pcallk's C-frame stays armed as a zombie,
+            // exactly like PUC's abandoned CIST_YPCALL activation) —
+            // relay across this C frame, no local cleanup.
+            error.MainDestined => cRelayMainDestined(vm),
         }
     };
     vm.alloc.free(call_args);

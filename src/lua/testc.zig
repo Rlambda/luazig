@@ -299,7 +299,12 @@ pub fn execute(st: *api.State, cmd: Command, args: []const []const u8) api.ApiEr
             if (args.len != 2) return error.InvalidState;
             const nargs = std.fmt.parseInt(usize, args[0], 10) catch return error.Type;
             const nresults = std.fmt.parseInt(i32, args[1], 10) catch return error.Type;
-            const stc = st.pcall(nargs, nresults);
+            // a main-destined closer error is never a local pcall
+            // failure — propagate the kind (the testC pad's -3 sentinel
+            // relays it toward MAIN's armed boundary).
+            const stc = st.pcall(nargs, nresults) catch |pe| switch (pe) {
+                error.MainDestined => return error.MainDestined,
+            };
             if (stc != .ok) return error.Runtime;
         },
         .next => {

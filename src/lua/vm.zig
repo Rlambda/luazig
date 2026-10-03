@@ -2552,6 +2552,27 @@ pub const Thread = struct {
     /// PUC `L->errfunc` (lstate.h:307): stack offset of error handler.
     /// ERRFUNC_NONE = no errfunc. Set by xpcall and pcallk.
     errfunc: StackOffset = ERRFUNC_NONE,
+    /// PUC `L->errorJmp != NULL` (ldo.c luaD_throw): this thread is
+    /// currently inside a protected call of its own — the fact luaD_throw
+    /// branches on to throw on the thread's OWN innermost armed boundary
+    /// instead of taking the resetthread + rethrow-on-main fallback.
+    /// Maintained by every boundary that arms PUC-style protection on its
+    /// thread: the CONVENTIONAL pcall lanes only (api.State.pcall —
+    /// lua_pcallk's `k == NULL || !yieldable(L)` branch runs luaD_pcall,
+    /// lapi.c:1095-1097; builtinPcall/builtinXpcall's `!defer_to_precover`
+    /// lane — the same branch) and callFinalizer (GCTM's luaD_pcall,
+    /// lgc.c:983). The yieldable pcallk branch deliberately arms NOTHING
+    /// (lapi.c: "call is already protected by 'resume'" — luaD_call, not
+    /// luaD_pcall): its recovery belongs to the resume boundary, which
+    /// this counter does not model. A yield exits the protecting frame,
+    /// so a suspended thread always reads 0, exactly like PUC's
+    /// per-thread errorJmp chain. Under-reporting windows (a non-main
+    /// thread reads 0 where PUC's resume rawrunprotected is armed): a
+    /// coroutine mid-execution and mid-precover-recovery — main never
+    /// takes those lanes (never yieldable), and only a raise targeting
+    /// THIS thread consults the field — the cross-thread close path,
+    /// where the only armed target possible is main.
+    protected_depth: u32 = 0,
     /// The errfunc slot of the message-handler window currently running
     /// (ERRFUNC_NONE = none). PUC luaG_errormsg has no re-entrancy guard:
     /// a handler error re-enters luaG_errormsg recursively (bounded by the
@@ -4279,7 +4300,7 @@ comptime {
     std.debug.assert(@sizeOf(Closure) == 48);
     std.debug.assert(@sizeOf(Cell) == 48);
     std.debug.assert(@sizeOf(Userdata) == 56);
-    std.debug.assert(@sizeOf(Thread) == 3864);
+    std.debug.assert(@sizeOf(Thread) == 3872);
 }
 
 /// Result of compiling a text chunk through the host-selected bytecode
@@ -5706,7 +5727,20 @@ pub const Vm = struct {
 
     /// Errors visible to embedders and the public Zig API. Internal dispatch
     /// control flow is deliberately excluded from this set.
-    pub const Error = std.mem.Allocator.Error || error{ RuntimeError, Yield };
+    ///
+    /// `MainDestined` (typed transport): a foreign-thread closer error
+    /// finalized by `crossCloseErrorRaise` whose catching boundary is the
+    /// MAIN thread's armed protected boundary (PUC ldo.c:130-138: the object
+    /// is copied to the main thread and re-thrown on `mainthread(g)->errorJmp`,
+    /// bypassing every intermediate frame — the raising thread is left dead,
+    /// intermediate coroutine callers are left mid-frame as zombies with
+    /// status OK). The error object lives in MAIN's thread error state (the
+    /// single canonical owner); every protected catch between the raise and
+    /// main's boundary must PROPAGATE this kind (never fold it, never close
+    /// regions with it, never finalize its carrier thread as dead) until a
+    /// consumer on main publishes it. Routing is by error KIND only — no
+    /// VM-global flags, no text matching.
+    pub const Error = std.mem.Allocator.Error || error{ RuntimeError, Yield, MainDestined };
 
     /// Private execution-layer signal set. `ThreadSwitch` is raised only while
     /// the bytecode coroutine trampoline is active and must be consumed by
@@ -5781,6 +5815,8 @@ pub const Vm = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.RuntimeError => return error.RuntimeError,
             error.Yield => return error.Yield,
+            // the kind is part of the public Error set — identity.
+            error.MainDestined => return error.MainDestined,
         };
     }
     /// Create a new VM with entropy-derived hash seed. `noenv` mirrors PUC's
@@ -8364,26 +8400,57 @@ pub const Vm = struct {
     /// boundary (mainthread(g)->errorJmp), bypassing every intermediate
     /// frame — including a coroutine caller's own resume boundary and its
     /// active pcalls (the re-throw is on main, never on the caller; the
-    /// caller is left mid-frame with status OK). luazig has no per-thread
-    /// boundary ownership — the single c_error_jmp is the innermost
-    /// C-function pad — so this re-raise lands on the CALLER's nearest
-    /// boundary instead. When the caller is the main thread the
-    /// observables coincide (the error still surfaces at main's pcall).
-    /// When the caller is a coroutine they diverge: the caller's resume
-    /// machinery or its own pcall catches the error (a driving C function
-    /// returns instead of being abandoned, main's pcall reports success,
-    /// coroutine.resume returns false+err instead of the protected chunk
-    /// dying, and the caller is finalized dead instead of left status-OK
-    /// mid-frame). Known divergence: a fix requires a general per-thread
-    /// boundary model (owner-tagged boundary chain or a main-destined
-    /// transport class respected by every protected catch), not a local
-    /// reroute of this raise.
+    /// caller is left mid-frame with status OK).
+    ///
+    /// typed transport: the re-raise target is now MAIN itself, not
+    /// the caller. The error object is installed in MAIN's thread error
+    /// state (the single canonical owner — the same channel every other
+    /// raise uses) and the raise returns `error.MainDestined`. Every
+    /// protected catch between here and main's armed boundary propagates
+    /// the kind unchanged (zombie parity: intermediate coroutine callers
+    /// keep their frames and status OK; their C activations are not
+    /// unwound by us); the consumer on main (a pcall/dostring boundary)
+    /// publishes the object from main's error state. C-API shims relay the
+    /// kind across C frames via the pad longjmp value 4 (see
+    /// `cRelayMainDestined` in c_api.zig) — the jump crosses exactly one C
+    /// frame, from the shim to its landing pad, never arbitrary Zig
+    /// defers.
     pub fn crossCloseErrorRaise(
         self: *Vm,
         ctx: SyncCloseContext,
         th: *Thread,
         first_err: Value,
     ) DispatchError!void {
+        // the caller's close context is no longer consulted for the
+        // re-raise target — MAIN is the target by definition (PUC
+        // ldo.c:130-138). The parameter stays for signature stability; the
+        // call site's own restore still runs after this returns/propagates.
+        _ = ctx;
+        // PUC luaD_throw (ldo.c:125-129) branches on the RAISING thread's
+        // own armed boundary BEFORE the main-fallback: a thread with its
+        // own errorJmp throws on THAT boundary — no resetthread, no status
+        // change, no remaining-marks close, no errfunc disarm (the catching
+        // boundary's ci/top restore and closeprotected own everything
+        // above its entry; marks below it survive). The only thread that
+        // can be an armed raising target here is MAIN mid-protected-call
+        // (a suspended coroutine's boundaries are all unwound at yield, and
+        // the active thread never reaches this cross path) —
+        // `protected_depth` is that armed fact. The kind still transports
+        // to the consuming boundary on main through the MainDestined
+        // channel: the physical propagation path crosses the driving
+        // coroutine's frames, which must be bypassed (zombie), not caught.
+        if (th.protected_depth > 0) {
+            const armed_status: i32 =
+                if (first_err == .String and first_err.String == self.oom_msg_str) 4 else 2;
+            th.err_has_obj = true;
+            th.err_obj = first_err;
+            th.err_is_oom = armed_status == 4;
+            th.err_is_errerr = false;
+            th.err_source = null;
+            th.err_line = -1;
+            self.err = if (first_err == .String) first_err.String.bytes() else null;
+            return error.MainDestined;
+        }
         const last = (try self.closeTbcRegion(th, th, 0, null, first_err, 2, false, &.{})) orelse first_err;
         const status: i32 = if (last == .String and last.String == self.oom_msg_str) 4 else 2;
         th.status = .dead;
@@ -8399,15 +8466,22 @@ pub const Vm = struct {
         // latch above already carries the object allocation-free).
         th.top = cWindowBase(th);
         self.cWindowPush(th, last) catch {};
-        // The re-raise on the caller (PUC: the main thread's armed
-        // boundary). Must address the caller thread directly — the context
-        // restore at the call site has not run yet, and errThread() would
-        // resolve to the target.
-        const caller = ctx.prev_thread orelse self.main_thread.?;
-        caller.err_has_obj = true;
-        caller.err_obj = last;
+        // PUC ldo.c:130-138: copy the error object to the MAIN thread and
+        // re-throw on MAIN's armed boundary — never on the caller. MAIN's
+        // thread error state is the canonical owner of the in-flight
+        // object; the consumer on main (its pcall/dostring boundary or a
+        // C-API relay target) publishes from here. The kind bits mirror
+        // what a same-thread raise would install (OOM bit from the PUC
+        // status; no handler ran, so no ERRERR).
+        const main = self.main_thread.?;
+        main.err_has_obj = true;
+        main.err_obj = last;
+        main.err_is_oom = status == 4;
+        main.err_is_errerr = false;
+        main.err_source = null;
+        main.err_line = -1;
         self.err = if (last == .String) last.String.bytes() else null;
-        return error.RuntimeError;
+        return error.MainDestined;
     }
 
     /// Safepoint window checker — a Debug-regime
@@ -8857,6 +8931,13 @@ pub const Vm = struct {
         // NOTE: the defer must be function-scoped — a block-scoped defer
         // would clear the flag before the finalizer body runs.
         const fin_thread = self.activeBytecodeThread();
+        // GCTM's luaD_pcall arms the GC-running thread's own boundary for
+        // the body's extent (protected_depth — the PUC errorJmp-armed
+        // fact): a cross-thread close targeting THIS thread during the
+        // body throws on this protection (the GC arm below is the
+        // consumer), never on the main fallback.
+        fin_thread.protected_depth += 1;
+        defer fin_thread.protected_depth -= 1;
         // PUC GCTM (lgc.c:983) runs the body through luaD_pcall(..., ef=0):
         // the finalizer body executes with NO message handler — an ambient
         // xpcall/pcallk handler must not intercept __gc errors; the error
@@ -10986,17 +11067,51 @@ pub const Vm = struct {
         const gc = self.fastTm(m, .gc) orelse return;
         const self_val: Value = obj.toValue() orelse return;
         const call_args = &[_]Value{self_val};
-        // PUC lgc.c:978-987: set GCSTPGC during finalizer execution to
-        // prevent reentrant GC (`collectgarbage()` from __gc returns
-        // false). PUC singlestep's GCScallfin arm (lgc.c:1670-1672)
-        // clears gcstopem around GCTM, so the allocator's emergency
-        // retry (lmem.c tryagain → luaC_fullgc(L,1)) may run a nested
-        // emergency full collection from inside the body. gc_busy is
-        // this VM's gcstopem equivalent, so it is cleared for the body
-        // window and restored after; gc_running is kept paired with the
-        // gc_stp write (the hot-path cache invariant) so allocation-site
-        // automatic steps stay blocked during the body exactly like
-        // PUC's gcrunning-under-GCSTPGC.
+        self.gcCallFinalizerProtected(gc, call_args);
+    }
+
+    /// gcCallFinalizerProtected: the GCTM protection wrapper (see
+    /// gcRunOneFinalizer above for the GCTM contract). PUC GCTM
+    /// (lgc.c:978-991) runs the finalizer body inside
+    /// luaD_pcall(..., old_top = the finalizer's function slot, ef = 0)
+    /// under the GCSTPGC window. This wrapper IS that protection: the
+    /// gc_stp/gc_busy window (reentrant-GC block with the emergency
+    /// retry allowed, exactly like PUC's gcstopem clearing around GCTM)
+    /// plus the pcall's error contract. A body error degrades to the
+    /// luaE_warnerror("__gc") warning channel and the pending list
+    /// continues (GCTM does not distinguish error classes). A
+    /// main-destined closer error from the body is caught HERE — this
+    /// boundary is the terminal consumer: the transported kind skipped
+    /// the semantic unwind (zombie parity), so this arm performs
+    /// luaD_pcall's catch itself before the warning — the ci restore
+    /// (frame level to the finalizer entry, unwinding the body's
+    /// zombie-preserved frames), then closeprotected (the TBC region
+    /// above the entry closes with the in-flight error, last-error-wins
+    /// may replace the object), then the top restore (PUC GCTM's
+    /// post-warn `L->top.p--` lands at the pre-finalizer top), then the
+    /// warning. The error object is canonically owned by the raise's
+    /// destination thread's err state — fin_thread itself (the armed
+    /// raise targeted the GC-running thread: callFinalizer's
+    /// protected_depth, PUC's GCTM luaD_pcall errorJmp) or MAIN (the
+    /// unarmed re-throw target, ldo.c:130-138); it transfers to
+    /// fin_thread here (a no-op when already there) so the recovery
+    /// close and the warning read it locally (the close reads
+    /// errThread() == fin_thread) and the ownership ends at this single
+    /// consumption. The pre-call err_has_obj snapshot distinguishes the
+    /// fresh armed install on fin_thread from a stale flag left by an
+    /// earlier recovered error (err state is only cleared at fresh
+    /// raises, resume entries and forced closes). Known divergence: when
+    /// the GC runs on a coroutine and the raise targeted another thread,
+    /// PUC's re-throw
+    /// would bypass the finalizer's protection and land on that
+    /// thread's/main's boundary, abandoning the cycle mid-way; this arm
+    /// restores, warns and continues the cycle instead.
+    fn gcCallFinalizerProtected(self: *Vm, gc: Value, call_args: []const Value) void {
+        const fin_thread = self.activeBytecodeThread();
+        const saved_frame_count = fin_thread.call_frames.len();
+        const saved_top = fin_thread.top;
+        const tbc_base = fin_thread.c_tbc_chain.items.len;
+        const snap_fin_has_obj = fin_thread.err_has_obj;
         const old_gcstp = self.gc_stp;
         const was_busy = self.gc_busy;
         self.gc_stp |= GCSTPGC;
@@ -11015,6 +11130,27 @@ pub const Vm = struct {
             error.Yield, error.ThreadSwitch => @panic(
                 "yield crossed the finalizer boundary (non-yieldable GCTM)",
             ),
+            error.MainDestined => {
+                const owner: *Thread =
+                    if (!snap_fin_has_obj and fin_thread.err_has_obj) fin_thread else self.main_thread.?;
+                if (owner != fin_thread) {
+                    const obj = if (owner.err_has_obj) owner.err_obj else .Nil;
+                    const is_oom = owner.err_is_oom;
+                    const is_errerr = owner.err_is_errerr;
+                    owner.err_has_obj = false;
+                    owner.err_obj = .Nil;
+                    fin_thread.err_has_obj = true;
+                    fin_thread.err_obj = obj;
+                    fin_thread.err_is_oom = is_oom;
+                    fin_thread.err_is_errerr = is_errerr;
+                    fin_thread.err_source = null;
+                    fin_thread.err_line = -1;
+                }
+                self.unwindBytecodeExecFrames(&fin_thread.call_frames, saved_frame_count);
+                self.apiCloseConventionalPcallBoundary(fin_thread, tbc_base);
+                fin_thread.top = saved_top;
+                self.gcWarnFinalizerError(self.protectedErrorValue());
+            },
         };
     }
 
@@ -11093,25 +11229,7 @@ pub const Vm = struct {
             const gc = self.fastTm(m, .gc) orelse continue;
             const self_val: Value = obj.toValue() orelse continue;
             const call_args = &[_]Value{self_val};
-            const old_gcstp = self.gc_stp;
-            const was_busy = self.gc_busy;
-            self.gc_stp |= GCSTPGC;
-            self.gc_running = false;
-            self.gc_busy = false;
-            defer {
-                self.gc_busy = was_busy;
-                self.gc_stp = old_gcstp;
-                self.gc_running = (old_gcstp == 0);
-            }
-            _ = self.callFinalizer(gc, call_args) catch |e| switch (e) {
-                error.RuntimeError => self.gcWarnFinalizerError(self.protectedErrorValue()),
-                error.OutOfMemory => self.gcWarnFinalizerError(.{
-                    .String = self.oom_msg_str orelse self.internStrAssume("not enough memory"),
-                }),
-                error.Yield, error.ThreadSwitch => @panic(
-                    "yield crossed the finalizer boundary (non-yieldable GCTM)",
-                ),
-            };
+            self.gcCallFinalizerProtected(gc, call_args);
         }
     }
 
@@ -16686,6 +16804,9 @@ pub const Vm = struct {
                         error.OutOfMemory => return error.OutOfMemory,
                         error.Yield => step = try self.bytecodeCoroutineYieldStep(active, active == initial),
                         error.ThreadSwitch => return error.ThreadSwitch,
+                        // propagate — the resume-level call site flags
+                        // the zombie exit.
+                        error.MainDestined => return error.MainDestined,
                     }
                     have_step = true;
                 };
@@ -17005,6 +17126,9 @@ pub const Vm = struct {
                                 }
                                 return error.OutOfMemory;
                             },
+                            // main-destined closer error — propagate
+                            // (the resume-level call site flags the zombie).
+                            error.MainDestined => return error.MainDestined,
                         };
                         break :retblk values;
                     };
@@ -17226,6 +17350,9 @@ pub const Vm = struct {
                         continue :bubble;
                     },
                     error.ThreadSwitch => return error.ThreadSwitch,
+                    // propagate — the resume-level call site flags
+                    // the zombie exit.
+                    error.MainDestined => return error.MainDestined,
                 };
                 if (completed) |ret| {
                     step = .{ .returned = ret };
@@ -18656,7 +18783,9 @@ pub const Vm = struct {
         return null;
     }
 
-    fn unwindBytecodeExecFrames(
+    /// pub for api.zig's conventional-pcall MainDestined consume
+    /// (the ci-restore equivalent of PUC luaD_pcall's `L->ci = old_ci`).
+    pub fn unwindBytecodeExecFrames(
         self: *Vm,
         exec_frames: *FrameStack,
         boundary_depth: usize,
@@ -18698,6 +18827,21 @@ pub const Vm = struct {
             // needs the frame's window on th.stack).
             if (frame.isC()) {
                 self.detachTbcRegion(self.activeBytecodeThread(), frame.tbc_chain_base);
+            }
+            // a Lua frame's OP_TBC marks (bc_tbc_regs) must detach
+            // into the chain here too — popBytecodeExecFrame's regs
+            // truncation would otherwise DROP them unclosed (PUC: tbclist
+            // levels survive the catching boundary's ci-restore untouched;
+            // its closeprotected runs every closer). Covers the
+            // MainDestined propagation (runBytecodeInternal returns the
+            // kind raw, skipping the semantic unwind's detach) and every
+            // other abort-pop of a marked Lua frame. Idempotent by
+            // construction: the semantic unwind (escapes_dispatch) detaches
+            // AND pops in one step, so a frame reaching this loop still
+            // owns its regs. Best-effort under OOM (the chain reserve
+            // fails): the marks drop as before — never a silent success.
+            if (!frame.isC()) {
+                self.detachLuaFrameTbcMarks(self.activeBytecodeThread(), frame) catch {};
             }
             if (!frame.isC() and frame.hasOpenUpvalues())
                 self.closeBytecodeUpvaluesFrom(frame, 0);
@@ -18797,6 +18941,9 @@ pub const Vm = struct {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.RuntimeError => return error.RuntimeError,
                     error.Yield => return error.Yield,
+                    // pure allocation+interning — unreachable by the
+                    // same proof; identity keeps the kind unfolded.
+                    error.MainDestined => return error.MainDestined,
                 };
             }
         }
@@ -18914,9 +19061,15 @@ pub const Vm = struct {
         // Register the invariant first so the error-unwind defer runs before
         // it (defer execution is LIFO). A direct bytecode yield deliberately
         // leaves the suffix resident in the thread instead of unwinding it.
+        // a main-destined exit is the third legitimate resident state —
+        // PUC's re-throw on main (ldo.c:130-138) abandons these frames without
+        // unwinding (zombie continuation); the errdefer below arms the flag
+        // before this assert runs (LIFO: registered after this defer).
+        var main_destined_exit = false;
         defer std.debug.assert(
             exec_frames.len() == boundary_depth or
                 ((yielded_in_place or exec_thread.bytecode_inplace_suspended) and exec_frames.len() > boundary_depth) or
+                main_destined_exit or
                 // P15.78: A C-frame may remain as the TOP frame above
                 // boundary_depth after a Lua frame returns to a C-frame
                 // parent. completeBytecodeExecFrame returns the results to
@@ -18946,7 +19099,21 @@ pub const Vm = struct {
         // check becomes: is bytecode_inplace_suspended true? If yes, this
         // runBytecodeInternal is the outermost one — preserve its frame but
         // unwind any leftover nested frames above boundary_depth + 1.
-        errdefer if (!yielded_in_place) {
+        // arm the assert's zombie disjunct on EVERY MainDestined exit
+        // (the explicit return below and implicit `try` propagation from the
+        // recover/close-unwind paths alike — a closer run during those can
+        // raise the kind too).
+        errdefer |md_err| if (md_err == error.MainDestined) {
+            main_destined_exit = true;
+        };
+        // a main-destined closer error (error.MainDestined) skips
+        // this unwind ENTIRELY — PUC's re-throw on main (ldo.c:130-138)
+        // abandons every intermediate frame without unwinding: a zombie
+        // coroutine keeps its whole frame chain (a later resume is
+        // rejected as non-suspended), and main's intermediate frames are
+        // dropped by the CONSUMING pcall's own ci-restore (PUC luaD_pcall:
+        // L->ci = old_ci), never here.
+        errdefer |err| if (!yielded_in_place and err != error.MainDestined) {
             // P15.70: The "owner" of the suspension is a runBytecodeInternal
             // whose frames must be preserved for resume. The outermost call
             // (the thread's outer boundary — 0 pre-base-frame, 1 with the
@@ -19036,7 +19203,14 @@ pub const Vm = struct {
 
         while (true) {
             const result = self.runBytecodeDispatch(exec_frames, boundary_depth, &yielded_in_place) catch |dispatch_err| {
-                if (dispatch_err == error.Yield or dispatch_err == error.ThreadSwitch) return dispatch_err;
+                if (dispatch_err == error.Yield) return error.Yield;
+                if (dispatch_err == error.ThreadSwitch) return error.ThreadSwitch;
+                // a main-destined closer error bypasses the semantic
+                // error unwind (no frame pops, no mark closes, no error-value
+                // replacement) — PUC's re-throw on main abandons these
+                // frames; the consumer on main (or the next relay) owns
+                // them. Propagate the kind raw.
+                if (dispatch_err == error.MainDestined) return error.MainDestined;
                 // P16.27 T1: the forced-close bypass is REMOVED — errors
                 // in closers are ordinary catchable errors; the close
                 // continuation records uncaught ones (last error wins).
@@ -23881,6 +24055,10 @@ pub const Vm = struct {
                         error.OutOfMemory => return error.OutOfMemory,
                         error.RuntimeError => return error.RuntimeError,
                         error.ThreadSwitch => return error.ThreadSwitch,
+                        // propagate the transported kind raw — the
+                        // semantic unwind must not run for it (zombie
+                        // parity; the consumer on main owns the frames).
+                        error.MainDestined => return error.MainDestined,
                     };
                     // P16.50-review-7 BLOCKER 4: resume's exact owned tuple
                     // is the tail-call transport (no window bound); yield
@@ -23929,6 +24107,10 @@ pub const Vm = struct {
                         error.OutOfMemory => return error.OutOfMemory,
                         error.RuntimeError => return error.RuntimeError,
                         error.ThreadSwitch => return error.ThreadSwitch,
+                        // propagate the transported kind raw — the
+                        // semantic unwind must not run for it (zombie
+                        // parity; the consumer on main owns the frames).
+                        error.MainDestined => return error.MainDestined,
                     };
                 }
                 // P16.50-review-6 BLOCKER 1: owned results (T.testC) are the
@@ -24531,6 +24713,10 @@ pub const Vm = struct {
                         error.OutOfMemory => return error.OutOfMemory,
                         error.RuntimeError => return error.RuntimeError,
                         error.ThreadSwitch => return error.ThreadSwitch,
+                        // propagate the transported kind raw — the
+                        // semantic unwind must not run for it (zombie
+                        // parity; the consumer on main owns the frames).
+                        error.MainDestined => return error.MainDestined,
                     };
                     // P16.50-review-7 BLOCKER 4: resume returns its EXACT
                     // results as an owned slice ([true/false] ++ values —
@@ -24583,6 +24769,10 @@ pub const Vm = struct {
                         error.OutOfMemory => return error.OutOfMemory,
                         error.RuntimeError => return error.RuntimeError,
                         error.ThreadSwitch => return error.ThreadSwitch,
+                        // propagate the transported kind raw — the
+                        // semantic unwind must not run for it (zombie
+                        // parity; the consumer on main owns the frames).
+                        error.MainDestined => return error.MainDestined,
                     };
                 }
                 if (ctx.th.stack.ptr != stack_base_before) {
@@ -27376,6 +27566,18 @@ pub const Vm = struct {
         // [false, err] (PUC luaD_pcall → luaD_closeprotected).
         const th_entry = self.activeBytecodeThread();
         const defer_to_precover = th_entry.yieldable();
+        // PUC lua_pcallk's conventional branch (lapi.c:1095-1097, the
+        // `k == NULL || !yieldable(L)` predicate) runs the body through
+        // luaD_pcall — the thread's own boundary is ARMED for the body's
+        // extent (protected_depth, the errorJmp-armed fact a cross-thread
+        // close on THIS thread branches on at its raise). The yieldable
+        // branch arms nothing here: its recovery belongs to the resume
+        // boundary's protection (precover), which is not modeled — a
+        // suspended or unwinding thread correctly reads 0.
+        if (!defer_to_precover) {
+            th_entry.protected_depth += 1;
+            defer th_entry.protected_depth -= 1;
+        }
         var deferred = false;
         // A suspension exit (error.Yield) restores NOTHING (PUC lapi.c
         // lua_pcallk yieldable path: luaD_throw(LUA_YIELD) longjmps past
@@ -27772,6 +27974,18 @@ pub const Vm = struct {
         // (see the frame-marking comment below for the full contract).
         const th_xpcall_entry = self.activeBytecodeThread();
         const defer_to_precover = th_xpcall_entry.yieldable();
+        // PUC lua_pcallk's conventional branch (lapi.c:1095-1097, the
+        // `k == NULL || !yieldable(L)` predicate) runs the body through
+        // luaD_pcall — the thread's own boundary is ARMED for the body's
+        // extent (protected_depth, the errorJmp-armed fact a cross-thread
+        // close on THIS thread branches on at its raise). The yieldable
+        // branch arms nothing here: its recovery belongs to the resume
+        // boundary's protection (precover), which is not modeled — a
+        // suspended or unwinding thread correctly reads 0.
+        if (!defer_to_precover) {
+            th_xpcall_entry.protected_depth += 1;
+            defer th_xpcall_entry.protected_depth -= 1;
+        }
         var deferred = false;
         // A suspension exit (error.Yield) restores NOTHING (PUC luaD_throw
         // unwinds nothing): the handler stays armed and the parked
@@ -28248,6 +28462,19 @@ pub const Vm = struct {
         const args = th_cur.stack[fr.func_slot + 1 .. th_cur.top];
         const res = self.auxwrapResume(th, args) catch |e| switch (e) {
             error.RuntimeError => return -1,
+            // a main-destined closer error from the wrapped
+            // coroutine re-throws on MAIN's armed boundary (PUC
+            // ldo.c:130-138) — relay across this C frame with the pad
+            // longjmp value 4 (the object is already in MAIN's err
+            // state); the landing pad's `.main_destined` arm propagates
+            // the kind, leaving this frame a zombie exactly like PUC's
+            // abandoned auxwrap activation.
+            error.MainDestined => {
+                if (self.c_error_jmp) |jb| {
+                    _longjmp(@ptrCast(jb), 4);
+                }
+                std.process.abort();
+            },
             error.OutOfMemory => {
                 if (self.c_error_jmp) |jb| {
                     self.setOutOfMemoryError();
@@ -29009,6 +29236,12 @@ pub const Vm = struct {
         if (self.stats.enabled) self.stats.resumes += 1; // P16.0b (resume committed)
         th.in_resume = true;
         th.capture_yield_id = 0;
+        // typed transport: set when a main-destined closer error
+        // (error.MainDestined) escapes this resume — the finalization defer
+        // below reads it to leave the thread a PUC-parity zombie (status
+        // .running / api_status 0, frames intact) instead of latching it
+        // dead. Declared BEFORE every defer that reads it.
+        var main_destined = false;
         defer {
             th.in_resume = false;
             th.capture_yield_id = 0;
@@ -29017,7 +29250,14 @@ pub const Vm = struct {
             // P16.36 Cut 1b: this defer runs AFTER the runtime switch-back
             // defer below (LIFO), so current_thread is already the caller —
             // read the dying thread's state DIRECTLY, never via errThread().
-            if (th.status == .running) {
+            // a main-destined closer error bypasses this resume
+            // boundary entirely (PUC ldo.c:130-138 — the re-throw is on
+            // MAIN's armed boundary, never on the caller's resume): the
+            // thread is NOT finalized dead here — it stays a ZOMBIE with
+            // status .running / api_status 0 (LUA_OK), frames intact, a
+            // later resume rejected as "non-suspended" exactly like PUC's
+            // abandoned caller.
+            if (th.status == .running and !main_destined) {
                 th.status = .dead;
                 // P16.50-review-5 B1: an OOM error carries status 4 — the
                 // error object is the FIXED interned "not enough memory"
@@ -29082,6 +29322,44 @@ pub const Vm = struct {
         th.err_line = -1;
 
         const call_args = args[1..];
+        // PUC lua_resume (ldo.c:970-975, resume → ccall(firstArg-1)): a
+        // never-started thread runs whatever value is staged at the top of
+        // its stack window — the C-API construction (lua_newthread + push
+        // onto the co) leaves the body ONLY on the stack; th.callee is set
+        // by coroutine.create alone. Adopt the staged body exactly like
+        // the C-level path (api.State.resume's callee_needed fallback):
+        // the body becomes th.callee and its slot the entry func slot (the
+        // staging below anchors the entry args right above it — PUC
+        // geometry: func at the body's own slot, args above). An empty
+        // window is PUC's "no function" case: resume_error("cannot resume
+        // dead coroutine") — with the Lua-level arg transport the window
+        // holds only the body, so emptiness is nargs-independent (PUC:
+        // after coresume's xmove the check top-(func+1)==nargs fires for
+        // every nargs when no body sits below the args).
+        if (!th.started and !isCallableValue(th.callee)) {
+            const cnt = Vm.cWindowCount(th);
+            if (cnt == 0) {
+                const istr = try self.internStr("cannot resume dead coroutine");
+                return .{ .owned = try self.ownedResumeFail(.{ .String = istr }) };
+            }
+            const body_slot = Vm.cWindowBase(th) + cnt - 1;
+            const body = th.stack[body_slot];
+            th.top = body_slot; // consume: the entry staging re-anchors here
+            if (!isCallableValue(body)) {
+                // PUC ccall raises the call error inside the protected
+                // resume: luaB_coresume reports [false, err] and the co
+                // dies with ERRRUN (the death latch reads th.err_obj).
+                const msg = try std.fmt.allocPrint(self.alloc, "attempt to call a {s} value", .{body.typeName()});
+                defer self.alloc.free(msg);
+                const istr = try self.internStr(msg);
+                th.err_obj = .{ .String = istr };
+                th.err_has_obj = true;
+                th.err_source = null;
+                th.err_line = -1;
+                return .{ .owned = try self.ownedResumeFail(.{ .String = istr }) };
+            }
+            th.callee = body;
+        }
         // Builtin entrypoints (notably coroutine.create(pcall/xpcall)) need the
         // original start arguments when resuming from suspended continuation
         // frames. This is runtime call context, not replay re-execution state.
@@ -29459,6 +29737,14 @@ pub const Vm = struct {
                         // still propagates — it is a switch request, not
                         // an error.
                         error.OutOfMemory => return self.resumeUncaughtErrorTail(th),
+                        // main-destined closer error from a
+                        // continuation — zombie exit + propagate (the
+                        // generic `else` below already returns e; the
+                        // explicit prong sets the zombie flag first).
+                        error.MainDestined => {
+                            main_destined = true;
+                            return e;
+                        },
                         else => return e,
                     };
                     if (yielded) break;
@@ -29611,6 +29897,14 @@ pub const Vm = struct {
                         error.Yield => {
                             yielded = true;
                         },
+                        // a main-destined closer error bypasses the
+                        // resume boundary (no precover, no failure tuple,
+                        // no death latch) — flag the zombie exit and
+                        // propagate the kind to the caller's frames.
+                        error.MainDestined => {
+                            main_destined = true;
+                            return e;
+                        },
                         error.RuntimeError, error.OutOfMemory => {
                             if (e == error.OutOfMemory) self.setOutOfMemoryError();
                             if (e == error.RuntimeError and th.close_mode and
@@ -29671,7 +29965,16 @@ pub const Vm = struct {
                 },
                 .Closure => |cl| {
                     if (cl.proto != null and !self.bytecode_coroutine_trampoline_active) {
-                        const step = try self.driveBytecodeCoroutineTrampoline(th, cl, resolved.args, resolved.ccmt);
+                        // a MainDestined escaping the trampoline
+                        // (raised inside the driven coroutine, relayed by
+                        // the trampoline's catch arms) must flag the zombie
+                        // exit BEFORE the defers run — a bare `try` would
+                        // propagate without the flag and the finalization
+                        // defer would mislatch this thread dead.
+                        const step = self.driveBytecodeCoroutineTrampoline(th, cl, resolved.args, resolved.ccmt) catch |e| {
+                            if (e == error.MainDestined) main_destined = true;
+                            return e;
+                        };
                         switch (step) {
                             .returned => |ret| {
                                 payload = ret;
@@ -29699,6 +30002,13 @@ pub const Vm = struct {
                                 error.Yield => {
                                     yielded = true;
                                     break :retblk null;
+                                },
+                                // main-destined closer error — zombie
+                                // exit, propagate (never the !ok failure
+                                // tail, never precover).
+                                error.MainDestined => {
+                                    main_destined = true;
+                                    return e;
                                 },
                                 error.RuntimeError, error.OutOfMemory => {
                                     if (e == error.OutOfMemory) self.setOutOfMemoryError();
@@ -29934,6 +30244,12 @@ pub const Vm = struct {
                         // still propagates — it is a switch request, not
                         // an error.
                         error.OutOfMemory => return self.resumeUncaughtErrorTail(th),
+                        // main-destined closer error from the
+                        // unroll's continuation — zombie exit + propagate.
+                        error.MainDestined => {
+                            main_destined = true;
+                            return e2;
+                        },
                         else => return e2,
                     };
                     try self.poscallCFrame(th, fc_result);
@@ -29965,6 +30281,13 @@ pub const Vm = struct {
                         // (yield path) consumes them.
                         yielded = true;
                         break :unroll_loop;
+                    },
+                    // main-destined closer error from the resumed
+                    // Lua frame — zombie exit + propagate (no precover,
+                    // no failure tuple).
+                    error.MainDestined => {
+                        main_destined = true;
+                        return e;
                     },
                     error.RuntimeError => {
                         // PUC lua_closethread (luaE_resetthread → resetCI +
@@ -30235,9 +30558,15 @@ pub const Vm = struct {
             outs[0] = .{ .String = istr };
             return;
         }
+        // PUC auxstatus (lcorolib.c:128): a thread with OK status that is
+        // not the currently executing one but still has live frames (e.g.
+        // frozen mid-resume by a main-destined cross-thread raise) reports
+        // "normal". In our model OK-while-executing is .running; only the
+        // currently executing thread may report "running".
+        const is_current = if (self.current_thread) |c| c == th else th == self.main_thread;
         const sn = switch (th.status) {
             .suspended => "suspended",
-            .running => "running",
+            .running => if (is_current) "running" else "normal",
             .dead => "dead",
         };
         const istr = try self.internStr(sn);
@@ -35878,7 +36207,7 @@ pub const Vm = struct {
         // execution happens, only parsing/compilation/undump which are
         // synchronous and never yield).
         return self.loadChunkImpl(input, bytes, chunk_name, mode, env, pinned_chunk_name) catch |err| switch (err) {
-            error.OutOfMemory, error.RuntimeError, error.Yield => |e| return e,
+            error.OutOfMemory, error.RuntimeError, error.Yield, error.MainDestined => |e| return e,
             error.ThreadSwitch => unreachable, // can't happen during loading
         };
     }
@@ -36337,6 +36666,9 @@ pub const Vm = struct {
             },
             error.RuntimeError => return error.RuntimeError,
             error.Yield => return error.Yield,
+            // propagate — the load builtin's caller chain carries
+            // the kind to main's boundary (loading itself never raises it).
+            error.MainDestined => return error.MainDestined,
         };
         switch (result) {
             .closure => |cl| {
@@ -38744,6 +39076,14 @@ pub const Vm = struct {
                         // hook yield (parkBytecodeIrHookYield sets
                         // bytecode_inplace_suspended + skip flag).
                         return error.Yield;
+                    }
+                    // pad longjmp value 4 — a main-destined closer
+                    // error relayed from a C-API shim inside the hook: the
+                    // object is in MAIN's err state; propagate the kind
+                    // (this hook activation is an intermediate frame the
+                    // consumer on main abandons).
+                    if (sj == 4) {
+                        return error.MainDestined;
                     }
                     // Hook errored via lua_error: the error object is in
                     // self.err / self.errThread().err_obj. Propagate as RuntimeError.
@@ -48280,6 +48620,11 @@ pub const Vm = struct {
                 }
                 return -2;
             },
+            // a main-destined closer error from the continuation
+            // script — the -3 sentinel; the pad decodes it to
+            // `.main_destined` and propagates the kind (this C activation
+            // is an intermediate frame the consumer on main abandons).
+            error.MainDestined => return -3,
             else => return -1,
         };
 
@@ -48323,6 +48668,15 @@ pub const Vm = struct {
         /// object is in `c_error_value` (or the thread err state when the
         /// throw came from the VM, not the C API).
         lua_err: c_int,
+        /// typed transport: a main-destined closer error relayed
+        /// across this C frame (pad longjmp value 4, or the testC
+        /// continuation sentinel -3). The object is already in MAIN's
+        /// thread error state (installed by `crossCloseErrorRaise`); this
+        /// activation is NOT the catching boundary — propagate
+        /// `error.MainDestined` unchanged, leaving the C-frame in place
+        /// (zombie parity: PUC abandons the intermediate C activations;
+        /// the consumer on main restores its own frame level).
+        main_destined,
     };
 
     /// ONE shared protected-C-boundary contract for both `_setjmp`
@@ -48448,7 +48802,9 @@ pub const Vm = struct {
             // propagates Zig errors instead of longjmping): -1 = a Lua
             // error occurred (the object is already in the VM error
             // state, c_error_value is null), -2 = yield (values in
-            // th.yielded). The old i32 passthrough encoded these as
+            // th.yielded), -3 = a main-destined closer error relayed from
+            // a continuation script (the object is in MAIN's err state).
+            // The old i32 passthrough encoded these as
             // plain negatives; the union maps them to the same outcomes
             // without colliding with ThreadSwitch.
             const raw = f(self.cur_handle.?);
@@ -48460,6 +48816,7 @@ pub const Vm = struct {
             b.finish();
             if (raw >= 0) return .{ .ok = @intCast(raw) };
             if (raw == -2) return .yield;
+            if (raw == -3) return .main_destined;
             return .{ .lua_err = 2 }; // LUA_ERRRUN (testC error sentinel)
         }
         // `_longjmp` landing — BEFORE decoding the status: the payload
@@ -48484,6 +48841,15 @@ pub const Vm = struct {
         // alongside the object (ldo.c:125-146).
         if (sj == 3) {
             return .thread_switch;
+        }
+        // typed transport: `_longjmp` with value 4 = a main-destined
+        // closer error relayed by a C-API shim (`cRelayMainDestined`) or a
+        // C continuation (auxwrap). The payload is already in MAIN's
+        // thread error state (publish-then-jump contract); this pad's
+        // activation is an intermediate frame the consumer on main will
+        // abandon — propagate the kind, never fold it here.
+        if (sj == 4) {
+            return .main_destined;
         }
         {
             const st: c_int = if (self.c_error_status != 0) self.c_error_status else 2;
@@ -48602,6 +48968,23 @@ pub const Vm = struct {
             // resume. The switch itself is processed by the active
             // trampoline (error.ThreadSwitch).
             return error.ThreadSwitch;
+        }
+
+        if (nret_signed == .main_destined) {
+            // typed transport: a main-destined closer error relayed
+            // across this C activation (pad longjmp 4 / testC sentinel
+            // -3). PUC ldo.c:130-138: the re-throw on main's armed
+            // boundary abandons every intermediate C activation — this
+            // frame is a zombie: it stays on `call_frames` (NOT popped,
+            // exactly like the yield/thread-switch arms), its live TBC
+            // marks stay detached-but-unclosed (they close at whichever
+            // boundary eventually owns them — main's catching pcall runs
+            // its own region close; a zombie coroutine's marks die with
+            // coroutine.close), and the error object is NOT folded here —
+            // it is already canonically owned by MAIN's thread error
+            // state. The consumer on main (or the next relay) decides the
+            // fate; this arm only propagates the kind.
+            return error.MainDestined;
         }
 
         if (nret_signed == .lua_err) {
@@ -50638,7 +51021,11 @@ pub const Vm = struct {
         // poscall_close = false: the sub-VM has no testC CallInfo; the
         // panic reset below closes the marks (PUC luaE_resetthread).
         _ = sub_vm.runTestcScript(script, ctx, win, false) catch |err| switch (err) {
-            error.RuntimeError, error.OutOfMemory => {
+            error.RuntimeError, error.OutOfMemory, error.MainDestined => {
+                // a MainDestined inside a checkpanic script is the
+                // same panic lane as RuntimeError (PUC: the sub-state has
+                // no errorJmp anywhere — the re-throw on the sub-main hits
+                // the panic function, which longjmps back to checkpanic).
                 // P16.50-review-5: an OOM from a testC command (e.g.
                 // `newtable` under countdown 0) propagates WITHOUT an
                 // error object — the sub-VM has no dispatch boundary to
@@ -50692,10 +51079,12 @@ pub const Vm = struct {
                     // Run panic script on the same sub-VM / window.
                     // PUC: runC(b->L, L1, b->paniccode) inside panicback.
                     _ = sub_vm.runTestcScript(ps, ctx, win, false) catch |pe| switch (pe) {
-                        error.RuntimeError, error.OutOfMemory => {
+                        error.RuntimeError, error.OutOfMemory, error.MainDestined => {
                             // Panic script itself errored — return its
                             // message (OOM: install the fixed message first,
-                            // same as the main-script catch above).
+                            // same as the main-script catch above). A
+                            // MainDestined here is the same panic lane (the
+                            // sub-state has no armed boundary anywhere).
                             if (pe == error.OutOfMemory) sub_vm.setOutOfMemoryError();
                             // Panic script itself errored — return its message.
                             if (outs.len > 0) {
@@ -50930,6 +51319,10 @@ pub const Vm = struct {
                     error.OutOfMemory => return @as(DispatchError!testc.RunResult, error.OutOfMemory),
                     error.RuntimeError => return @as(DispatchError!testc.RunResult, error.RuntimeError),
                     error.ThreadSwitch => return @as(DispatchError!testc.RunResult, error.ThreadSwitch),
+                    // a cross-thread closer error inside the region
+                    // close propagates the transported kind (the object is
+                    // in MAIN's err state; the frames are the consumer's).
+                    error.MainDestined => return @as(DispatchError!testc.RunResult, error.MainDestined),
                 };
                 if (final_err) |fe| {
                     // A closer errored: all entries were closed with the
@@ -61409,7 +61802,7 @@ test "P16.50-review-3 R1: k continuation error transport through finishCcall" {
         // The OOM left no stale boundary: the state is genuinely usable
         // (a conventional round-trip on the main thread succeeds).
         try testing.expect(state.loadbuffer("return 7", "=p50r3b") == .ok);
-        try testing.expect(state.pcall(0, 1) == .ok);
+        try testing.expect((state.pcall(0, 1) catch |e| return e) == .ok);
         try testing.expect(std.meta.eql(
             state.curThread().stack[state.curThread().top - 1],
             .{ .Int = 7 },
@@ -61951,7 +62344,7 @@ test "P16.50-review-3 R3: api_status lifecycle through lua_status" {
     // round-trip (PUC: lua_pcall leaves L->status == LUA_OK on success;
     // luazig's lua_status pins LUA_OK for the main handle).
     try testing.expect(state.loadbuffer("return 7", "=p50r3d") == .ok);
-    try testing.expect(state.pcall(0, 1) == .ok);
+    try testing.expect((state.pcall(0, 1) catch |e| return e) == .ok);
     try testing.expect(std.meta.eql(
         state.curThread().stack[state.curThread().top - 1],
         .{ .Int = 7 },
@@ -70070,7 +70463,10 @@ const a11_c10_child_src =
     \\        std.debug.print("A11S1-C10-LOAD-FAIL {d}\n", .{@intFromEnum(lst)});
     \\        return 3;
     \\    }
-    \\    const pst = state.pcall(0, 0);
+    \\    const pst = state.pcall(0, 0) catch |perr| {
+    \\        std.debug.print("A11S1-C10-PCALL-ERR {s}\n", .{@errorName(perr)});
+    \\        return 5;
+    \\    };
     \\    std.debug.print("A11S1-C10-DONE status={d}\n", .{@intFromEnum(pst)});
     \\    if (!std.mem.eql(u8, scenario, "poison")) state.deinit();
     \\    return 0;
@@ -70255,7 +70651,7 @@ test "A1.1s1 class 3: lua_call fixed-result nil-fill (PUC moveresults parity, fi
     {
         const st = state.loadbuffer("a11s3(function() return 42 end, 0)", "=a11s3a");
         try testing.expect(st == .ok);
-        const pst = state.pcall(0, 0);
+        const pst = state.pcall(0, 0) catch |e| return e;
         try testing.expect(pst == .ok);
         // First result slot: 42 in both PUC and the current code.
         _ = c_api.lua_getglobal(L, "a11s3_r1_val");
@@ -70280,7 +70676,7 @@ test "A1.1s1 class 3: lua_call fixed-result nil-fill (PUC moveresults parity, fi
     {
         const st = state.loadbuffer("local r1 = a11s3(function() return 11, 22, 33 end, 1) return r1", "=a11s3b");
         try testing.expect(st == .ok);
-        const pst = state.pcall(0, 1);
+        const pst = state.pcall(0, 1) catch |e| return e;
         try testing.expect(pst == .ok);
         try testing.expectEqual(@as(i64, 11), c_api.lua_tointegerx(L, -1, null));
         c_api.lua_pop(L, 1);
@@ -70290,7 +70686,7 @@ test "A1.1s1 class 3: lua_call fixed-result nil-fill (PUC moveresults parity, fi
     {
         const st = state.loadbuffer("local t = a11s3(function() return 1 end, 2) return t", "=a11s3c");
         try testing.expect(st == .ok);
-        const pst = state.pcall(0, 1);
+        const pst = state.pcall(0, 1) catch |e| return e;
         try testing.expect(pst == .ok);
         try testing.expectEqual(@as(i64, 2), c_api.lua_tointegerx(L, -1, null));
         c_api.lua_pop(L, 1);
@@ -70299,7 +70695,7 @@ test "A1.1s1 class 3: lua_call fixed-result nil-fill (PUC moveresults parity, fi
     {
         const st = state.loadbuffer("local r1, r2 = a11s3(function() return 7, 8 end, 3) return r1 + r2", "=a11s3d");
         try testing.expect(st == .ok);
-        const pst = state.pcall(0, 1);
+        const pst = state.pcall(0, 1) catch |e| return e;
         try testing.expect(pst == .ok);
         try testing.expectEqual(@as(i64, 15), c_api.lua_tointegerx(L, -1, null));
         c_api.lua_pop(L, 1);
@@ -70405,7 +70801,7 @@ test "A1.1s1 class 12: lua_getinfo 'S'/'n' proto-lifetime pointers survive GC (f
     // swept by the collection) turns this red.
     const st = state.loadbuffer("a11s12()", "=a11s12src");
     try testing.expect(st == .ok);
-    const pst = state.pcall(0, 0);
+    const pst = state.pcall(0, 0) catch |e| return e;
     try testing.expect(pst == .ok);
     try testing.expect(a11s12_source_alive_after_gc == true);
 }
@@ -70479,7 +70875,7 @@ test "A1.1s1 class 13: lua_copy upvalue write barriers generational old→young 
     a11s13_mode = 0;
     a11s13_tbl = null;
     _ = c_api.lua_getglobal(L, "a11s13");
-    var pst = state.pcall(0, 0);
+    var pst = state.pcall(0, 0) catch |e| return e;
     try testing.expect(pst == .ok);
 
     try vm.gcMinorCollection();
@@ -70491,7 +70887,7 @@ test "A1.1s1 class 13: lua_copy upvalue write barriers generational old→young 
     a11s13_mode = 1;
     a11s13_tbl = null;
     _ = c_api.lua_getglobal(L, "a11s13");
-    pst = state.pcall(0, 0);
+    pst = state.pcall(0, 0) catch |e| return e;
     try testing.expect(pst == .ok);
     try vm.gcMinorCollection();
     try testing.expect(p50StillRegistered(vm, a11s13_tbl.?) == true);
@@ -70500,7 +70896,7 @@ test "A1.1s1 class 13: lua_copy upvalue write barriers generational old→young 
     // nothing later traverses the freed table through the closure.
     a11s13_mode = 2;
     _ = c_api.lua_getglobal(L, "a11s13");
-    pst = state.pcall(0, 0);
+    pst = state.pcall(0, 0) catch |e| return e;
     try testing.expect(pst == .ok);
 }
 
@@ -70557,7 +70953,7 @@ test "A1.1s1 M28: lua_setiuservalue backward barrier remembers old userdata → 
 
     a11s28_tbl = null;
     _ = c_api.lua_getglobal(L, "a11s28");
-    const pst = state.pcall(0, 0);
+    const pst = state.pcall(0, 0) catch |e| return e;
     try testing.expect(pst == .ok);
 
     // The minor cycle must traverse the remembered edge and keep the
@@ -70733,7 +71129,7 @@ test "A1.1s1 class 5: lua_settop lowering runs TBC close protocol (fixed)" {
         \\return r, a11s5_closed
     , "=a11s5");
     try testing.expect(st == .ok);
-    const pst = state.pcall(0, 2);
+    const pst = state.pcall(0, 2) catch |e| return e;
     try testing.expect(pst == .ok);
     // __close ran inside lua_settop (the mark was consumed there).
     try testing.expectEqual(@as(c_int, 1), c_api.lua_toboolean(L, -2));
@@ -70748,7 +71144,7 @@ test "A1.1s1 class 5: lua_settop lowering runs TBC close protocol (fixed)" {
     {
         const st2 = state.loadbuffer("a11s5_closed = false error('probe')", "=a11s5late");
         try testing.expect(st2 == .ok);
-        const pst2 = state.pcall(0, 0);
+        const pst2 = state.pcall(0, 0) catch |e| return e;
         try testing.expect(pst2 == .runtime_error);
         _ = c_api.lua_getglobal(L, "a11s5_closed");
         try testing.expectEqual(@as(c_int, 0), c_api.lua_toboolean(L, -1));
@@ -70779,7 +71175,7 @@ test "A1.1s1 class 6: resume error window — c_api [err,err] matches api.State 
         const L2 = c_api.lua_newthread(L).?;
         const st = state.loadbuffer("return function() error('boom') end", "=a11s6a");
         try testing.expect(st == .ok);
-        const pst = state.pcall(0, 1);
+        const pst = state.pcall(0, 1) catch |e| return e;
         try testing.expect(pst == .ok);
         c_api.lua_xmove(L, L2, 1);
         var nres: c_int = -1;
@@ -70812,7 +71208,7 @@ test "A1.1s1 class 6: resume error window — c_api [err,err] matches api.State 
         try state.newthread(); // Thread at index 1
         const st = state.loadbuffer("return function() error('boom') end", "=a11s6b");
         try testing.expect(st == .ok);
-        const pst = state.pcall(0, 1);
+        const pst = state.pcall(0, 1) catch |e| return e;
         try testing.expect(pst == .ok);
         try state.xmove(null, 1, 1);
         const rst = state.@"resume"(1, 0);
@@ -71113,7 +71509,7 @@ test "A1.1s1 class 4: readiness probes — vararg/TFORCALL/tailcall/hooks (basel
             \\return a, b, c
         , "=a11s4a");
         try testing.expect(st == .ok);
-        try testing.expect(state.pcall(0, 3) == .ok);
+        try testing.expect((state.pcall(0, 3) catch |e| return e) == .ok);
         try testing.expectEqual(@as(i64, 2), c_api.lua_tointegerx(L, -3, null));
         try testing.expectEqual(@as(i64, 7), c_api.lua_tointegerx(L, -2, null));
         try testing.expectEqual(@as(i64, 8), c_api.lua_tointegerx(L, -1, null));
@@ -71124,7 +71520,7 @@ test "A1.1s1 class 4: readiness probes — vararg/TFORCALL/tailcall/hooks (basel
     {
         const st = state.loadbuffer("return select('#', ...)", "=a11s4b");
         try testing.expect(st == .ok);
-        try testing.expect(state.pcall(0, 1) == .ok);
+        try testing.expect((state.pcall(0, 1) catch |e| return e) == .ok);
         try testing.expectEqual(@as(i64, 0), c_api.lua_tointegerx(L, -1, null));
         c_api.lua_pop(L, 1);
     }
@@ -71136,7 +71532,7 @@ test "A1.1s1 class 4: readiness probes — vararg/TFORCALL/tailcall/hooks (basel
             \\return n
         , "=a11s4c");
         try testing.expect(st == .ok);
-        try testing.expect(state.pcall(0, 1) == .ok);
+        try testing.expect((state.pcall(0, 1) catch |e| return e) == .ok);
         try testing.expectEqual(@as(i64, 60), c_api.lua_tointegerx(L, -1, null));
         c_api.lua_pop(L, 1);
     }
@@ -71151,7 +71547,7 @@ test "A1.1s1 class 4: readiness probes — vararg/TFORCALL/tailcall/hooks (basel
             \\return loop(100000)
         , "=a11s4d");
         try testing.expect(st == .ok);
-        try testing.expect(state.pcall(0, 1) == .ok);
+        try testing.expect((state.pcall(0, 1) catch |e| return e) == .ok);
         var len: usize = 0;
         const s = c_api.lua_tolstring(L, -1, &len);
         try testing.expect(s != null);
@@ -71172,7 +71568,7 @@ test "A1.1s1 class 4: readiness probes — vararg/TFORCALL/tailcall/hooks (basel
             \\return count > 0, x
         , "=a11s4e");
         try testing.expect(st == .ok);
-        try testing.expect(state.pcall(0, 2) == .ok);
+        try testing.expect((state.pcall(0, 2) catch |e| return e) == .ok);
         try testing.expectEqual(@as(c_int, 1), c_api.lua_toboolean(L, -2));
         try testing.expectEqual(@as(i64, 2), c_api.lua_tointegerx(L, -1, null));
         c_api.lua_pop(L, 2);
@@ -71211,7 +71607,7 @@ test "A1.1s1 class 8: post-blackening err_obj write — root-mark tripwire (GREE
     {
         const st = state.loadbuffer("local t = {} error(t)", "=a11s8a");
         try testing.expect(st == .ok);
-        try testing.expect(state.pcall(0, 1) == .runtime_error);
+        try testing.expect((state.pcall(0, 1) catch |e| return e) == .runtime_error);
         // Drop the stack copy the pcall boundary pushed — the thread field
         // is now the sole reference.
         try state.pop(1);
@@ -71233,7 +71629,7 @@ test "A1.1s1 class 8: post-blackening err_obj write — root-mark tripwire (GREE
     {
         const st = state.loadbuffer("local t = {} error(t)", "=a11s8b");
         try testing.expect(st == .ok);
-        try testing.expect(state.pcall(0, 1) == .runtime_error);
+        try testing.expect((state.pcall(0, 1) catch |e| return e) == .runtime_error);
         const th = vm.errThread();
         const tbl = th.err_obj.Table;
         try vm.gcMinorCollection();
@@ -71308,7 +71704,7 @@ test "Proof 7: CClosure upvalues work without c_active_closure (top C frame)" {
     // upvalues, the nested inner reads ITS own, and the outer re-reads
     // its first after the inner frame popped.
     _ = c_api.lua_getglobal(L, "a11p7");
-    try testing.expect(state.pcall(0, 0) == .ok);
+    try testing.expect((state.pcall(0, 0) catch |e| return e) == .ok);
     try testing.expectEqual(@as(i64, 111), a11p7_outer_up1);
     try testing.expectEqual(@as(i64, 222), a11p7_outer_up2);
     try testing.expectEqual(@as(i64, 777), a11p7_inner_up1);
@@ -71330,7 +71726,7 @@ test "Proof 7: CClosure upvalues work without c_active_closure (top C frame)" {
     c_api.lua_pop(L, 1);
     a11p7_outer_up2 = -1;
     _ = c_api.lua_getglobal(L, "a11p7");
-    try testing.expect(state.pcall(0, 0) == .ok);
+    try testing.expect((state.pcall(0, 0) catch |e| return e) == .ok);
     try testing.expectEqual(@as(i64, 999), a11p7_outer_up2);
     c_api.lua_pop(L, 1);
 }
@@ -72276,6 +72672,162 @@ test "testC pcallk recovery: TBC close inside the C continuation keeps the parke
             \\  coroutine.status(co)
             ,
             .want = &.{ "kran", "true,y1", "suspended", "true,kret", "dead" },
+        },
+    };
+
+    for (forms) |form| {
+        var vm: Vm = .init(testing.allocator, false);
+        defer vm.deinit();
+        const main_h = try vm.setupMainHandle();
+        defer vm.freeStateHandle(main_h);
+        vm.setDynamicBytecodeCompiler(defaultBytecodeCompiler);
+        try vm.enableTestcModule();
+
+        const chunk_v = try vm.compileChunkValue(form.src, form.name);
+        var scope = try vm.openRootScope(1, 0);
+        defer scope.close();
+        _ = scope.protectValueAssumeCapacity(chunk_v);
+        const cl = chunk_v.Closure;
+
+        const results = try vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
+        defer vm.alloc.free(results);
+        try testing.expectEqual(form.want.len, results.len);
+        for (form.want, results) |want, got| {
+            try testing.expect(got == .String);
+            try testing.expectEqualStrings(want, got.String.bytes());
+        }
+    }
+}
+
+// The main-destined transport through the testC machinery: the raise
+// crossing testC C-activations (the pad sentinel), the GC finalizer
+// re-entry through a testC thread-lane truncation, and the checkpanic
+// panic lane around a sub-state with no armed boundary anywhere. These
+// need the test-only T module, so they live here (the C-API classes of
+// the same transport are the permanent C differential suite
+// tests/c_api/40_maindestined_transport.c).
+test "main-destined transport: testC lane pads, GC finalizer re-entry, checkpanic panic lane" {
+    const testing = std.testing;
+
+    const Form = struct {
+        name: []const u8,
+        src: []const u8,
+        want: []const []const u8,
+    };
+
+    const forms = [_]Form{
+        // The cross-thread truncation runs as a testC thread-lane script
+        // (T.testC(target, "settop 0")) from a caller coroutine's Lua body.
+        // Scenario A: the caller's resume itself is a testC script on main
+        // (T.testC("resume 2 0", caller)) — the raise must bypass BOTH the
+        // caller's and main's testC C-activations (zombie) and land on the
+        // innermost armed pcall. Scenario B: a plain Lua-level resume under
+        // a nested pcall. PUC-ltests etalon (verified differential):
+        // inner pcall catches false + the closer error, target dead, the
+        // mid-frame zombie caller reports "normal", the chunk continues.
+        .{
+            .name = "c6-lane",
+            .src =
+            \\local LOG = {}
+            \\OBJ = setmetatable({}, {__close = function() error("closer-boom") end})
+            \\local function make_target()
+            \\  local body = T.makeCfunc("toclose 1; yield 0")
+            \\  local co = coroutine.create(body)
+            \\  local ok, res = coroutine.resume(co, OBJ)
+            \\  LOG[#LOG + 1] = "target-first " .. tostring(ok) .. " " .. tostring(res) .. " " .. coroutine.status(co)
+            \\  return co
+            \\end
+            \\do
+            \\  local target = make_target()
+            \\  local caller = coroutine.create(function() T.testC(target, "settop 0") end)
+            \\  local ok, err = pcall(function()
+            \\    T.testC("resume 2 0", caller)
+            \\    LOG[#LOG + 1] = "unreachable-A"
+            \\  end)
+            \\  LOG[#LOG + 1] = "A-inner-pcall " .. tostring(ok) .. " " .. tostring(err)
+            \\  LOG[#LOG + 1] = "A-target-status " .. coroutine.status(target)
+            \\  LOG[#LOG + 1] = "A-caller-status " .. coroutine.status(caller)
+            \\end
+            \\do
+            \\  local target = make_target()
+            \\  local caller = coroutine.create(function() T.testC(target, "settop 0") end)
+            \\  local ok, err = pcall(function()
+            \\    local rok = coroutine.resume(caller)
+            \\    LOG[#LOG + 1] = "unreachable-B " .. tostring(rok)
+            \\  end)
+            \\  LOG[#LOG + 1] = "B-inner-pcall " .. tostring(ok) .. " " .. tostring(err)
+            \\  LOG[#LOG + 1] = "B-target-status " .. coroutine.status(target)
+            \\  LOG[#LOG + 1] = "B-caller-status " .. coroutine.status(caller)
+            \\end
+            \\return table.concat(LOG, "|")
+            ,
+            .want = &.{
+                "target-first true nil suspended|" ++
+                    "A-inner-pcall false [string \"c6-lane\"]:2: closer-boom|" ++
+                    "A-target-status dead|" ++
+                    "A-caller-status normal|" ++
+                    "target-first true nil suspended|" ++
+                    "B-inner-pcall false [string \"c6-lane\"]:2: closer-boom|" ++
+                    "B-target-status dead|" ++
+                    "B-caller-status normal",
+            },
+        },
+        // GC finalizer re-entry: a __gc metamethod performs the cross-thread
+        // truncation through the testC thread lane. The finalizer runs
+        // protected on the GC-running thread (main here), so the re-thrown
+        // closer error lands on the finalizer's own protection and degrades
+        // to the "error in __gc" warning (stderr noise under the test
+        // runner); the GC cycle and the chunk continue, the target is dead.
+        // PUC-ltests etalon (verified differential).
+        .{
+            .name = "gc-reentry",
+            .src =
+            \\local LOG = {}
+            \\OBJ = setmetatable({}, {__close = function() error("closer-boom") end})
+            \\local target = coroutine.create(T.makeCfunc("toclose 1; yield 0"))
+            \\local ok0 = coroutine.resume(target, OBJ)
+            \\LOG[#LOG + 1] = "target-first " .. tostring(ok0) .. " " .. coroutine.status(target)
+            \\local finalizable = setmetatable({}, {__gc = function() T.testC(target, "settop 0") end})
+            \\finalizable = nil
+            \\collectgarbage()
+            \\LOG[#LOG + 1] = "after-gc " .. coroutine.status(target)
+            \\LOG[#LOG + 1] = "chunk-continues"
+            \\return table.concat(LOG, "|")
+            ,
+            .want = &.{
+                "target-first true suspended|after-gc dead|chunk-continues",
+            },
+        },
+        // The checkpanic panic lane: the bare checkpanic sub-state has no
+        // armed boundary anywhere, so an error there is the panic lane.
+        // Variant A: an unprotected error with a live to-be-closed mark
+        // whose closer returns normally — the mark closes during the panic
+        // reset and the original error object reaches the panic script.
+        // Variant B: the closer itself errors during the panic reset —
+        // last-error-wins replaces the object. The PUC-ltests-verified
+        // shape (a nil-call runtime error in the closer) is kept as raw
+        // differential evidence only: its allocPrint'd runtime-error
+        // strings leak at the sub-VM teardown under the testing allocator
+        // (a pre-existing ownership gap, reproduced at HEAD before this
+        // transport work), so the permanent form raises a compile-time
+        // literal instead — the bare sub-VM exposes the builtin globals
+        // (a documented pre-existing divergence from PUC's ltests
+        // sub-state), which error() needs here. The testC loadstring
+        // command consumes name and mode tokens unconditionally, so both
+        // are supplied.
+        .{
+            .name = "checkpanic-lane",
+            .src =
+            \\local script_a = [[pushstring "return function(_, e) return 'closed' end"; loadstring 1 "bt" "bt"; call 0 1; newtable; newtable; pushvalue 2; setfield 4 "__close"; setmetatable 3; toclose 3; pushstring "boom"; error]]
+            \\local script_b = [[pushstring "return function(_, e) error('cerr', 0) end"; loadstring 1 "bt" "bt"; call 0 1; newtable; newtable; pushvalue 2; setfield 4 "__close"; setmetatable 3; toclose 3; pushstring "boom"; error]]
+            \\local panic_script = [[pushstring "panic-saw:"; concat 2]]
+            \\return "A " .. T.checkpanic(script_a, panic_script) .. "|" ..
+            \\  "B " .. T.checkpanic(script_b, panic_script)
+            ,
+            .want = &.{
+                "A boompanic-saw:|" ++
+                    "B cerrpanic-saw:",
+            },
         },
     };
 

@@ -12,6 +12,11 @@ pub const ApiError = std.mem.Allocator.Error || error{
     Memory,
     InvalidIndex,
     InvalidState,
+    // typed transport: a main-destined closer error in flight (see
+    // Vm.Error.MainDestined). Identity-mapped by mapVmError/mapDispatchError;
+    // C-API shims relay it across the current C frame (cRelayMainDestined)
+    // instead of folding it into a caller-local throw.
+    MainDestined,
 };
 
 pub const Type = enum(u8) {
@@ -911,6 +916,10 @@ pub const State = struct {
         self.vm.apiYield(th.stack[base..th.top]) catch |err| switch (err) {
             error.RuntimeError, error.Yield => return error.Runtime,
             error.OutOfMemory => return error.OutOfMemory,
+            // identity — the yield machinery itself never raises the
+            // kind (no user code); propagate it unfolded if a nested path
+            // ever produces one.
+            error.MainDestined => return error.MainDestined,
         };
     }
 
@@ -1115,7 +1124,7 @@ pub const State = struct {
         return self.loadbuffer(source.bytes, source.name);
     }
 
-    pub fn pcall(self: *State, nargs: usize, nresults: i32) Status {
+    pub fn pcall(self: *State, nargs: usize, nresults: i32) error{MainDestined}!Status {
         const th = self.curThread();
         if (self.count() < nargs + 1) return .runtime_error;
         const func_slot = th.top - nargs - 1;
@@ -1150,7 +1159,37 @@ pub const State = struct {
         // (luaD_closeprotected) before building the error object.
         const act = self.vm.activeBytecodeThread();
         const tbc_base = act.c_tbc_chain.items.len;
+        // the pcall-entry frame count — PUC luaD_pcall's old_ci. A
+        // consumed MainDestined skipped the semantic error unwind (the
+        // transported kind abandons frames without unwinding them), so the
+        // catch below restores the frame level itself, exactly like PUC's
+        // `L->ci = old_ci`.
+        const saved_frame_count = act.call_frames.len();
+        // PUC luaD_pcall arms the thread's own boundary for the call's
+        // extent (protected_depth — the errorJmp-armed fact a cross-thread
+        // close on THIS thread branches on at its raise).
+        th.protected_depth += 1;
+        defer th.protected_depth -= 1;
         const ret = self.vm.apiCall(.nonyieldable, callee, args) catch |e| {
+            // typed transport: a main-destined closer error caught
+            // on a NON-main thread must NOT be consumed here — PUC
+            // ldo.c:130-138 re-throws it on MAIN's armed boundary,
+            // bypassing this pcall entirely (no region close, no top
+            // restore, no error-object push: those mutations below belong
+            // to the consumer on main only). Propagate the kind; the
+            // relay chain delivers it to main's boundary.
+            if (e == error.MainDestined and act != self.vm.main_thread.?) {
+                return error.MainDestined;
+            }
+            // Consume on main: the transported kind ran NO semantic
+            // unwind — drop the abandoned intermediate frames here (PUC
+            // luaD_pcall's ci restore) BEFORE the region close below
+            // (PUC order: ci restore, then closeprotected). The unwind
+            // pop-detaches live marks; the close below then closes every
+            // mark above the pcall entry with the in-flight error.
+            if (e == error.MainDestined) {
+                self.vm.unwindBytecodeExecFrames(&act.call_frames, saved_frame_count);
+            }
             // PUC luaD_pcall (ldo.c:1090-1095): on error, restore the
             // stack to the base, run luaD_closeprotected(old_top, status)
             // — every TBC mark above the pcall entry closes WITH the
@@ -1174,13 +1213,20 @@ pub const State = struct {
             // with the final closer error when a closer errored.
             // P16.36 Cut 1b: the pcall'd call raised on the active
             // thread (same-thread protected call) — read its error state
-            // directly.
+            // directly. A MainDestined consumed HERE (act == main)
+            // publishes the object crossCloseErrorRaise installed into
+            // main's err state (PUC: the object copied to main's top).
             const errval: vm_mod.Value = if (act.err_has_obj) act.err_obj else .Nil;
             self.vm.cWindowPush(th, errval) catch return .memory_error;
             // PUC: status is LUA_ERRERR (5) if the message handler errored,
-            // LUA_ERRMEM (4) for OOM, LUA_ERRRUN (2) otherwise.
+            // LUA_ERRMEM (4) for OOM, LUA_ERRRUN (2) otherwise. A
+            // consumed MainDestined maps by main's installed kind bits
+            // (crossCloseErrorRaise set err_is_oom from the PUC status).
             return switch (e) {
                 error.OutOfMemory => .memory_error,
+                error.MainDestined => if (act.err_is_oom)
+                    .memory_error
+                else if (act.err_is_errerr) .error_handler_error else .runtime_error,
                 else => if (act.err_is_errerr) .error_handler_error else .runtime_error,
             };
         };
@@ -1858,6 +1904,9 @@ pub fn mapVmError(err: vm_mod.Vm.Error) ApiError {
         // non-yieldable invariant broke — fail loudly instead of silently
         // re-labeling coroutine control flow as ERRRUN.
         error.Yield => @panic("api: yield crossed a non-yieldable API boundary"),
+        // identity — the kind stays visible to the C-API shim,
+        // which relays it (never a caller-local throw).
+        error.MainDestined => error.MainDestined,
     };
 }
 
@@ -1872,6 +1921,8 @@ fn mapDispatchError(err: vm_mod.Vm.DispatchError) ApiError {
         error.RuntimeError => error.Runtime,
         error.Yield => @panic("api: yield crossed a non-yieldable API boundary"),
         error.ThreadSwitch => @panic("api: thread-switch crossed a host API boundary"),
+        // identity — see mapVmError.
+        error.MainDestined => error.MainDestined,
     };
 }
 
@@ -1893,6 +1944,9 @@ pub fn mapCompileError(err_val: CompileError) Status {
         error.RuntimeError => .runtime_error,
         error.Yield => @panic("api: yield crossed a non-yieldable load boundary"),
         error.ThreadSwitch => @panic("api: thread-switch crossed a host load boundary"),
+        // compiling runs no user code, so the kind is unreachable on
+        // this path — fail loudly instead of folding it into ERRRUN.
+        error.MainDestined => @panic("api: main-destined error crossed a load boundary"),
     };
 }
 

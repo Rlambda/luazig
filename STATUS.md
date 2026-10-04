@@ -308,7 +308,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   воспроизведения важен предшествующий контекст all.lua. Решающий
   эксперимент и класс — отдельная итерация.
 
-- [ ] **FO6(cs3oom): `lua_pushcfunction` при n=0 выделяет Closure
+- [x] **FO6(cs3oom): `lua_pushcfunction` при n=0 выделяет Closure
   (BLOCKER, pre-existing, ARCHITECTURAL-BACKLOG).** PUC 5.5
   `lua_pushcclosure` при n=0 кладёт light C function через `setfvalue`
   без allocation (`lapi.c:611`); Zig `State.pushcfunction` вызывает
@@ -319,6 +319,25 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   его заменили на fallible `pushlstring`. Требуется модель light C
   function и общий inventory call/type/equality/GC/dump sites,
   отдельный milestone после утверждения дизайна.
+  CLOSED (D1 milestone, cuts `482c21f`+`cdf1c13`, 2026-10-03):
+  Value.LightCFunction (nullable, non-GC) для публичных
+  pushcfunction/pushcclosure(f,0), luaL_setfuncs(nup==0),
+  luaL_requiref openf, lookforfunc loader; ltable noncollectable light
+  keys (pointer equality/hash, полный key-контракт); cFuncEqual и
+  n=0 allocCclosure путь удалены (rg-proof). Оракулы B11-B15/B13/B19/
+  C26 ALL PASS; 94_package_loadlib против DL-enabled PUC —
+  byte-identical; постоянный suite 41_light_pub (9 проверок ловят
+  старую модель; byte-identical PUC D+RF). A6-разложение:
+  allocCclosure-корень закрыт; freeze-ERRMEM сместился в
+  callCFunction epilogue alloc.dupe результатов — PRE-EXISTING общий
+  класс → F-A6T (BLOCKER-класс, ARCHITECTURAL-BACKLOG, отдельный
+  milestone: in-window result delivery refactor; изолированный proof
+  integer-callback PUC 0/5 vs zig ERRMEM). Гейты: 374/374 D+RF,
+  smoke 93/93, matrix zig_fail=0, api580 GREEN. Perf: lua_calls
+  +0.0000%, c_calls −3.79% (улучшение). Новые findings: 29-q9
+  denied=3 vs 2 (MEDIUM, ORDINARY, pre-existing на pristine 482c21f);
+  stdlib .Builtin identity gap (MEDIUM, ARCH-BACKLOG — вне узкого D1
+  по решению владельца); loadlib("*")-probe (LOW).
   RESEARCH VERDICT (vlcf, 2026-10-03, к `38b4aa6`; отчёт
   /tmp/opencode/vlcf_report.md, oracle /tmp/opencode/vlcf_oracle.c +
   raw): FO6 подтверждён и изолирован freeze-oracle — ERRMEM возникает

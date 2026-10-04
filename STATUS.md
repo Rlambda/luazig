@@ -46,11 +46,25 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
 - [ ] **lua_getinfo '>'-режим (прямой function-аргумент) не реализован
-  (HIGH, pre-existing; найден scres 2026-10-04).** c_api.zig:3764
+  (BLOCKER, pre-existing; найден scres 2026-10-04).** c_api.zig:3764
   возвращает 0 для ВСЕХ видов функций; PUC lapi.c ldebug.c обрабатывает
   '>'-префикс (what смещается, func берётся со стека до вызова).
   Затрагивает каждый вызов getinfo с function-аргументом, независимо
   от .Builtin identity. Cut 0 в плане scres (Variant A).
+
+- [ ] **scres architecture verification: stdlib C trampoline не доказан
+  на target lua_State и OOM/GC (HIGH, FIX-NOW для research handoff).**
+  Research e9e0261 рекомендует Option A, но его throwaway trampoline
+  выбирает activeBytecodeThread вместо thread переданного L. Независимый
+  raw differential /tmp/scres_thread_raw.c: прямой вызов указателя
+  string.upper на coroutine того же VM — PUC `n=1, XY`, prototype
+  `n=-1, xy` (оба rc=0). Prototype также держит owned `outs` под
+  Zig defer через `testcLightCFuncError(OutOfMemory)`/_longjmp;
+  требуемого OOM→GC→retry proof нет. B2 perf-проценты заявлены без B2
+  counters в /tmp/opencode/scres_perf_ab.json; raw Debug/ReleaseFast
+  differential разделён по режимам не был. Нужна bounded verification
+  target-thread adapter, cleanup/roots, точного inventory и perf
+  provenance до owner decision; product-код master не менялся.
 
 - [ ] **GC finalizer thread-routing parity-gap (ARCHITECTURAL-BACKLOG;
   f1gc2, 2026-10-03).** PUC на host lua_gc(worker) aborts via panic-
@@ -514,6 +528,13 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   -> cleanup; Variant B (identity-зеркалирование на .Builtin) —
   задокументированный fallback. Owner decision требуется до
   implementation; STOP-условия в отчёте.
+  REVIEW 2026-10-04: INCONCLUSIVE для implementation handoff.
+  Source inventory и базовый identity-gap подтверждены, но prototype
+  не выполняет contract прямого f(L) на coroutine того же VM; OOM/GC
+  proof и раздельные D/RF raw отсутствуют, B2 perf raw не сохранён.
+  `124` — число probed entries, а не динамическое доказательство
+  каждого из ~141 опубликованных `.Builtin`. Следующий шаг —
+  bounded verification выше; owner decision пока рано.
 
 - [ ] **`package.loadlib(path, "*")` возвращает function вместо true
   (BLOCKER, pre-existing, ORDINARY-BACKLOG).** PUC `loadlib.c:391–394`

@@ -64408,164 +64408,42 @@ test "P16.50-review-3 R4: ledger audit under an ACTIVE testc control (no per-pro
     }
 }
 
-/// The R5 subprocess program, embedded as source. Built with the SAME
-/// module graph as `zig build test` (util + lua) and executed for scenarios
-/// A (throw from the main L) and B (throw from a non-current coroutine L2).
-/// Validated against the live tree before embedding: the identical program
-/// was built and run manually (both scenarios, SIGABRT, stderr output).
-const p50r3_panic_main_src =
-    \\// P16.50-review-3 R5 subprocess: atpanic hook on an unprotected OOM throw.
-    \\// Scenario comes from argv[1] ("A" or "B"); all diagnostics go to stderr.
-    \\const std = @import("std");
-    \\const lua = @import("lua");
-    \\
-    \\/// One-shot failing allocator: the FIRST allocation after `armed` is set
-    \\/// fails exactly once, everything else (before and after) passes through.
-    \\const OneShot = struct {
-    \\    inner: std.mem.Allocator,
-    \\    armed: bool = false,
-    \\    failed: bool = false,
-    \\
-    \\    fn allocator(self: *OneShot) std.mem.Allocator {
-    \\        return .{
-    \\            .ptr = self,
-    \\            .vtable = &.{
-    \\                .alloc = allocFn,
-    \\                .resize = resizeFn,
-    \\                .remap = remapFn,
-    \\                .free = freeFn,
-    \\            },
-    \\        };
-    \\    }
-    \\
-    \\    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-    \\        const self: *OneShot = @ptrCast(@alignCast(ctx));
-    \\        if (self.armed and !self.failed) {
-    \\            self.failed = true;
-    \\            return null;
-    \\        }
-    \\        return self.inner.rawAlloc(len, alignment, ret_addr);
-    \\    }
-    \\
-    \\    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-    \\        const self: *OneShot = @ptrCast(@alignCast(ctx));
-    \\        return self.inner.rawResize(memory, alignment, new_len, ret_addr);
-    \\    }
-    \\
-    \\    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-    \\        const self: *OneShot = @ptrCast(@alignCast(ctx));
-    \\        return self.inner.rawRemap(memory, alignment, new_len, ret_addr);
-    \\    }
-    \\
-    \\    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-    \\        const self: *OneShot = @ptrCast(@alignCast(ctx));
-    \\        self.inner.rawFree(memory, alignment, ret_addr);
-    \\    }
-    \\};
-    \\
-    \\fn dummyCfunc(L: ?*lua.c_api.lua_State) callconv(.c) c_int {
-    \\    _ = L;
-    \\    return 0;
-    \\}
-    \\
-    \\fn panicHook(L: ?*lua.c_api.lua_State) callconv(.c) c_int {
-    \\    var len: usize = 0;
-    \\    const msg = lua.c_api.lua_tolstring(L, -1, &len);
-    \\    std.debug.print("PANIC-SEEN L={x} msg={s}\n", .{ @intFromPtr(L), if (msg) |m| m[0..len] else "(null)" });
-    \\    return 0;
-    \\}
-    \\
-    \\pub fn main(init: std.process.Init) u8 {
-    \\    // argv[0] = program name, argv[1] = scenario ("A" default).
-    \\    const argv = init.minimal.args.vector;
-    \\    const scenario: []const u8 = if (argv.len > 1) std.mem.span(argv[1]) else "A";
-    \\
-    \\    var one_shot = OneShot{ .inner = std.heap.c_allocator };
-    \\    var state = lua.api.State.init(.{ .allocator = one_shot.allocator() });
-    \\    defer state.deinit();
-    \\    const vm = state.vm;
-    \\    const L = vm.main_handle.?;
-    \\    const c = lua.c_api;
-    \\
-    \\    _ = c.lua_atpanic(L, panicHook);
-    \\
-    \\    if (std.mem.eql(u8, scenario, "B")) {
-    \\        // Non-current coroutine handle: L2 exists, cur_handle stays main L.
-    \\        const L2 = c.lua_newthread(L);
-    \\        std.debug.print("EXPECT-L2 {x}\n", .{@intFromPtr(L2)});
-    \\        _ = c.lua_pushinteger(L2, 7);
-    \\        one_shot.armed = true;
-    \\        c.lua_pushcclosure(L2, dummyCfunc, 1);
-    \\    } else {
-    \\        std.debug.print("MAIN-L {x}\n", .{@intFromPtr(L)});
-    \\        _ = c.lua_pushinteger(L, 7);
-    \\        one_shot.armed = true;
-    \\        c.lua_pushcclosure(L, dummyCfunc, 1);
-    \\    }
-    \\    // Unreachable on both paths: the OOM either longjmps to a boundary
-    \\    // (none is active) or runs the panic hook and aborts.
-    \\    std.debug.print("NO-PANIC (unexpected)\n", .{});
-    \\    return 0;
-    \\}
-    \\
-;
+/// Run a crash fixture built by the test step in the test runner's mode.
+/// Every scenario starts a fresh process so intentional aborts cannot stop
+/// the remaining unit tests.
+const TestChildRun = struct {
+    term: std.process.Child.Term,
+    stdout: []u8,
+    stderr: []u8,
+};
+
+fn testChildPath() ![]const u8 {
+    const key = "LUAZIG_TEST_CHILD=";
+    const environ = std.c.environ;
+    var i: usize = 0;
+    while (environ[i]) |entry| : (i += 1) {
+        const item = std.mem.span(entry);
+        if (std.mem.startsWith(u8, item, key)) return item[key.len..];
+    }
+    return error.TestChildPathMissing;
+}
+
+fn runTestChild(allocator: std.mem.Allocator, io: std.Io, kind: []const u8, scenario: []const u8) !TestChildRun {
+    const path = try testChildPath();
+    const run = try std.process.run(allocator, io, .{ .argv = &.{ path, kind, scenario } });
+    return .{ .term = run.term, .stdout = run.stdout, .stderr = run.stderr };
+}
 
 test "P16.50-review-3 R5: atpanic hook on an unprotected OOM (subprocess)" {
     const testing = std.testing;
-
-    // std.testing exposes no shared Io in 0.16 — build our own threaded one
-    // (the cwd-probe-verified pattern for io-using tests). The child zig
-    // NEEDS a real environment (HOME / XDG_CACHE_HOME / PATH) to resolve
-    // its cache directories: Io.Threaded.init defaults `environ` to .empty
-    // and processSpawnPosix builds the child env from exactly that — an
-    // empty env makes `zig build-exe` fail with AppDataDirUnavailable.
-    // Pass the parent's libc environ (the start.zig pattern).
-    const c_environ = std.c.environ;
-    var env_count: usize = 0;
-    while (c_environ[env_count] != null) : (env_count += 1) {}
-    var io_threaded = std.Io.Threaded.init(testing.allocator, .{
-        .environ = .{ .block = .{ .slice = c_environ[0..env_count :null] } },
-    });
+    var io_threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer io_threaded.deinit();
     const io = io_threaded.io();
 
-    const src_path = "/tmp/opencode/p50r3_panic_main.zig";
-    const bin_path = "/tmp/opencode/p50r3_panic_bin";
-
-    // Write the subprocess source (the test binary's CWD is the build root,
-    // so the absolute /tmp path and the relative module paths both resolve).
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = src_path, .data = p50r3_panic_main_src });
-
-    // Build against the SAME module graph as `zig build test` (util + lua,
-    // libc linked). The optimize flag matches the current test mode so the
-    // lua module compile is shared with this test binary's cache entry.
-    const opt_flag = if (@import("builtin").mode == .ReleaseFast) "-OReleaseFast" else "-ODebug";
-    const build_result = try std.process.run(testing.allocator, io, .{
-        .argv = &.{
-            "/usr/bin/zig",             "build-exe",
-            "--dep",                    "lua",
-            "-Mroot=" ++ src_path,      "--dep",
-            "util",                     "-Mlua=src/lua/root.zig",
-            "-Mutil=src/util/root.zig", "-lc",
-            opt_flag,                   "-femit-bin=" ++ bin_path,
-        },
-    });
-    defer testing.allocator.free(build_result.stdout);
-    defer testing.allocator.free(build_result.stderr);
-    if (build_result.term != .exited or build_result.term.exited != 0) {
-        std.debug.print("p50r3 R5 build failed:\n{s}\n{s}\n", .{
-            build_result.stdout,
-            build_result.stderr,
-        });
-        return error.TestUnexpectedResult;
-    }
-
-    // Both scenarios share the binary; each must abort with SIGABRT (the
+    // Both scenarios share the fixture; each must abort with SIGABRT (the
     // panic path after the hook returns — PUC LUAI_THROW with no boundary).
     for ([_][]const u8{ "A", "B" }) |scenario| {
-        const run = try std.process.run(testing.allocator, io, .{
-            .argv = &.{ bin_path, scenario },
-        });
+        const run = try runTestChild(testing.allocator, io, "panic", scenario);
         defer testing.allocator.free(run.stdout);
         defer testing.allocator.free(run.stderr);
 
@@ -65452,171 +65330,26 @@ test "A1.0c hook boundary 12: PUC-valid count-hook yield suspends the coroutine;
     try testing.expectEqual(depth0, vm.gc_root_depth);
 }
 
-/// The §4 subprocess program, embedded as source. Built with the SAME
-/// module graph as `zig build test` (util + lua) and executed for two
-/// scenarios: "leak" (the callback returns with its RootScope still
-/// open — the production finish() checkpoint must catch it) and
-/// "control" (the callback closes its scope — the checkpoint passes).
-/// In Debug the leak scenario must ABORT at finish()'s exact-equality
-/// assert (SIGABRT + the unreachable panic, never reaching the
-/// "survived" marker); in ReleaseFast the comptime-eliminated assert
-/// gives way to the defensive restoreRoots, which must POSITIVELY
-/// restore the root state (the restored=1 marker) — deleting the
-/// assert from finish() turns the Debug expectation RED, which is
-/// exactly what the old in-process test 9 could not prove.
-const a10c_s4_child_src =
-    \\// A1.0c §4 subprocess: leaked RootScope through the production
-    \\// C-API boundary path. Scenario from argv[1]: "leak" (default) or
-    \\// "control". All diagnostics go to stderr.
-    \\const std = @import("std");
-    \\const lua = @import("lua");
-    \\
-    \\fn leakCf(L: ?*lua.c_api.lua_State) callconv(.c) c_int {
-    \\    const vm = L.?.vm;
-    \\    var scope = vm.openRootScope(1, 1) catch return 0;
-    \\    lua.c_api.lua_createtable(L, 0, 0);
-    \\    // The created table lands on the thread's WINDOW.
-    \\    const th = L.?.thread.?;
-    \\    const t = th.stack[th.top - 1].Table;
-    \\    const cell = vm.alloc.create(lua.internal.vm.Cell) catch {
-    \\        scope.close();
-    \\        return 0;
-    \\    };
-    \\    cell.* = .{ .value = .Nil };
-    \\    vm.gcRegisterCell(cell);
-    \\    _ = scope.protectValueAssumeCapacity(.{ .Table = t });
-    \\    _ = scope.protectCellAssumeCapacity(cell);
-    \\    _ = lua.c_api.lua_pushinteger(L, 7);
-    \\    return 1; // LEAK: the scope is never closed — finish() must catch it
-    \\}
-    \\
-    \\fn controlCf(L: ?*lua.c_api.lua_State) callconv(.c) c_int {
-    \\    const vm = L.?.vm;
-    \\    var scope = vm.openRootScope(1, 1) catch return 0;
-    \\    lua.c_api.lua_createtable(L, 0, 0);
-    \\    // Window read (see leakCf).
-    \\    const th = L.?.thread.?;
-    \\    const t = th.stack[th.top - 1].Table;
-    \\    const cell = vm.alloc.create(lua.internal.vm.Cell) catch {
-    \\        scope.close();
-    \\        return 0;
-    \\    };
-    \\    cell.* = .{ .value = .Nil };
-    \\    vm.gcRegisterCell(cell);
-    \\    _ = scope.protectValueAssumeCapacity(.{ .Table = t });
-    \\    _ = scope.protectCellAssumeCapacity(cell);
-    \\    scope.close(); // well-behaved: the checkpoint must pass
-    \\    _ = lua.c_api.lua_pushinteger(L, 5);
-    \\    return 1;
-    \\}
-    \\
-    \\pub fn main(init: std.process.Init) u8 {
-    \\    const argv = init.minimal.args.vector;
-    \\    const scenario: []const u8 = if (argv.len > 1) std.mem.span(argv[1]) else "leak";
-    \\    const leak = std.mem.eql(u8, scenario, "leak");
-    \\
-    \\    var state = lua.api.State.init(.{ .allocator = std.heap.c_allocator });
-    \\    defer state.deinit();
-    \\    const vm = state.vm;
-    \\    const L = vm.main_handle.?;
-    \\
-    \\    const roots_v0 = vm.gc_root_values.items.len;
-    \\    const roots_c0 = vm.gc_root_cells.items.len;
-    \\    const depth0 = vm.gc_root_depth;
-    \\
-    \\    // Drive the callback through the REAL production C-API boundary
-    \\    // path: lua_pushcfunction + lua_pcallk → apiCall → runClosure →
-    \\    // callCFunction → callCFunctionWithBoundary (the finish()
-    \\    // checkpoint at the normal C return).
-    \\    lua.c_api.lua_pushcfunction(L, if (leak) leakCf else controlCf);
-    \\    std.debug.print("A10C-CHILD-ARMED {s}\n", .{scenario});
-    \\    const st = lua.c_api.lua_pcallk(L, 0, 1, 0, 0, null);
-    \\    if (st != 0) {
-    \\        std.debug.print("A10C-CHILD-PCALL-FAIL {d}\n", .{st});
-    \\        return 3;
-    \\    }
-    \\    // Reached only when finish() accepted the return: in Debug the
-    \\    // leak scenario aborts AT the checkpoint, so this "survived"
-    \\    // marker's absence narrows the abort to the assert; in
-    \\    // ReleaseFast the defensive restore must have brought the root
-    \\    // state back exactly (restored=1).
-    \\    const restored = vm.gc_root_values.items.len == roots_v0 and
-    \\        vm.gc_root_cells.items.len == roots_c0 and
-    \\        vm.gc_root_depth == depth0;
-    \\    std.debug.print("A10C-CHILD-AFTER restored={d}\n", .{@intFromBool(restored)});
-    \\    if (!restored) return 4;
-    \\    // The pcall result is the main thread's WINDOW top.
-    \\    const mth = L.thread.?;
-    \\    const n = mth.stack[mth.top - 1].Int;
-    \\    std.debug.print("A10C-CHILD-OK n={d}\n", .{n});
-    \\    return 0;
-    \\}
-    \\
-;
+// The root-scope fixture is executed for two scenarios: "leak"
+// (the callback returns with its RootScope still
+// open — the production finish() checkpoint must catch it) and
+// "control" (the callback closes its scope — the checkpoint passes).
+// In Debug the leak scenario must ABORT at finish()'s exact-equality
+// assert (SIGABRT + the unreachable panic, never reaching the
+// "survived" marker); in ReleaseFast the comptime-eliminated assert
+// gives way to the defensive restoreRoots, which must POSITIVELY
+// restore the root state (the restored=1 marker) — deleting the
+// assert from finish() turns the Debug expectation RED, which is
+// exactly what the old in-process test 9 could not prove.
 
 test "A1.0c boundary 13: leaked-scope finish() assert is real (subprocess; Debug aborts, ReleaseFast restores)" {
     const testing = std.testing;
-
-    // Threaded Io with the parent's libc environ (the R5 pattern — the
-    // child zig needs a real environment for its cache directories).
-    const c_environ = std.c.environ;
-    var env_count: usize = 0;
-    while (c_environ[env_count] != null) : (env_count += 1) {}
-    var io_threaded = std.Io.Threaded.init(testing.allocator, .{
-        .environ = .{ .block = .{ .slice = c_environ[0..env_count :null] } },
-    });
+    var io_threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer io_threaded.deinit();
     const io = io_threaded.io();
 
-    // UNIQUE per-process paths: the Debug and ReleaseFast suites may run
-    // concurrently — a shared /tmp path (the R5 flaw) would collide.
-    const pid = std.c.getpid();
-    const src_path = try std.fmt.allocPrint(testing.allocator, "/tmp/opencode/a10c_s4_child_{d}.zig", .{pid});
-    defer testing.allocator.free(src_path);
-    const bin_path = try std.fmt.allocPrint(testing.allocator, "/tmp/opencode/a10c_s4_bin_{d}", .{pid});
-    defer testing.allocator.free(bin_path);
-    const root_arg = try std.fmt.allocPrint(testing.allocator, "-Mroot={s}", .{src_path});
-    defer testing.allocator.free(root_arg);
-    const emit_arg = try std.fmt.allocPrint(testing.allocator, "-femit-bin={s}", .{bin_path});
-    defer testing.allocator.free(emit_arg);
-
-    // The test binary's CWD is the build root, so the relative module
-    // paths resolve; the source lives at the absolute /tmp path.
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = src_path, .data = a10c_s4_child_src });
-
-    // Build against the SAME module graph as `zig build test` (util +
-    // lua, libc linked). Per-module CLI settings attach to the NEXT
-    // `-M` argument and reset after it: the optimize flag must precede
-    // EVERY module (root, lua, util) — a trailing `-O` applies to no
-    // module and silently builds an all-Debug child. Matching the
-    // current test mode also shares the lua module's cache entry with
-    // this test binary's compile.
-    const opt_flag = if (@import("builtin").mode == .ReleaseFast) "-OReleaseFast" else "-ODebug";
-    const build_result = try std.process.run(testing.allocator, io, .{
-        .argv = &.{
-            "/usr/bin/zig", "build-exe",
-            opt_flag,       "--dep",
-            "lua",          root_arg,
-            "--dep",        "util",
-            opt_flag,       "-Mlua=src/lua/root.zig",
-            opt_flag,       "-Mutil=src/util/root.zig",
-            "-lc",          emit_arg,
-        },
-    });
-    defer testing.allocator.free(build_result.stdout);
-    defer testing.allocator.free(build_result.stderr);
-    if (build_result.term != .exited or build_result.term.exited != 0) {
-        std.debug.print("a10c §4 build failed:\n{s}\n{s}\n", .{
-            build_result.stdout,
-            build_result.stderr,
-        });
-        return error.TestUnexpectedResult;
-    }
-
     for ([_][]const u8{ "leak", "control" }) |scenario| {
-        const run = try std.process.run(testing.allocator, io, .{
-            .argv = &.{ bin_path, scenario },
-        });
+        const run = try runTestChild(testing.allocator, io, "root-scope", scenario);
         defer testing.allocator.free(run.stdout);
         defer testing.allocator.free(run.stderr);
 
@@ -71937,70 +71670,6 @@ fn a11RegionPerm(io: std.Io, alloc: std.mem.Allocator, addr: usize) !?[4]u8 {
     return null;
 }
 
-/// One subprocess run result (term + both streams, caller frees).
-const A11ChildRun = struct {
-    term: std.process.Child.Term,
-    stdout: []u8,
-    stderr: []u8,
-};
-
-/// Build an oracle child program (the a10c §4 convention: same
-/// module graph as `zig build test`, unique /tmp paths, scenario from
-/// argv[1]). Returns the binary path (caller frees).
-fn a11ChildBuild(talloc: std.mem.Allocator, io: std.Io, child_src: []const u8, tag: []const u8) ![]u8 {
-    const opt_flag = if (@import("builtin").mode == .ReleaseFast) "-OReleaseFast" else "-ODebug";
-    return a11ChildBuildMode(talloc, io, child_src, tag, opt_flag);
-}
-
-fn a11ChildBuildMode(talloc: std.mem.Allocator, io: std.Io, child_src: []const u8, tag: []const u8, opt_flag: []const u8) ![]u8 {
-    const pid = std.c.getpid();
-    const src_path = try std.fmt.allocPrint(talloc, "/tmp/opencode/a11s1_{s}_{d}.zig", .{ tag, pid });
-    defer talloc.free(src_path);
-    const bin_path = try std.fmt.allocPrint(talloc, "/tmp/opencode/a11s1_{s}_bin_{d}", .{ tag, pid });
-    errdefer talloc.free(bin_path);
-    const root_arg = try std.fmt.allocPrint(talloc, "-Mroot={s}", .{src_path});
-    defer talloc.free(root_arg);
-    const emit_arg = try std.fmt.allocPrint(talloc, "-femit-bin={s}", .{bin_path});
-    defer talloc.free(emit_arg);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = src_path, .data = child_src });
-    // Per-module CLI settings attach to the NEXT -M argument: the
-    // optimize flag must precede EVERY module (a10c §4 lesson — a
-    // trailing -O applies to no module and silently builds all-Debug).
-    const build_result = try std.process.run(talloc, io, .{
-        .argv = &.{
-            "/usr/bin/zig", "build-exe",
-            opt_flag,       "--dep",
-            "lua",          root_arg,
-            "--dep",        "util",
-            opt_flag,       "-Mlua=src/lua/root.zig",
-            opt_flag,       "-Mutil=src/util/root.zig",
-            "-lc",          emit_arg,
-        },
-    });
-    defer talloc.free(build_result.stdout);
-    defer talloc.free(build_result.stderr);
-    if (build_result.term != .exited or build_result.term.exited != 0) {
-        std.debug.print("a11s1 child build failed ({s}):\n{s}\n{s}\n", .{
-            tag, build_result.stdout, build_result.stderr,
-        });
-        return error.TestUnexpectedResult;
-    }
-    return bin_path;
-}
-
-fn a11ChildRun(talloc: std.mem.Allocator, io: std.Io, bin: []const u8, scenario: []const u8) !A11ChildRun {
-    const run = try std.process.run(talloc, io, .{ .argv = &.{ bin, scenario } });
-    return .{ .term = run.term, .stdout = run.stdout, .stderr = run.stderr };
-}
-
-/// Delete a child binary after its run — each a11ChildBuild* call emits a
-/// fresh pid-unique ~56M Debug binary into /tmp/opencode; without this the
-/// suite leaks ~0.5G per run and eventually exhausts the tmpfs (observed:
-/// silent empty-output build failures once /tmp passed ~80%).
-fn a11ChildBinDelete(io: std.Io, bin: []const u8) void {
-    std.Io.Dir.deleteFileAbsolute(io, bin) catch {};
-}
-
 test "A1.1s1 oracle 1: poison ledger, in-region resize, region remap, maps PROT_NONE, teardown release" {
     const testing = std.testing;
     var vm: Vm = .init(testing.allocator, false);
@@ -72077,63 +71746,14 @@ test "A1.1s1 oracle 1: poison ledger, in-region resize, region remap, maps PROT_
     // (deferred above; nothing to do here)
 }
 
-/// The §oracle-2 subprocess program: a freed poisoned block read must
-/// fault (SIGSEGV); the control (read before free) must pass cleanly.
-const a11_oracle2_child_src =
-    \\// A1.1s1 oracle 2 child: poison-trap fault proof. Scenario from
-    \\// argv[1]: "fault" (default) or "control". Diagnostics to stderr.
-    \\const std = @import("std");
-    \\const lua = @import("lua");
-    \\
-    \\pub fn main(init: std.process.Init) u8 {
-    \\    const argv = init.minimal.args.vector;
-    \\    const scenario: []const u8 = if (argv.len > 1) std.mem.span(argv[1]) else "fault";
-    \\
-    \\    var state = lua.api.State.init(.{ .allocator = std.heap.c_allocator });
-    \\    defer state.deinit();
-    \\    const vm = state.vm;
-    \\
-    \\    // Arm the oracle: every charged block from here on lives in a
-    \\    // private mapping; its free traps the region (PROT_NONE).
-    \\    vm.testcArmPoisonUnmap();
-    \\    const block = vm.alloc.alloc(u8, 64) catch {
-    \\        std.debug.print("A11S1-OR2-ALLOC-FAIL\n", .{});
-    \\        return 3;
-    \\    };
-    \\
-    \\    if (std.mem.eql(u8, scenario, "control")) {
-    \\        // Live read (mapped, rw): must succeed; the free then traps
-    \\        // and the deferred teardown releases the region cleanly.
-    \\        const v = block[0];
-    \\        std.debug.print("A11S1-OR2-CONTROL-OK {d}\n", .{v});
-    \\        vm.alloc.free(block);
-    \\        return 0;
-    \\    }
-    \\
-    \\    // Fault arm: free traps the region, then the read must SIGSEGV.
-    \\    vm.alloc.free(block);
-    \\    std.debug.print("A11S1-OR2-ARMED\n", .{});
-    \\    const v = block[0]; // freed-header read: deterministic fault
-    \\    std.debug.print("A11S1-OR2-NO-FAULT {d}\n", .{v});
-    \\    return 0;
-    \\}
-    \\
-;
+// The §oracle-2 subprocess program: a freed poisoned block read must
+// fault (SIGSEGV); the control (read before free) must pass cleanly.
 
 test "A1.1s1 oracle 2: freed poisoned block read faults in a subprocess (control passes)" {
     const testing = std.testing;
-    const c_environ = std.c.environ;
-    var env_count: usize = 0;
-    while (c_environ[env_count] != null) : (env_count += 1) {}
-    var io_threaded = std.Io.Threaded.init(testing.allocator, .{
-        .environ = .{ .block = .{ .slice = c_environ[0..env_count :null] } },
-    });
+    var io_threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer io_threaded.deinit();
     const io = io_threaded.io();
-
-    const bin = try a11ChildBuild(testing.allocator, io, a11_oracle2_child_src, "or2");
-    defer testing.allocator.free(bin);
-    defer a11ChildBinDelete(io, bin);
 
     // Fault arm: the freed-header read must fault. In Debug the child's
     // Zig runtime intercepts the SIGSEGV and re-raises it as a handled
@@ -72141,7 +71761,7 @@ test "A1.1s1 oracle 2: freed poisoned block read faults in a subprocess (control
     // at the exact read); in ReleaseFast there is no handler and the
     // raw SIGSEGV surfaces. Both shapes are the same deterministic fault.
     {
-        const run = try a11ChildRun(testing.allocator, io, bin, "fault");
+        const run = try runTestChild(testing.allocator, io, "poison", "fault");
         defer testing.allocator.free(run.stdout);
         defer testing.allocator.free(run.stderr);
         const segv = (run.term == .signal and run.term.signal == .SEGV) or
@@ -72158,7 +71778,7 @@ test "A1.1s1 oracle 2: freed poisoned block read faults in a subprocess (control
     }
     // Control: clean exit — the same alloc/free path with a LIVE read.
     {
-        const run = try a11ChildRun(testing.allocator, io, bin, "control");
+        const run = try runTestChild(testing.allocator, io, "poison", "control");
         defer testing.allocator.free(run.stdout);
         defer testing.allocator.free(run.stderr);
         if (run.term != .exited or run.term.exited != 0) {
@@ -72171,106 +71791,28 @@ test "A1.1s1 oracle 2: freed poisoned block read faults in a subprocess (control
     }
 }
 
-/// The §class-10 subprocess program: proves the wholesale marking model's
-/// core safety property — an object referenced by any frame-window slot
-/// is never swept while the reference exists. The chunk arms fail-all and
-/// triggers the emergency GC (the allocFn retry after a countdown-0
-/// failure), whose root scan marks the WHOLE register window including
-/// dead slots. Under wholesale marking the dead-slot tables
-/// from the block scope SURVIVE the earlier collectgarbage() (retained one
-/// cycle, PUC's own below-top conservatism shape), so the emergency scan
-/// reads live registered pointers — no freed-header read is possible, with
-/// or without the sweep. If marking ever regresses to a per-PC liveness
-/// bound, the sweep frees the dead-slot tables and the scan (whose old
-/// registry-membership skip is removed) reads the freed header: with the
-/// poison oracle armed that faults deterministically before DONE; without
-/// it the read is silent corruption. PUC has the same property by
-/// construction (traversethread marks [0..L->top) wholesale; the collector
-/// never frees an object referenced below an active frame's top).
-const a11_c10_child_src =
-    \\// A1.1s1 class-10 child: emergency-GC stale register mark reads a
-    \\// freed object header. Scenario from argv[1]: "poison" (default),
-    \\// "nopoison", or "nosweep". Diagnostics to stderr.
-    \\const std = @import("std");
-    \\const lua = @import("lua");
-    \\
-    \\fn armfailCf(L: ?*lua.c_api.lua_State) callconv(.c) c_int {
-    \\    // Arm the countdown INSIDE the chunk: arming before loadbuffer
-    \\    // would fail the compile allocations. 0 = fail while armed.
-    \\    L.?.vm.testcArmAllocCount(0);
-    \\    std.debug.print("A11S1-C10-ARMED\n", .{});
-    \\    return 0;
-    \\}
-    \\
-    \\pub fn main(init: std.process.Init) u8 {
-    \\    const argv = init.minimal.args.vector;
-    \\    const scenario: []const u8 = if (argv.len > 1) std.mem.span(argv[1]) else "poison";
-    \\
-    \\    var state = lua.api.State.init(.{ .allocator = std.heap.c_allocator });
-    \\    // NOT `defer state.deinit()`: under poison, State.deinit ->
-    \\    // vm.deinit -> releasePoisonedRegions munmaps ALL poisoned
-    \\    // regions including still-live charged ones (the main handle
-    \\    // c_stack), and the later freeStateHandle frees that c_stack
-    \\    // through the restored base allocator into the trapped region —
-    \\    // a teardown fault indistinguishable from the in-chunk emergency
-    \\    // fault this child exists to prove. Non-poison scenarios deinit
-    \\    // normally below; the process exit reclaims the rest.
-    \\    const vm = state.vm;
-    \\    vm.setDynamicBytecodeCompiler(lua.internal.vm.defaultBytecodeCompiler);
-    \\
-    \\    if (std.mem.eql(u8, scenario, "poison")) vm.testcArmPoisonUnmap();
-    \\
-    \\    // Register armfail as a Lua global (the production C-API path).
-    \\    const L = vm.main_handle.?;
-    \\    lua.c_api.lua_pushcfunction(L, armfailCf);
-    \\    lua.c_api.lua_setglobal(L, "armfail");
-    \\
-    \\    // Block-scoped locals die inside the frame register window (the
-    \\    // compiler does not nil them): after the `end`, slots 0-3 still
-    \\    // hold the four table pointers as DEAD slots. Wholesale marking
-    \\    // keeps them marked — the collectgarbage() cycle
-    \\    // RETAINS them (one-cycle dead-slot retention, PUC's own
-    \\    // below-top conservatism shape), so the emergency scan below
-    \\    // reads live registered pointers whether or not the sweep ran.
-    \\    // armfail() arms fail-all; `local q = {}` reuses slot 0 but
-    \\    // OP_NEWTABLE's allocation fails BEFORE the store, so the
-    \\    // emergency GC scan (full frame window) reads slots 0-3.
-    \\    const sweep = !std.mem.eql(u8, scenario, "nosweep");
-    \\    const chunk = if (sweep)
-    \\        "do local a, b, c, d = {}, {}, {}, {} end collectgarbage() armfail() local q = {} return q"
-    \\    else
-    \\        "do local a, b, c, d = {}, {}, {}, {} end armfail() local q = {} return q";
-    \\
-    \\    const lst = state.loadbuffer(chunk, "=a11s1c10");
-    \\    if (lst != .ok) {
-    \\        std.debug.print("A11S1-C10-LOAD-FAIL {d}\n", .{@intFromEnum(lst)});
-    \\        return 3;
-    \\    }
-    \\    const pst = state.pcall(0, 0) catch |perr| {
-    \\        std.debug.print("A11S1-C10-PCALL-ERR {s}\n", .{@errorName(perr)});
-    \\        return 5;
-    \\    };
-    \\    std.debug.print("A11S1-C10-DONE status={d}\n", .{@intFromEnum(pst)});
-    \\    if (!std.mem.eql(u8, scenario, "poison")) state.deinit();
-    \\    return 0;
-    \\}
-    \\
-;
+// The §class-10 subprocess program: proves the wholesale marking model's
+// core safety property — an object referenced by any frame-window slot
+// is never swept while the reference exists. The chunk arms fail-all and
+// triggers the emergency GC (the allocFn retry after a countdown-0
+// failure), whose root scan marks the WHOLE register window including
+// dead slots. Under wholesale marking the dead-slot tables
+// from the block scope SURVIVE the earlier collectgarbage() (retained one
+// cycle, PUC's own below-top conservatism shape), so the emergency scan
+// reads live registered pointers — no freed-header read is possible, with
+// or without the sweep. If marking ever regresses to a per-PC liveness
+// bound, the sweep frees the dead-slot tables and the scan (whose old
+// registry-membership skip is removed) reads the freed header: with the
+// poison oracle armed that faults deterministically before DONE; without
+// it the read is silent corruption. PUC has the same property by
+// construction (traversethread marks [0..L->top) wholesale; the collector
+// never frees an object referenced below an active frame's top).
 
 test "A1.1s1 class 10: emergency GC marks stale register slots — freed-header read faults under poison, silent memory_error without" {
     const testing = std.testing;
-    const c_environ = std.c.environ;
-    var env_count: usize = 0;
-    while (c_environ[env_count] != null) : (env_count += 1) {}
-    var io_threaded = std.Io.Threaded.init(testing.allocator, .{
-        .environ = .{ .block = .{ .slice = c_environ[0..env_count :null] } },
-    });
+    var io_threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer io_threaded.deinit();
     const io = io_threaded.io();
-
-    const bin = try a11ChildBuild(testing.allocator, io, a11_c10_child_src, "c10");
-    defer testing.allocator.free(bin);
-    defer a11ChildBinDelete(io, bin);
 
     // Poison-oracle tripwire for the wholesale marking model.
     //
@@ -72298,7 +71840,7 @@ test "A1.1s1 class 10: emergency GC marks stale register slots — freed-header 
     // memory_error (status 4) and exit cleanly; the ARMED marker proves
     // the countdown was armed inside the chunk.
     {
-        const run = a11ChildRun(testing.allocator, io, bin, "poison") catch |err| {
+        const run = runTestChild(testing.allocator, io, "emergency-gc", "poison") catch |err| {
             std.debug.print("a11s1 c10 poison: run error {s}\n", .{@errorName(err)});
             return err;
         };
@@ -72317,7 +71859,7 @@ test "A1.1s1 class 10: emergency GC marks stale register slots — freed-header 
     // nil'd dead slots, the same emergency scan, memory_error, clean
     // teardown (state.deinit runs: nothing is trapped).
     {
-        const run = try a11ChildRun(testing.allocator, io, bin, "nopoison");
+        const run = try runTestChild(testing.allocator, io, "emergency-gc", "nopoison");
         defer testing.allocator.free(run.stdout);
         defer testing.allocator.free(run.stderr);
         if (run.term != .exited or run.term.exited != 0) {
@@ -72333,7 +71875,7 @@ test "A1.1s1 class 10: emergency GC marks stale register slots — freed-header 
     // emergency scan marks them as ordinary reachable objects; the
     // countdown still fails the retried alloc — memory_error, status 4.
     {
-        const run = try a11ChildRun(testing.allocator, io, bin, "nosweep");
+        const run = try runTestChild(testing.allocator, io, "emergency-gc", "nosweep");
         defer testing.allocator.free(run.stdout);
         defer testing.allocator.free(run.stderr);
         if (run.term != .exited or run.term.exited != 0) {
@@ -72746,116 +72288,41 @@ test "A1.1s1 M28: lua_setiuservalue backward barrier remembers old userdata → 
     try testing.expect(p50StillRegistered(vm, a11s28_tbl.?) == true);
 }
 
-const a11_c14_child_src =
-    \\// A1.1s1 class-14 child: stale ValueRoot/CellRoot read/replace
-    \\// probe. Scenario from argv[1]: vr-read | vr-replace | cr-read |
-    \\// cr-replace. Contract (A1.1 brief class 14, M25-fixed): every
-    \\// stale handle op deterministically PANICS in Debug AND
-    \\// ReleaseFast — no silent .Nil, no silent no-op. Markers to
-    \\// stderr only on the (forbidden) survival path.
-    \\const std = @import("std");
-    \\const lua = @import("lua");
-    \\
-    \\pub fn main(init: std.process.Init) u8 {
-    \\    const argv = init.minimal.args.vector;
-    \\    const scenario: []const u8 = if (argv.len > 1) std.mem.span(argv[1]) else "vr-read";
-    \\
-    \\    var state = lua.api.State.init(.{ .allocator = std.heap.c_allocator });
-    \\    defer state.deinit();
-    \\    const vm = state.vm;
-    \\
-    \\    // A raw closed cell. The probe never collects and CellRoot only
-    \\    // stores/returns the pointer, so an unregistered cell suffices.
-    \\    const cell = std.heap.c_allocator.create(lua.internal.vm.Cell) catch return 1;
-    \\    cell.* = .{
-    \\        .value = .Nil,
-    \\        .stack_idx = lua.internal.vm.Cell.stack_closed,
-    \\        .stack_thread = null,
-    \\    };
-    \\    defer std.heap.c_allocator.destroy(cell);
-    \\
-    \\    var scope = vm.openRootScope(1, 1) catch return 1;
-    \\    const vroot = scope.protectValueAssumeCapacity(.{ .Int = 42 });
-    \\    const croot = scope.protectCellAssumeCapacity(cell);
-    \\    scope.close(); // both handles are stale now
-    \\
-    \\    if (std.mem.eql(u8, scenario, "vr-read")) {
-    \\        const v = vroot.read();
-    \\        // Unreachable on the contract: read panics before returning.
-    \\        std.debug.print("A11S1-C14 VR-READ-SURVIVED {any}\n", .{v});
-    \\    } else if (std.mem.eql(u8, scenario, "vr-replace")) {
-    \\        vroot.replace(.{ .Int = 7 });
-    \\        // Unreachable on the contract: replace panics.
-    \\        std.debug.print("A11S1-C14 VR-REPLACE-SURVIVED\n", .{});
-    \\    } else if (std.mem.eql(u8, scenario, "cr-read")) {
-    \\        const c = croot.read();
-    \\        // Unreachable on the contract: read panics.
-    \\        std.debug.print("A11S1-C14 CR-READ-SURVIVED {any}\n", .{c});
-    \\    } else {
-    \\        croot.replace(cell);
-    \\        // Unreachable on the contract: replace panics.
-    \\        std.debug.print("A11S1-C14 CR-REPLACE-SURVIVED\n", .{});
-    \\    }
-    \\    return 0;
-    \\}
-;
-
-test "A1.1s1 class 14: stale ValueRoot/CellRoot ops — deterministic panic in Debug and ReleaseFast (GREEN)" {
+test "A1.1s1 class 14: stale ValueRoot/CellRoot ops panic in the current build mode" {
     const testing = std.testing;
-    const c_environ = std.c.environ;
-    var env_count: usize = 0;
-    while (c_environ[env_count] != null) : (env_count += 1) {}
-    var io_threaded = std.Io.Threaded.init(testing.allocator, .{
-        .environ = .{ .block = .{ .slice = c_environ[0..env_count :null] } },
-    });
+    var io_threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer io_threaded.deinit();
     const io = io_threaded.io();
 
     const scenarios = [_][]const u8{ "vr-read", "vr-replace", "cr-read", "cr-replace" };
     for (scenarios) |scenario| {
-        // Contract: every stale handle op (vr-read/vr-replace/
-        // cr-read/cr-replace) aborts deterministically in BOTH modes —
-        // the panic branch is the check itself, so no comptime gating
-        // and no mode-dependent silent arms remain. Each child is
-        // built explicitly with its own -O mode: a11ChildBuild mirrors
-        // the PARENT's mode (mode-symmetric oracle tests), which would
-        // compile the wrong mode under a mismatched parent (found by
-        // the both-modes gate).
-        inline for ([_][]const u8{ "-ODebug", "-OReleaseFast" }) |opt_flag| {
-            const tag = if (comptime std.mem.eql(u8, opt_flag, "-ODebug")) "c14dbg" else "c14rf";
-            const bin = try a11ChildBuildMode(testing.allocator, io, a11_c14_child_src, tag, opt_flag);
-            defer testing.allocator.free(bin);
-            defer a11ChildBinDelete(io, bin);
-            const run = try a11ChildRun(testing.allocator, io, bin, scenario);
-            defer testing.allocator.free(run.stdout);
-            defer testing.allocator.free(run.stderr);
-            const aborted = switch (run.term) {
-                .exited => |c| c != 0,
-                .signal => true,
-                else => true,
-            };
-            if (!aborted) {
-                std.debug.print("a11s1 c14 {s} {s}: expected panic, got {any}\n{s}\n", .{
-                    tag, scenario, run.term, run.stderr,
-                });
-                return error.TestUnexpectedResult;
-            }
-            // The abort must be the deterministic contract panic, not a
-            // generic crash: stderr names the exact failing arm.
-            const marker: []const u8 = if (std.mem.eql(u8, scenario, "vr-read"))
-                "ValueRoot.read on stale/foreign handle"
-            else if (std.mem.eql(u8, scenario, "vr-replace"))
-                "ValueRoot.replace on stale/foreign handle"
-            else if (std.mem.eql(u8, scenario, "cr-read"))
-                "CellRoot.read on stale/foreign handle"
-            else
-                "CellRoot.replace on stale/foreign handle";
-            if (std.mem.indexOf(u8, run.stderr, marker) == null) {
-                std.debug.print("a11s1 c14 {s} {s}: abort without contract marker {s}:\n{s}\n", .{
-                    tag, scenario, marker, run.stderr,
-                });
-                return error.TestUnexpectedResult;
-            }
+        const run = try runTestChild(testing.allocator, io, "stale-root", scenario);
+        defer testing.allocator.free(run.stdout);
+        defer testing.allocator.free(run.stderr);
+        const aborted = switch (run.term) {
+            .exited => |c| c != 0,
+            .signal => true,
+            else => true,
+        };
+        if (!aborted) {
+            std.debug.print("a11s1 c14 {s}: expected panic, got {any}\n{s}\n", .{
+                scenario, run.term, run.stderr,
+            });
+            return error.TestUnexpectedResult;
+        }
+        const marker: []const u8 = if (std.mem.eql(u8, scenario, "vr-read"))
+            "ValueRoot.read on stale/foreign handle"
+        else if (std.mem.eql(u8, scenario, "vr-replace"))
+            "ValueRoot.replace on stale/foreign handle"
+        else if (std.mem.eql(u8, scenario, "cr-read"))
+            "CellRoot.read on stale/foreign handle"
+        else
+            "CellRoot.replace on stale/foreign handle";
+        if (std.mem.indexOf(u8, run.stderr, marker) == null) {
+            std.debug.print("a11s1 c14 {s}: abort without contract marker {s}:\n{s}\n", .{
+                scenario, marker, run.stderr,
+            });
+            return error.TestUnexpectedResult;
         }
     }
 }

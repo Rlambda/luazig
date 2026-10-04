@@ -115,6 +115,27 @@ pub fn build(b: *std.Build) void {
     lua_tests.root_module.link_libc = true;
     const run_lua_tests = b.addRunArtifact(lua_tests);
 
+    // Crash and panic tests execute this child with different scenarios. Build
+    // it once in the same mode as the test runner instead of compiling Lua
+    // again from inside each test case.
+    const test_child_name = b.fmt("luazig-test-child-{s}", .{@tagName(optimize)});
+    const test_child = b.addExecutable(.{
+        .name = test_child_name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/subprocess/fixture.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "lua", .module = lua_mod },
+                .{ .name = "util", .module = util_mod },
+            },
+        }),
+    });
+    test_child.root_module.link_libc = true;
+    const install_test_child = b.addInstallArtifact(test_child, .{ .dest_sub_path = test_child_name });
+    run_lua_tests.step.dependOn(&install_test_child.step);
+    run_lua_tests.setEnvironmentVariable("LUAZIG_TEST_CHILD", b.getInstallPath(.bin, test_child_name));
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lua_tests.step);
 }

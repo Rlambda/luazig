@@ -51,12 +51,6 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   прототипа). Отдельный от F-A6T класс? — решающий эксперимент в
   отчёте scresv.
 
-- [ ] **G2(scresv): lua_Alloc seam violation (HIGH, pre-existing;
-  найден scresv 2026-10-04).** Аллокации в обход user allocator; close
-  маршрутизирует 252 foreign frees / 78.7 KB через пользовательский
-  allocator — custom allocators были бы коррумпированы. Требует
-  inventory всех infraAlloc/vm.alloc-путей и owner-решения о seam.
-
 - [ ] **lua_getinfo '>'-режим (прямой function-аргумент) не реализован
   (BLOCKER, pre-existing; найден scres 2026-10-04).** c_api.zig:3764
   возвращает 0 для ВСЕХ видов функций; PUC lapi.c ldebug.c обрабатывает
@@ -539,6 +533,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   -> math.random CClosure -> stateful-итераторы отдельным milestone
   -> cleanup; Variant B (identity-зеркалирование на .Builtin) —
   задокументированный fallback. Owner decision требуется до
+  implementation; STOP-условия в отчёте.
   VERIFICATION VERDICT (scresv, 2026-10-04, к `fabc83f`; отчёт
   /tmp/opencode/scresv_report.md, артефакты /tmp/opencode/scresv_*):
   Option A — доказанный contract, контрпримеров не осталось.
@@ -573,7 +568,6 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   финального mx-прогона (19:07) — вердикт опирается на raw mx-выводы;
   при implementation rebuild-верификация adapter'а обязательна. Owner
   decision — только после review этой verification.
-  implementation; STOP-условия в отчёте.
   REVIEW 2026-10-04: INCONCLUSIVE для implementation handoff.
   Source inventory и базовый identity-gap подтверждены, но prototype
   не выполняет contract прямого f(L) на coroutine того же VM; OOM/GC
@@ -581,6 +575,17 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   `124` — число probed entries, а не динамическое доказательство
   каждого из ~141 опубликованных `.Builtin`. Следующий шаг —
   bounded verification выше; owner decision пока рано.
+  REVIEW scresv/e7a77ff 2026-10-04: INCONCLUSIVE для полного Option A
+  contract. Raw `f(co)` target-thread parity и S1–S10 в Debug/RF
+  воспроизведены на заново собранном prototype, но S1–S10 не содержит
+  yield/continuation; S6 и S7 отличаются в attribution. Fail-index
+  k=1..3 проверяет только `string.upper`, без доказанного попадания в
+  каждый заявленный outs/core/root/push/transport arm. Текущий
+  throwaway prototype собирается (запись о 7 errors устарела), однако
+  source/binary привязка исходных измерений неполна. Сохранённый perf
+  JSON содержит A/B1, а 21-seed B2 counters не предъявлены. Нужна
+  bounded verification по следующему prompt.md; owner decision пока
+  рано. Это вывод ревью, прошлый report.md не переписывается.
 
 - [ ] **`package.loadlib(path, "*")` возвращает function вместо true
   (BLOCKER, pre-existing, ORDINARY-BACKLOG).** PUC `loadlib.c:391–394`
@@ -613,7 +618,9 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   передаёт callback `osize=0`, тогда как PUC `luaM_malloc_` передаёт
   type tag для объектов. Design/inventory и
   live-block transition нужны до implementation; см. радар
-  `ARCHITECTURE_DEBT.md` (Embedding §1).
+  `ARCHITECTURE_DEBT.md` (Embedding §1). Дополнительная проба scresv
+  показала 252 foreign frees / 78.7 KB через пользовательский allocator
+  при закрытии state (G2 — evidence к этому же owner-пункту).
 
 - [x] **Stdlib completeness: `package.searchers`/`require` parity
   (BLOCKER, correction после implementation).** Миграция

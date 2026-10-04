@@ -308,7 +308,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   воспроизведения важен предшествующий контекст all.lua. Решающий
   эксперимент и класс — отдельная итерация.
 
-- [ ] **D1 correction: testC light callback leaks result slice on root-reserve OOM
+- [x] **D1 correction: testC light callback leaks result slice on root-reserve OOM
   (HIGH, FIX-NOW).** Introduced by `cdf1c13` in
   `Vm.testcLightCFunc`: `copyTestcReturnValues` allocates `vals` through
   `infraAlloc`; if the subsequent `openRootScope(vals.len, 0)` fails,
@@ -318,6 +318,20 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   `vals` explicitly and is a control. Review verdict for D1 is CORRECT;
   add deterministic failing-allocator coverage at this boundary, release
   `vals` before nonlocal exit, and verify allocator/VM reuse after OOM.
+  CLOSED (D1 correction `790e683`, 2026-10-04): free vals до nonlocal
+  exit из openRootScope catch (зеркально cWindowPushSlice контрольной
+  ветке; оба выхода noreturn — defer не выполняется, ровно-one-free на
+  всех 6 exits callback). Fail-index тест + TestcOomSeamRecorder:
+  матрица 0..reserve ERRMEM/MEMERRMSG, root-state byte-exact,
+  exactly-once free каждой записи, recovery+GC; D+RF.
+  Negative-before на cdf1c13 (throwaway worktree) — тест ловил потерю
+  (free_counts==1 + независимый DebugAllocator leak-стек
+  copyTestcReturnValues <- testcLightCFunc); positive-after — утечки
+  нет. Гейты (координатор лично): 375/375 D+RF, suite 41
+  byte-identical D+RF, fmt/diff-check; binary-артефактов нет. Findings
+  (pre-existing, класс F-A6T): push-catch сворачивает stack-overflow
+  RuntimeError в OOM; push-catch недостижим через infraAlloc-seam
+  (доказано noreturn-анализом + косвенной батареей).
 
 - [x] **FO6(cs3oom): `lua_pushcfunction` при n=0 выделяет Closure
   (BLOCKER, pre-existing, ARCHITECTURAL-BACKLOG).** PUC 5.5

@@ -406,6 +406,11 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   с nup=0. В luazig они `.Builtin`; отдельный открытый пункт ниже.
   Трёхсрезовый план готов как основа implementation prompt после
   owner sign-off узкого scope; исходный report.md не изменяется.
+  OWNER DECISION 2026-10-04: узкий D1 утверждён для C API-created
+  nup=0 functions и `lookforfunc` loader; внутренние `.Builtin`
+  стандартных библиотек остаются отдельным milestone. Implementation
+  prompt включает review-добавления `valueMetatable`/`topointer` и
+  полный semantic switch gate перед публикацией n=0 producer.
 
 - [ ] **Internal stdlib `.Builtin` скрывает PUC light C function
   identity (BLOCKER, pre-existing, ORDINARY-BACKLOG до owner decision).**

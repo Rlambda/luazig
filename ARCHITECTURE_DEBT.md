@@ -337,6 +337,24 @@ parity-дефектом; F3 (forced-close region ownership) закрыт `9b1bad
    мутационно чувствительны). PUC держит ключ на стеке `auxgetstr`;
    Zig-эквивалент — root-публикация до стейджинга метаметода.
 
+5. **Light C function value — узкий D1 утверждён владельцем
+   (2026-10-04).** PUC `lua_pushcclosure(f,0)` публикует immediate
+   `LUA_VLCF` без heap allocation; luazig создаёт heap CClosure,
+   нарушая frozen-allocator и same-pointer identity/table-key parity
+   (FO6, `STATUS.md`, vlcf/vlcfv research). Целевая модель —
+   `Value.LightCFunction` как non-GC pointer value для функций,
+   создаваемых через публичный C API (`pushcclosure(0)`,
+   `luaL_setfuncs(...,0)`, `luaL_requiref` openf) и `lookforfunc`
+   loader. CClosure с upvalues (включая `require` и четыре searcher)
+   остаётся; `cFuncEqual` и n=0 heap path удаляются. Review
+   `cf150ca` добавил обязательные `valueMetatable`/`topointer`
+   arms и B13 differential к трём cuts. Внутренние stdlib `.Builtin`
+   не входят в D1: PUC nup=0 stdlib functions (например
+   `package.loadlib`/`searchpath`) являются VLCF, а luazig C API
+   показывает `iscfunction=0`, `tocfunction=NULL`, `topointer=NULL`.
+   Это отдельный подтверждённый parity blocker в `STATUS.md`;
+   следующий owner decision определит его migration scope.
+
 ## Не-parity архитектурный backlog
 
 Эти пункты не являются correctness-расхождениями с PUC и не

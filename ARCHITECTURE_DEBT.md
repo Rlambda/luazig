@@ -354,6 +354,21 @@ parity-дефектом; F3 (forced-close region ownership) закрыт `9b1bad
    показывает `iscfunction=0`, `tocfunction=NULL`, `topointer=NULL`.
    Это отдельный подтверждённый parity blocker в `STATUS.md`;
    следующий owner decision определит его migration scope.
+   OWNER DECISION (2026-10-04, после scresv2/`5eaaceb` и review
+   `92b498a`): целевой вариант **A-full** — PUC-подобная публикация
+   всех nup=0 stdlib functions как настоящих `LightCFunction` с
+   канонической pointer identity; upvalue-bearing функции остаются
+   `CClosure`. Prototype target-thread adapter доказал non-yield raw
+   `f(co)`, но R4 Y1/Y2/D3 опроверг полную модель: `error.Yield`
+   превращается в error, на running co теряются status/continuation
+   и появляется ложный ERRMEM. Перед implementation требуется bounded
+   research единого typed yield/continuation transport на C boundary,
+   включая fresh/unarmed и running/armed co, protected calls, GC/roots
+   и re-entry. Legacy `.Builtin` публикации удаляются по мере
+   миграции; A-restricted и B-mirror не являются целевой моделью.
+   Обязательные отдельные gates: C API `lua_getinfo('>')`, R1
+   attribution, R2 immutable trampoline lookup, R3 panic hook и
+   dispatch-entry normalization с измеренным perf trade-off.
 
 ## Не-parity архитектурный backlog
 

@@ -53,7 +53,9 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   light-publication (`coroutine.yield` доказан; прочие yieldable функции
   требуют проверки); non-yield builtins
   не затронуты. Решается raw-yield моделью в adapter ИЛИ выбором
-  A-restricted/B-mirror — owner decision. Raw:
+  A-restricted/B-mirror — варианты исследования; владелец утвердил
+  A-full как целевой дизайн (2026-10-04). Следующий этап — bounded
+  research typed yield/continuation transport до implementation. Raw:
   /tmp/opencode/scresv2_{ymx,y2d}_{puc,ad}.out.
 
 - [ ] **file mt `__tostring` не опубликован как функция (BLOCKER,

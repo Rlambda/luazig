@@ -45,6 +45,22 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
+- [ ] **R4(scresv2, BLOCKER): yield-транспорт в stdlib C trampoline
+  сломан — raw yield из C callback на running coroutine превращается
+  в ERRMEM (2026-10-04).** PUC поглощает raw yield как results с full
+  continuation (Y2a n=7 r1=true); prototype adapter — CHUNK ERR "not
+  enough memory" (порча error-класса). Блокирует yieldable
+  light-publication (coroutine.yield/wrap и др.); non-yield builtins
+  не затронуты. Решается raw-yield моделью в adapter ИЛИ выбором
+  A-restricted/B-mirror — owner decision. Raw:
+  /tmp/opencode/scresv2_{ymx,y2d}_{puc,ad}.out.
+
+- [ ] **file mt `__tostring` не опубликован как функция (LOW/MEDIUM,
+  pre-existing; найден scresv2 2026-10-04).** Единственный счётный
+  разрыв между PUC 135 уникальных table-published function entries и
+  zig 143 .Builtin + require; PUC публикует mt.__tostring через
+  luaL_setfuncs, zig — нет. Отдельный parity-gap вне identity-модели.
+
 - [ ] **G1(scresv): ERRMEM не ловится pcall в product VM-lane (HIGH,
   pre-existing; найден scresv 2026-10-04).** PUC ловит OOM защищённым
   вызовом; zig — нет. Доказано на чистом master VM-lane коде (без
@@ -567,6 +583,30 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   состоянии (7 errors), scresv_tr_ad/rf (18:56) устарели относительно
   финального mx-прогона (19:07) — вердикт опирается на raw mx-выводы;
   при implementation rebuild-верификация adapter'а обязательна. Owner
+  V2 VERIFICATION VERDICT (scresv2, 2026-10-04, к `19331d0`; отчёт
+  /tmp/opencode/scresv2_report.md, hashes scresv2_hashes.txt):
+  ВЕРДИКТ ИЗМЕНЁН — R4 материализовался в confirmed BLOCKER:
+  yield-транспорт trampoline сломан. Y2 (resumed co, raw yield из C
+  callback на RUNNING co): PUC — Y2a n=7 r1=true eq2=true, full
+  continuation, Y2c завершение; zig — CHUNK ERR "not enough memory"
+  (порча класса ошибки yield->OOM; координатор верифицировал raw
+  scresv2_{ymx,y2d}_{puc,ad}.out). Y1/D3 — связанные формы. Option A
+  валидна ТОЛЬКО для non-yield builtins (S1-S10/f(co)/fail-index
+  воспроизведены на immutable D+RF сборках единого исходника);
+  решение A-restricted / A-full (после R4-fix) / B-mirror — за owner.
+  Подсчёты исправлены: PUC 145 table-published function entries
+  (динамический walker: 135 уникальных; прежние "138" = 3 дубликата)
+  vs zig 143 .Builtin + require Closure = 144; единственный счётный
+  разрыв — file mt __tostring (НОВЫЙ pre-existing gap, пункт ниже).
+  124 динамических пробы — subset, НЕ доказательство полного набора.
+  B1≈B2 теперь ДОКАЗАН paired 21-seed raw counters + hash (B1 re-run
+  воспроизвёл +32.68/+83.67/+10.67% точно); причинный вывод (регрессия
+  = C-call bookkeeping, не lookup) сохранён; ~1% gate отменён как
+  необоснованный. Retraction: "C-result transport" — НЕ arm raw-lane
+  (граница доказательства зафиксирована). G1 подтверждён на чистом
+  master (bin == 19331d0): PUC ловит ERRMEM под pcall, master escape.
+  G2 воспроизведён точно (252 foreign frees / 78749 B) и ВЛИТ в
+  существующий пункт C API allocator owner (второй долг не создавался).
   decision — только после review этой verification.
   REVIEW 2026-10-04: INCONCLUSIVE для implementation handoff.
   Source inventory и базовый identity-gap подтверждены, но prototype

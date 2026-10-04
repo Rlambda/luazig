@@ -357,7 +357,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   исправленного cut-порядка; исходный research-handoff остаётся
   неизменным, implementation prompt пока не утверждён.
 
-- [ ] **VLCF research handoff: ложный `require` cut и неполный callable
+- [x] **VLCF research handoff: ложный `require` cut и неполный callable
   inventory (HIGH, FIX-NOW для следующего VLCF research).** PUC
   `loadlib.c:744` создаёт `require` с одним package-upvalue; текущий
   luazig делает то же. Удаление upvalue ради light function внесло бы
@@ -392,6 +392,31 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   gsub/sort/load/pairs/debug/coroutine + F3/F4/F5) → cut 3 (ltable
   keys + pushcclosure(0)→light + loader→light + testC n=0 + удаление
   cFuncEqual); каждый cut с KEEP/REMOVE-тестами и полными gates.
+  REVIEW 2026-10-04: **ACCEPT + RECORD** для bounded verification,
+  только в scope externally pushed nup=0 C functions + dynamic loader.
+  D1 как immediate non-GC Value подтверждён; `require`/searchers
+  остаются CClosure с package-upvalue. Ревьювер повторил V/B oracle,
+  PUC/Zig package-C-API пробу и проверил final diff. Уточнения к
+  implementation cuts: `valueMetatable` (vm.zig:47983) получает light
+  arm в cut 1; `State.topointer` (api.zig:1464) обязан вернуть адрес
+  light C function не позднее cut 3, с B13 differential gate. B5
+  динамически проверяет `require`, а searchers доказаны исходниками;
+  формула «единственный VLCF в package — loader» ложна: PUC также
+  создаёт `package.loadlib`/`package.searchpath` через `luaL_newlib`
+  с nup=0. В luazig они `.Builtin`; отдельный открытый пункт ниже.
+  Трёхсрезовый план готов как основа implementation prompt после
+  owner sign-off узкого scope; исходный report.md не изменяется.
+
+- [ ] **Internal stdlib `.Builtin` скрывает PUC light C function
+  identity (BLOCKER, pre-existing, ORDINARY-BACKLOG до owner decision).**
+  PUC `loadlib.c:727` + `lauxlib.h:135–136` публикует
+  `package.loadlib`/`package.searchpath` как VLCF; luazig
+  `openPackageLibrary` публикует `.Builtin`. Независимый C API
+  differential `/tmp/vlcfv_builtin_review.c`: PUC для обеих функций
+  `type=6 isc=1 toc=1 top=1`, Zig `type=6 isc=0 toc=0 top=0`.
+  Та же модель затрагивает другие standard-library nup=0 функции;
+  полный scope и архитектура миграции требуют отдельного owner choice.
+  Не смешивать с D1 для externally pushed C functions без решения.
 
 - [ ] **`package.loadlib(path, "*")` возвращает function вместо true
   (BLOCKER, pre-existing, ORDINARY-BACKLOG).** PUC `loadlib.c:391–394`

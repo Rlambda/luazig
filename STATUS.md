@@ -45,6 +45,18 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
+- [ ] **G1(scresv): ERRMEM не ловится pcall в product VM-lane (HIGH,
+  pre-existing; найден scresv 2026-10-04).** PUC ловит OOM защищённым
+  вызовом; zig — нет. Доказано на чистом master VM-lane коде (без
+  прототипа). Отдельный от F-A6T класс? — решающий эксперимент в
+  отчёте scresv.
+
+- [ ] **G2(scresv): lua_Alloc seam violation (HIGH, pre-existing;
+  найден scresv 2026-10-04).** Аллокации в обход user allocator; close
+  маршрутизирует 252 foreign frees / 78.7 KB через пользовательский
+  allocator — custom allocators были бы коррумпированы. Требует
+  inventory всех infraAlloc/vm.alloc-путей и owner-решения о seam.
+
 - [ ] **lua_getinfo '>'-режим (прямой function-аргумент) не реализован
   (BLOCKER, pre-existing; найден scres 2026-10-04).** c_api.zig:3764
   возвращает 0 для ВСЕХ видов функций; PUC lapi.c ldebug.c обрабатывает
@@ -527,6 +539,40 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   -> math.random CClosure -> stateful-итераторы отдельным milestone
   -> cleanup; Variant B (identity-зеркалирование на .Builtin) —
   задокументированный fallback. Owner decision требуется до
+  VERIFICATION VERDICT (scresv, 2026-10-04, к `fabc83f`; отчёт
+  /tmp/opencode/scresv_report.md, артефакты /tmp/opencode/scresv_*):
+  Option A — доказанный contract, контрпримеров не осталось.
+  Decisive counterexample закрыт target-thread adapter'ом (handleThread,
+  anchored window, cWindowPushSlice, единственный
+  enterSyncCloseContext authority, PUC luaD_throw-реплика): raw f(co)
+  даёт f=1 n=1 top=2 value=XY точно; матрица S1-S10 (main/co один VM,
+  второй VM, republish, VM call, pcall/error, yield/continuation)
+  структурно идентична PUC, D==RF (координатор верифицировал raw
+  scresv_mx_{ad,rf,puc}.out: S2 exact; единственное расхождение S6 —
+  формат argerror-сообщения, известный pre-existing error-attribution
+  класс = R1). Fail-index matrix: каждый инъектируемый arm (outs/
+  builtin core/root reserve/publication/transport) — корректный OOM
+  kind, recovery, повторный вызов, GC survival, zero seam drift;
+  16B-outs leak старого прототипа устранён free-before-throw
+  (negative-before ловил, positive-after чистый). Perf: adapter внутри
+  записанных B1/B2 полос (+34.2/+77.5/+10.7%); hash'и A/B1/B2
+  перепроверены; декомпозиция (регрессия = C-call bookkeeping, НЕ
+  lookup) переносится; порог ~1% НЕ owner-gate. Migration requirements
+  при выборе A: R1 error-attribution cut (S6/S7 naming, pre-existing
+  fail()-класс); R2 de-globalize lazy trampoline-таблицы (torn-entry
+  race под concurrent VMs -> wrong-builtin dispatch); R3 atpanic hook
+  на abort arm; R4 raw-yield модель до coroutine cut (PUC поглощает
+  raw yield на fresh co как results). НОВЫЕ pre-existing product gaps
+  (не внесены lane): G1 — ERRMEM не ловится pcall (PUC ловит; доказано
+  на чистом master VM-lane коде); G2 — lua_Alloc seam violation
+  (аллокации в обход user allocator; close маршрутизирует 252 foreign
+  frees/78.7KB через него — custom allocators коррумпировали бы).
+  Evidence-hygiene finding (координатор, MEDIUM): финальный fixed-
+  бинарь не сохранён, throwaway worktree оставлен в non-building
+  состоянии (7 errors), scresv_tr_ad/rf (18:56) устарели относительно
+  финального mx-прогона (19:07) — вердикт опирается на raw mx-выводы;
+  при implementation rebuild-верификация adapter'а обязательна. Owner
+  decision — только после review этой verification.
   implementation; STOP-условия в отчёте.
   REVIEW 2026-10-04: INCONCLUSIVE для implementation handoff.
   Source inventory и базовый identity-gap подтверждены, но prototype

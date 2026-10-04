@@ -323,7 +323,8 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   ветке; оба выхода noreturn — defer не выполняется, ровно-one-free на
   всех 6 exits callback). Fail-index тест + TestcOomSeamRecorder:
   матрица 0..reserve ERRMEM/MEMERRMSG, root-state byte-exact,
-  exactly-once free каждой записи, recovery+GC; D+RF.
+  exactly-once free каждой transport-slice записи (80-byte vals),
+  recovery+GC; D+RF.
   Negative-before на cdf1c13 (throwaway worktree) — тест ловил потерю
   (free_counts==1 + независимый DebugAllocator leak-стек
   copyTestcReturnValues <- testcLightCFunc); positive-after — утечки
@@ -332,6 +333,21 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   (pre-existing, класс F-A6T): push-catch сворачивает stack-overflow
   RuntimeError в OOM; push-catch недостижим через infraAlloc-seam
   (доказано noreturn-анализом + косвенной батареей).
+
+- [ ] **F-A6T testC result transport: stack overflow опубликован как
+  ERRMEM (BLOCKER, pre-existing, ARCHITECTURAL-BACKLOG).** В
+  `testcLightCFunc` исходные результаты остаются в C-окне, затем
+  `cWindowPushSlice` дублирует их поверх окна; если
+  `cWindowEnsure` возвращает RuntimeError `stack overflow`,
+  безусловный catch вызывает OOM-tail. Независимый differential
+  `/tmp/d1oom-review-stack.lua` с валидным
+  `rawcheckstack 600000; settop 600000; return 600000`:
+  PUC ltests — `pcall=true`, Zig --testc — `pcall=false,
+  not enough memory` (оба rc=0; raw /tmp/d1oom-review-stack-{puc,zig}.out).
+  Это не внесено correction 790e683; root — pre-existing result
+  transport F-A6T. При архитектурной замене transport сохранить
+  ERRRUN/ERRMEM kind и убрать лишнее дублирование окна; текущий
+  D1 ownership cut не расширять.
 
 - [x] **FO6(cs3oom): `lua_pushcfunction` при n=0 выделяет Closure
   (BLOCKER, pre-existing, ARCHITECTURAL-BACKLOG).** PUC 5.5

@@ -308,6 +308,17 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   воспроизведения важен предшествующий контекст all.lua. Решающий
   эксперимент и класс — отдельная итерация.
 
+- [ ] **D1 correction: testC light callback leaks result slice on root-reserve OOM
+  (HIGH, FIX-NOW).** Introduced by `cdf1c13` in
+  `Vm.testcLightCFunc`: `copyTestcReturnValues` allocates `vals` through
+  `infraAlloc`; if the subsequent `openRootScope(vals.len, 0)` fails,
+  `testcLightCFuncError(error.OutOfMemory)` calls `_longjmp` and bypasses
+  `defer infraAlloc().free(vals)`. Repeated protected calls can lose an
+  allocation each time. The `cWindowPushSlice` failure arm already frees
+  `vals` explicitly and is a control. Review verdict for D1 is CORRECT;
+  add deterministic failing-allocator coverage at this boundary, release
+  `vals` before nonlocal exit, and verify allocator/VM reuse after OOM.
+
 - [x] **FO6(cs3oom): `lua_pushcfunction` при n=0 выделяет Closure
   (BLOCKER, pre-existing, ARCHITECTURAL-BACKLOG).** PUC 5.5
   `lua_pushcclosure` при n=0 кладёт light C function через `setfvalue`

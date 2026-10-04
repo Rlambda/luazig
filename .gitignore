@@ -41,6 +41,8 @@ tests/c_api/40_maindestined_transport
 tests/c_api/40_maindestined_transport-puc
 tests/c_api/40_package_openf
 tests/c_api/40_package_openf-puc
+tests/c_api/41_light_pub
+tests/c_api/41_light_pub-puc
 
 # Stray tool marker
 .codex

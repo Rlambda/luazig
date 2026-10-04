@@ -11724,15 +11724,16 @@ pub const Vm = struct {
     }
 
     /// Canonical C-closure constructor (P16.50-review-15 BLOCKER 1): PUC
-    /// `lua_pushcclosure` (lapi.c:609+) — a FRESH CClosure per call whose
-    /// upvalue slots are that closure's OWN Cells (the values are copied
-    /// in; closures never share Cell objects). Prepared-then-committed
-    /// with exact per-object rollback: a failure leaves zero registered
-    /// objects and zero accounting drift. ONE owner for every C-closure
-    /// construction: api.State.makeCclosure (lua_pushcclosure /
-    /// luaL_setfuncs) delegates here, and coroutine.wrap's auxwrap
-    /// closure is built by it too. The CALLER roots the `values` across
-    /// this call (RootScope / stack slots — PUC roots them on L->stack).
+    /// `lua_pushcclosure` with n > 0 (lapi.c:617+) — a FRESH CClosure per
+    /// call whose upvalue slots are that closure's OWN Cells (the values
+    /// are copied in; closures never share Cell objects).
+    /// Prepared-then-committed with exact per-object rollback: a failure
+    /// leaves zero registered objects and zero accounting drift. ONE owner
+    /// for every C-closure construction: api.State.makeCclosure
+    /// (lua_pushcclosure n>0 / luaL_setfuncs nup>0) delegates here, and
+    /// coroutine.wrap's auxwrap closure is built by it too. The CALLER
+    /// roots the `values` across this call (RootScope / stack slots — PUC
+    /// roots them on L->stack for the whole construction).
     pub fn allocCclosure(
         self: *Vm,
         fn_: ?*const fn (?*lua_State) callconv(.c) c_int,
@@ -11746,15 +11747,6 @@ pub const Vm = struct {
         // L->stack for the whole construction).
         var scope = try self.openRootScope(1, n);
         defer scope.close();
-        if (n == 0) {
-            const cl = try self.alloc.create(Closure);
-            cl.* = .{ .upvalues = &.{}, .c_func = fn_ };
-            self.gcRegisterCommit(.{ .closure = cl });
-            self.gcNoteAlloc(@sizeOf(Closure));
-            self.testc_obj_functions += 1;
-            _ = scope.protectValueAssumeCapacity(.{ .Closure = cl });
-            return cl;
-        }
         const upv_cells = try self.alloc.alloc(*Cell, n);
         var created: usize = 0;
         errdefer {
@@ -37552,18 +37544,19 @@ pub const Vm = struct {
     ///
     /// `package.loadlib(libname, funcname)` opens the shared library at
     /// `libname` via `std.DynLib.open` (Zig's dlopen wrapper), looks up the
-    /// C symbol `funcname` (typically `luaopen_<modname>`), and wraps the
-    /// resulting function pointer in a `Closure` so it integrates with the
-    /// existing C function dispatch (Task B1's `callCFunction`).
+    /// C symbol `funcname` (typically `luaopen_<modname>`) and publishes
+    /// the resolved function pointer as a light C function value (PUC
+    /// loadlib.c:399 wraps it with `lua_pushcfunction`).
     ///
     /// **Return values** (matching PUC's `ll_loadlib`):
-    ///   * Success: `(closure)` — a callable C closure wrapping the symbol.
+    ///   * Success: `(function)` — a callable light C function wrapping the
+    ///     symbol.
     ///   * Failure: `(nil, errmsg, "open"|"init")` — `errmsg` describes the
     ///     failure; the third value is PUC's category string (`"open"` for
     ///     dlopen failure, `"init"` for symbol-not-found).
     ///
     /// **Probe mode** (`funcname == "*"`): opens the library, closes it
-    /// immediately, and returns a dummy closure (`llAccessible`) if the
+    /// immediately, and returns a no-op function (`llAccessible`) if the
     /// open succeeded. This mirrors PUC's `LL_SYM_PREFIX "*"` path used by
     /// `package.searchpath`/`require` to check whether a library is loadable.
     ///
@@ -37592,8 +37585,8 @@ pub const Vm = struct {
         // could run a GC.
         const res = try self.lookforfuncCore(lib_path, func_name);
         switch (res) {
-            .func => |cl| {
-                if (outs.len > 0) outs[0] = .{ .Closure = cl };
+            .func => |f| {
+                if (outs.len > 0) outs[0] = .{ .LightCFunction = f };
                 self.last_builtin_out_count = @min(outs.len, 1);
             },
             // The public loadlib messages keep their "\n\t" prefix (PUC
@@ -37617,10 +37610,9 @@ pub const Vm = struct {
     }
 
     const LookforResult = union(enum) {
-        /// C closure wrapping the resolved symbol (or the accessibility
-        /// probe's no-op); unrooted on return — the caller protects it
-        /// before its next allocation.
-        func: *Closure,
+        /// Light C function value wrapping the resolved symbol (or the
+        /// accessibility probe's no-op) — an immediate, never GC-rooted.
+        func: ?*const fn (?*lua_State) callconv(.c) c_int,
         /// dlopen failed; owned detail message WITHOUT separator prefix.
         open_err: []u8,
         /// dlsym failed; owned detail message WITHOUT separator prefix.
@@ -37632,10 +37624,11 @@ pub const Vm = struct {
     /// checked first; a miss dlopens the library (RTLD_GLOBAL for the "*"
     /// probe so inter-library dependencies resolve) and caches the handle
     /// permanently (PUC never dlcloses — C extensions may cache pointers to
-    /// their own static data). "*" returns the accessibility no-op closure
-    /// (llAccessible); otherwise the symbol is resolved and wrapped in a C
-    /// closure. `lib_path`/`func_name` may alias GC-visible strings — they
-    /// are duped up front, before any allocation that could run a GC.
+    /// their own static data). "*" returns the accessibility no-op function
+    /// (llAccessible); otherwise the symbol is resolved and published as a
+    /// light C function (loadlib.c:399). `lib_path`/`func_name` may alias
+    /// GC-visible strings — they are duped up front, before any allocation
+    /// that could run a GC.
     fn lookforfuncCore(self: *Vm, lib_path: []const u8, func_name: []const u8) DispatchError!LookforResult {
         const path_z = try self.alloc.dupeZ(u8, lib_path);
         defer self.alloc.free(path_z);
@@ -37664,14 +37657,11 @@ pub const Vm = struct {
         };
 
         // PUC lookforfunc: probe mode ("*") just verifies the library loads.
-        // Return a no-op closure (PUC's ll_accessible).
+        // Return the accessibility no-op as a light C function. (PUC 5.5
+        // pushes boolean true here; the boolean-vs-function divergence of
+        // the public package.loadlib is a separate documented gap.)
         if (is_probe) {
-            const cl = try self.alloc.create(Closure);
-            cl.* = .{ .upvalues = &.{}, .c_func = &llAccessible };
-            self.gcRegisterCommit(.{ .closure = cl });
-            self.gcNoteAlloc(@sizeOf(Closure));
-            self.testc_obj_functions += 1;
-            return .{ .func = cl };
+            return .{ .func = &llAccessible };
         }
 
         const func_name_z = try self.alloc.dupeZ(u8, func_name);
@@ -37681,15 +37671,10 @@ pub const Vm = struct {
             return .{ .sym_err = msg };
         };
         const c_func: *const fn (?*lua_State) callconv(.c) c_int = @ptrCast(@alignCast(sym));
-
-        // Wrap the C function pointer in a Closure so it can be called via
-        // the normal runClosure → callCFunction dispatch path.
-        const cl = try self.alloc.create(Closure);
-        cl.* = .{ .upvalues = &.{}, .c_func = c_func };
-        self.gcRegisterCommit(.{ .closure = cl });
-        self.gcNoteAlloc(@sizeOf(Closure));
-        self.testc_obj_functions += 1;
-        return .{ .func = cl };
+        // PUC wraps the dlsym'd symbol with lua_pushcfunction — a light C
+        // function value (loadlib.c:399), callable through the normal
+        // C-function dispatch path, no heap object.
+        return .{ .func = c_func };
     }
 
     /// PUC luaL_checkstring(L, 1) as used by ll_require and the searchers:
@@ -38022,10 +38007,12 @@ pub const Vm = struct {
                 _ = scope.protectValueAssumeCapacity(.{ .String = file_str });
                 const lf = try self.loadfuncCore(file_str.bytes(), name_str.bytes());
                 switch (lf) {
-                    .func => |cl| {
-                        _ = scope.protectValueAssumeCapacity(.{ .Closure = cl });
+                    .func => |f| {
+                        // Light loader: an immediate value, no GC root
+                        // needed; only file_str (a string) stays rooted
+                        // across allocOwnedResult.
                         const res = try self.allocOwnedResult(2);
-                        res[0] = .{ .Closure = cl };
+                        res[0] = .{ .LightCFunction = f };
                         res[1] = .{ .String = file_str };
                         return res;
                     },
@@ -38073,10 +38060,11 @@ pub const Vm = struct {
                 _ = scope.protectValueAssumeCapacity(.{ .String = file_str });
                 const lf = try self.loadfuncCore(file_str.bytes(), name);
                 switch (lf) {
-                    .func => |cl| {
-                        _ = scope.protectValueAssumeCapacity(.{ .Closure = cl });
+                    .func => |f| {
+                        // Light loader: immediate value; file_str stays
+                        // rooted across allocOwnedResult.
                         const res = try self.allocOwnedResult(2);
-                        res[0] = .{ .Closure = cl };
+                        res[0] = .{ .LightCFunction = f };
                         res[1] = .{ .String = file_str };
                         return res;
                     },
@@ -38100,7 +38088,7 @@ pub const Vm = struct {
     }
 
     const LoadfuncResult = union(enum) {
-        func: *Closure,
+        func: ?*const fn (?*lua_State) callconv(.c) c_int,
         /// dlopen failed (PUC ERRLIB); owned detail message.
         open_err: []u8,
         /// dlsym failed (PUC ERRFUNC); owned detail message.
@@ -38139,9 +38127,9 @@ pub const Vm = struct {
             defer self.alloc.free(open_name);
             const res = try self.lookforfuncCore(file_path, open_name);
             switch (res) {
-                .func => |cl| {
+                .func => |f| {
                     if (last_sym_err) |m| self.alloc.free(m);
-                    return .{ .func = cl };
+                    return .{ .func = f };
                 },
                 .open_err => |msg| {
                     if (last_sym_err) |m| self.alloc.free(m);
@@ -51290,6 +51278,97 @@ pub const Vm = struct {
         };
     }
 
+    /// C-ABI entry of the testC function itself (PUC ltests.c `testC`
+    /// symbol): the light C function published by the `pushcclosure 0`
+    /// script command. It runs a script taken from its first argument on
+    /// the calling C window through the same machinery as the direct
+    /// T.testC lane. A light value carries nothing — no upvalues, no
+    /// captured env (getglobal/setglobal hit the running state's real
+    /// globals, exactly like PUC's VLCF(testC) called from any state).
+    /// Yield/error/OOM transport follows the shim protocol of
+    /// callCFunctionWithBoundary: plain -1/-2/-3 returns for Zig-error
+    /// outcomes, longjmp for the OOM raise.
+    fn testcLightCFunc(L: ?*lua_State) callconv(.c) c_int {
+        const h = L orelse return 0;
+        const self = h.vm;
+        const th = self.activeBytecodeThread();
+        if (th.call_frames.len() == 0) {
+            _ = self.failC("testC: missing C frame", .{}) catch {};
+            return -1;
+        }
+        const fr_idx = th.call_frames.len() - 1;
+        if (!th.call_frames.getConstPtr(fr_idx).isC()) {
+            _ = self.failC("testC: missing C frame", .{}) catch {};
+            return -1;
+        }
+        const fr = th.call_frames.getConstPtr(fr_idx);
+        const fs = fr.func_slot;
+        const args = th.stack[fs + 1 .. th.top];
+        if (args.len == 0 or args[0] != .String) {
+            _ = self.failC("bad argument #1 to 'testC' (string expected)", .{}) catch {};
+            return -1;
+        }
+        const win = TestcWin{ .vm = self, .th = th, .off = 0 };
+        const spec: testc.ReturnSpec = run: {
+            const rr = self.runTestcScript(args[0].String.bytes(), .{}, win, true) catch |e| {
+                return self.testcLightCFuncError(e);
+            };
+            break :run rr.return_spec orelse testc.ReturnSpec{ .fixed = 0 };
+        };
+        const vals = self.copyTestcReturnValues(win.slice(), spec) catch |e| {
+            return self.testcLightCFuncError(e);
+        };
+        defer self.infraAlloc().free(vals);
+        // Root the results across the window push (its growth allocation
+        // can run an emergency GC; until the values land on th.stack they
+        // are visible only to this Zig frame). The push appends above the
+        // script's leftover window: the C epilogue reads the top nret
+        // slots, which is exactly the PUC poscall shape.
+        var scope = self.openRootScope(vals.len, 0) catch {
+            return self.testcLightCFuncError(error.OutOfMemory);
+        };
+        defer scope.close();
+        for (vals) |v| _ = scope.protectValueAssumeCapacity(v);
+        self.cWindowPushSlice(th, vals) catch {
+            // The scope's defer does not run across the raise below; the
+            // slice is already freed by the matching defer ordering —
+            // release it explicitly before the jump (the landing pad
+            // restores the abandoned root scope).
+            self.infraAlloc().free(vals);
+            return self.testcLightCFuncError(error.OutOfMemory);
+        };
+        return @intCast(vals.len);
+    }
+
+    /// Shared error tail of testcLightCFunc: map the dispatch error to
+    /// the shim-return protocol (RuntimeError already installed in the
+    /// VM error state; MainDestined relays; Yield parks this C frame with
+    /// the values already in th.yielded) or raise the OOM through the
+    /// armed boundary.
+    fn testcLightCFuncError(self: *Vm, e: DispatchError) c_int {
+        return switch (e) {
+            error.RuntimeError => -1,
+            error.MainDestined => -3,
+            error.Yield => -2,
+            error.OutOfMemory => {
+                if (self.c_error_jmp) |jb| {
+                    self.setOutOfMemoryError();
+                    self.latchErrmemRaiseWindow(self.activeBytecodeThread());
+                    self.c_error_value = self.errThread().err_obj;
+                    self.c_error_status = 4; // LUA_ERRMEM
+                    _longjmp(@ptrCast(jb), 1);
+                }
+                std.process.abort();
+            },
+            error.ThreadSwitch => {
+                if (self.c_error_jmp) |jb| {
+                    _longjmp(@ptrCast(jb), 3);
+                }
+                std.process.abort();
+            },
+        };
+    }
+
     fn builtinTestcMakeCfunc(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         var scope = try self.openRootScope(3, 0);
@@ -52706,6 +52785,16 @@ pub const Vm = struct {
                 if (cargs.len != 1) return self.fail("testC pushcclosure expects 1 arg", .{});
                 const n = std.fmt.parseInt(usize, cargs[0], 10) catch return self.fail("testC invalid upvalue count", .{});
                 if (n > win.count()) return self.fail("testC stack underflow", .{});
+                // PUC runC (ltests.c:1787): `lua_pushcclosure(L1, testC, n)`.
+                // n == 0 publishes the testC function pointer itself as a
+                // light C function — no heap object, no upvalue emulation
+                // table; calls run the script machinery through the C-ABI
+                // entry (testcLightCFunc), the standard light path.
+                if (n == 0) {
+                    try win.ensure(1);
+                    win.pushPrepared(.{ .LightCFunction = &testcLightCFunc });
+                    return null;
+                }
                 var scope = try self.openRootScope(3, 0);
                 defer scope.close();
                 // P16.50-review-14 HIGH 2: upvals/ccl/mt live only in Zig
@@ -54720,18 +54809,6 @@ pub const Vm = struct {
     /// and must have the metamethods.
     const TabCheck = struct { read: bool = false, write: bool = false, len: bool = false };
 
-    /// PUC `luaV_equalobj` function arm as used by findfield's rawequal:
-    /// a 0-upvalue C closure is luazig's shape for PUC's light C function
-    /// (pushcclosure n==0 pushes LUA_VLCF, compared by the function
-    /// pointer), so two fresh pushes of the same `lua_CFunction` are
-    /// equal; every other closure is PUC's heap-closure arm — object
-    /// identity.
-    fn cFuncEqual(a: *Closure, b: *Closure) bool {
-        if (a == b) return true;
-        if (a.c_func == null or b.c_func == null) return false;
-        return a.upvalues.len == 0 and b.upvalues.len == 0 and a.c_func.? == b.c_func.?;
-    }
-
     /// PUC `pushglobalfuncname` (lauxlib.c:74-92): search the registry
     /// `_LOADED` table for the function value — `findfield` with level 2
     /// walks each loaded module table's fields — and return the dotted
@@ -54761,19 +54838,14 @@ pub const Vm = struct {
             for (mod_table.hash) |*field_node| {
                 if (!ltable.Node.isStringTag(field_node.key_tt)) continue;
                 if (field_node.value == .Nil) continue;
-                // PUC findfield matches with lua_rawequal. A 0-upvalue C
-                // closure is luazig's shape for PUC's light C function
-                // (lua_pushcclosure n==0 pushes LUA_VLCF; luaV_equalobj
-                // compares those by the function POINTER), so two fresh
-                // pushes of the same lua_CFunction match. Upvalue-carrying
-                // C closures and bytecode closures are PUC's heap-closure
-                // arm — object identity. Tag-guarded reads (wrong-union
-                // payload reads are UB in ReleaseFast — see
-                // debugFindGlobalFuncName).
+                // PUC findfield matches with lua_rawequal: light C
+                // functions by the function POINTER (lvm.c:641), every
+                // heap object (closure/table/...) by object identity.
+                // Tag-guarded reads (wrong-union payload reads are UB in
+                // ReleaseFast — see debugFindGlobalFuncName).
                 const matches = switch (field_node.value) {
-                    .Closure => |cl| func == .Closure and cFuncEqual(cl, func.Closure),
+                    .Closure => |cl| func == .Closure and cl == func.Closure,
                     .Builtin => |b| func == .Builtin and b == func.Builtin,
-                    // PUC VLCF: raw fn-pointer equality (lvm.c:641).
                     .LightCFunction => |f| func == .LightCFunction and f == func.LightCFunction,
                     else => false,
                 };
@@ -56189,6 +56261,84 @@ test "vm: light C function as a require searcher-result loader" {
     try testing.expectEqual(@as(usize, 2), ret.len);
     try testing.expectEqual(@as(i64, 42), ret[0].Int);
     try testing.expectEqual(@as(i64, 42), ret[1].Int);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Publication through the public C API: producers publish real light
+// values — api.pushcclosure(0)/registerfuncs(0) (lapi.c:609-615),
+// the testC pushcclosure-0 command (ltests.c:1787 → VLCF(testC)).
+
+test "vm: testC pushcclosure 0 publishes a real light C function" {
+    const testing = std.testing;
+
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    _ = try vm.setupMainHandle();
+    defer vm.freeStateHandle(vm.main_handle.?);
+
+    // PUC runC: `lua_pushcclosure(L1, testC, 0)` — the testC function
+    // pointer itself, no upvalue-emulation table.
+    const script = [_]Value{.{ .String = try vm.internStr("pushcclosure 0; return 1") }};
+    const ret = try vm.apiCall(.nonyieldable, .{ .Builtin = .testc_testC }, script[0..]);
+    defer vm.alloc.free(ret);
+    try testing.expectEqual(@as(usize, 1), ret.len);
+    try testing.expect(ret[0] == .LightCFunction);
+    try testing.expect(ret[0].LightCFunction.? == @as(*const fn (?*lua_State) callconv(.c) c_int, &Vm.testcLightCFunc));
+
+    // Same-pointer identity across two publications (PUC VLCF equality).
+    const ret2 = try vm.apiCall(.nonyieldable, .{ .Builtin = .testc_testC }, script[0..]);
+    defer vm.alloc.free(ret2);
+    try testing.expect(Vm.valuesEqual(ret[0], ret2[0]));
+
+    // Calling it runs a script from its first argument through the
+    // standard light C-function entry (PUC VLCF(testC) semantics: no
+    // upvalues, no captured env — getglobal hits the real globals).
+    const call_args = [_]Value{.{ .String = try vm.internStr("pushint 7; return 1") }};
+    const r2 = try vm.apiCall(.nonyieldable, ret[0], call_args[0..]);
+    defer vm.alloc.free(r2);
+    try testing.expectEqual(@as(usize, 1), r2.len);
+    try testing.expectEqual(@as(i64, 7), r2[0].Int);
+
+    // Out-of-range upvalue reads are nil (PUC index2value → G nilvalue
+    // for a light C function: "absent upvalues from C-function pointers").
+    const null_args = [_]Value{.{ .String = try vm.internStr("isnull U1; return 1") }};
+    const r3 = try vm.apiCall(.nonyieldable, ret[0], null_args[0..]);
+    defer vm.alloc.free(r3);
+    try testing.expectEqual(@as(usize, 1), r3.len);
+    try testing.expectEqual(true, r3[0].Bool);
+}
+
+test "vm: api.pushcclosure(0)/registerfuncs(0) publish light values" {
+    const api = @import("api.zig");
+    const testing = std.testing;
+    var state = api.State.init(.{ .allocator = testing.allocator });
+    defer state.deinit();
+
+    try state.pushcclosure(&vimpl1Cf42, 0);
+    const pushed = state.curThread().stack[state.curThread().top - 1];
+    try testing.expect(pushed == .LightCFunction);
+    try testing.expect(pushed.LightCFunction.? == &vimpl1Cf42);
+    try testing.expect(GcObject.fromValue(pushed) == null);
+    try testing.expect(state.iscfunction(-1));
+    try testing.expect(state.tocfunction(-1).? == &vimpl1Cf42);
+    try state.popN(1);
+
+    const reg = [_]api.State.Reg{
+        .{ .name = "vimpl3alpha", .func = vimpl1Cf42 },
+        .{ .name = "vimpl3ph", .func = null },
+        .{ .name = null, .func = null },
+    };
+    try state.newlib(reg[0..].ptr);
+    try testing.expect(state.typeOf(-1).? == .table);
+    _ = try state.getfield(-1, "vimpl3alpha");
+    const regf = state.curThread().stack[state.curThread().top - 1];
+    try testing.expect(regf == .LightCFunction);
+    try testing.expect(regf.LightCFunction.? == &vimpl1Cf42);
+    try state.popN(1);
+    _ = try state.getfield(-1, "vimpl3ph");
+    try testing.expect(state.typeOf(-1).? == .boolean);
+    try testing.expect(!state.toboolean(-1));
+    try state.popN(2);
 }
 
 test "vm: table constructor and access" {
@@ -60233,14 +60383,14 @@ test "P16.50: pushcclosure/registerfuncs OOM transactionality" {
     // Pre-reserve the main window so window pushes cannot allocate.
     try vm.cWindowEnsure(state.curThread(), 16);
 
-    // ---- Segment A: pushcclosure with 0 upvalues ----
-    var fail_idx: usize = 0;
-    var tested_failures: usize = 0;
-    var first_success_idx: ?usize = null;
-    while (fail_idx <= 5) : (fail_idx += 1) {
+    // ---- Segment A: pushcclosure with 0 upvalues. PUC lapi.c:609-615
+    // publishes the function pointer itself (LUA_VLCF) — no allocation at
+    // all — so the operation must succeed even under a TOTAL-failure
+    // allocator (fail index 0) and publish an unregistered light value. ----
+    {
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
-            .fail_index = fail_idx,
-            .resize_fail_index = fail_idx,
+            .fail_index = 0,
+            .resize_fail_index = 0,
         });
         const snap = try P50Snapshot.take(vm, testing.allocator);
         defer snap.deinit(testing.allocator);
@@ -60249,25 +60399,16 @@ test "P16.50: pushcclosure/registerfuncs OOM transactionality" {
         const result = state.pushcclosure(p50Cfunc, 0);
         vm.alloc = testing.allocator;
 
-        if (result) |_| {
-            first_success_idx = fail_idx;
-            const cl = state.curThread().stack[state.curThread().top - 1].Closure;
-            try testing.expect(p50IsRegistered(vm, .{ .closure = cl }));
-            try testing.expect(p50InYoung(vm, .{ .closure = cl }));
-            state.curThread().top -= 1; // plain pop of the pushed closure
-            p50TeardownClosure(vm, cl);
-            try snap.assertRestored(vm);
-            break;
-        } else |err| {
-            try testing.expectEqual(error.OutOfMemory, err);
-            tested_failures += 1;
-            try snap.assertRestored(vm);
-            try vm.gcMinorCollection();
-            try snap.assertRestored(vm);
-        }
+        try result;
+        const pushed = state.curThread().stack[state.curThread().top - 1];
+        try testing.expect(pushed == .LightCFunction);
+        try testing.expect(pushed.LightCFunction == p50Cfunc);
+        try testing.expect(GcObject.fromValue(pushed) == null);
+        state.curThread().top -= 1; // plain pop of the pushed value
+        try snap.assertRestored(vm);
+        try vm.gcMinorCollection();
+        try snap.assertRestored(vm);
     }
-    try testing.expect(tested_failures > 0);
-    try testing.expect(first_success_idx != null);
 
     // ---- Segment B: pushcclosure with 3 upvalues (cells committed
     // incrementally; the errdefer rolls the created ones back in reverse) ----
@@ -60277,9 +60418,9 @@ test "P16.50: pushcclosure/registerfuncs OOM transactionality" {
     //
     // P16.50-review: the free-before-read errdefer bug is FIXED (rollback
     // loop runs BEFORE the array free) — every failure index is drivable.
-    fail_idx = 0;
-    tested_failures = 0;
-    first_success_idx = null;
+    var fail_idx: usize = 0;
+    var tested_failures: usize = 0;
+    var first_success_idx: ?usize = null;
     while (fail_idx <= 5) : (fail_idx += 1) {
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{
             .fail_index = fail_idx,
@@ -63642,13 +63783,14 @@ test "P16.50-review-3 R2: exported throwing APIs under callCFunction OOM sweeps"
         try testing.expectEqual(@as(usize, 0), sr.census.n_table);
     }
 
-    // ---- lua_pushcfunction: #0 the Closure, #1 the results dupe — first
-    // success at 2. (No fresh-stack growth — the
-    // closure lands on the window with spare capacity.) ----
+    // ---- lua_pushcfunction: the light publication allocates NOTHING (PUC
+    // setfvalue — no heap object); the sweep's single allocation is the
+    // results dupe — first success at 1. (No fresh-stack growth — the
+    // value lands on the window with spare capacity.) ----
     {
         const sr = try p50r3Sweep(vm, th, frames0, p50r3CfPushcfunction, 7, false);
-        try testing.expectEqual(@as(usize, 2), sr.first_success);
-        try testing.expectEqual(@as(usize, 1), sr.census.n_closure);
+        try testing.expectEqual(@as(usize, 1), sr.first_success);
+        try testing.expectEqual(@as(usize, 0), sr.census.n_closure);
         try testing.expectEqual(@as(usize, 0), sr.census.n_cell);
         try testing.expectEqual(@as(usize, 0), sr.census.n_string);
         try testing.expectEqual(@as(usize, 0), sr.census.n_table);
@@ -63672,14 +63814,15 @@ test "P16.50-review-3 R2: exported throwing APIs under callCFunction OOM sweeps"
     }
 
     // ---- luaL_newlib (nup=0, 2 entries): #0 the lib Table, then per entry
-    // — the key intern, the Closure — plus the publish rehash (2
-    // allocations), then the results dupe — first success at 8. (No #1
-    // stack growth — the table lands on the
-    // window with spare capacity.) ----
+    // — the key intern (the function itself is a light value — no closure
+    // allocation, PUC luaL_setfuncs nup==0 parity) — plus the publish
+    // rehash (2 allocations), then the results dupe — first success at 6.
+    // (No #1 stack growth — the table lands on the window with spare
+    // capacity.) ----
     {
         const sr = try p50r3Sweep(vm, th, frames0, p50r3CfNewlib, 12, false);
-        try testing.expectEqual(@as(usize, 8), sr.first_success);
-        try testing.expectEqual(@as(usize, 2), sr.census.n_closure);
+        try testing.expectEqual(@as(usize, 6), sr.first_success);
+        try testing.expectEqual(@as(usize, 0), sr.census.n_closure);
         try testing.expectEqual(@as(usize, 0), sr.census.n_cell);
         try testing.expectEqual(@as(usize, 2), sr.census.n_string);
         try testing.expectEqual(@as(usize, 1), sr.census.n_table); // created inside newlib
@@ -63996,7 +64139,8 @@ test "P16.50-review-5 B2: C-ABI throw matrix" {
         const r = try vm.callCFunction(p50r3CfPushcfunction, .Nil, &.{}, 0);
         defer vm.alloc.free(r);
         try testing.expectEqual(@as(usize, 1), r.len);
-        try testing.expect(r[0] == .Closure);
+        try testing.expect(r[0] == .LightCFunction);
+        try testing.expect(r[0].LightCFunction == p50Cfunc);
         p50r3TeardownResidue(vm, snap.chain.len);
         try snap.assertRestored(vm);
     }

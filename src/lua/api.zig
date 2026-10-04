@@ -1375,7 +1375,6 @@ pub const State = struct {
     }
 
     /// Push a C closure wrapping `fn_` with `n` upvalues from the stack.
-    /// Currently only n=0 is supported (upvalues need Phase 9).
     /// Canonical C-closure constructor (P16.50-review BLOCKER 3).
     /// PUC semantics: `lua_pushcclosure` (lapi.c:609+) allocates a FRESH
     /// CClosure per call and COPIES the given values into that closure's
@@ -1388,24 +1387,28 @@ pub const State = struct {
     /// per-closure Cells + Closure out, prepared-then-committed.
     /// Returns the closure WITHOUT touching the stack (callers own the
     /// push/pop ordering).
-    /// P16.50-review-15 BLOCKER 1: the construction itself lives in
-    /// `Vm.allocCclosure` — the ONE owner shared with every other
-    /// C-closure builder (coroutine.wrap's auxwrap closure).
     fn makeCclosure(self: *State, fn_: ?*const fn (?*vm_mod.lua_State) callconv(.c) c_int, values: []const vm_mod.Value) ApiError!*vm_mod.Closure {
         return self.vm.allocCclosure(fn_, values);
     }
 
+    /// PUC `lua_pushcclosure` (lapi.c:609+): `n == 0` publishes the
+    /// function pointer itself as a light C function value — no heap
+    /// object, no GC registration, and `fn_ == null` is storable (type
+    /// "function", iscfunction true, tocfunction null; calling it is PUC
+    /// UB). `n > 0` allocates a fresh CClosure over the top `n` values.
     pub fn pushcclosure(self: *State, fn_: ?*const fn (?*vm_mod.lua_State) callconv(.c) c_int, n: usize) ApiError!void {
         const th = self.curThread();
-        // M1: reserve the closure's slot BEFORE construction (the reserve
+        // M1: reserve the result slot BEFORE construction (the reserve
         // may grow + move the stack, so the upvalue slice is captured
-        // after it). After makeCclosure the push hits reserved capacity —
-        // the constructed closure never crosses a fallible operation
-        // before its rooting store.
+        // after it). After construction the push hits reserved capacity —
+        // the constructed value never crosses a fallible operation before
+        // its rooting store. For a light value there is no construction:
+        // the push is the infallible commit of the whole operation.
         try self.reservePushSlot();
         if (n == 0) {
-            const cl = try self.makeCclosure(fn_, &.{});
-            try self.push(.{ .Closure = cl });
+            // Post-reserve the push hits reserved capacity: the whole
+            // operation commits infallibly (PUC setfvalue + api_incr_top).
+            try self.push(.{ .LightCFunction = fn_ });
             return;
         }
         // Read the n upvalue values from the window top (WITHOUT popping:
@@ -1805,6 +1808,13 @@ pub const State = struct {
             const key_str = try self.vm.internStr(name);
             if (reg[i].func == null) {
                 self.vm.apiRawSet(tbl, .{ .String = key_str }, .{ .Bool = false }) catch |e| return mapVmError(e);
+                continue;
+            }
+            if (nup == 0) {
+                // PUC luaL_setfuncs with nup == 0: every
+                // lua_pushcclosure(f, 0) publishes a light C function —
+                // nothing to allocate, so nothing to roll back.
+                self.vm.apiRawSet(tbl, .{ .String = key_str }, .{ .LightCFunction = reg[i].func }) catch |e| return mapVmError(e);
                 continue;
             }
             const cl = try self.makeCclosure(reg[i].func, shared_values);

@@ -50,19 +50,28 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   в ERRMEM (2026-10-04).** PUC поглощает raw yield как results с full
   continuation (Y2a n=7 r1=true); prototype adapter — CHUNK ERR "not
   enough memory" (порча error-класса). Блокирует yieldable
-  light-publication (coroutine.yield/wrap и др.); non-yield builtins
+  light-publication (`coroutine.yield` доказан; прочие yieldable функции
+  требуют проверки); non-yield builtins
   не затронуты. Решается raw-yield моделью в adapter ИЛИ выбором
   A-restricted/B-mirror — owner decision. Raw:
   /tmp/opencode/scresv2_{ymx,y2d}_{puc,ad}.out.
 
-- [ ] **file mt `__tostring` не опубликован как функция (LOW/MEDIUM,
-  pre-existing; найден scresv2 2026-10-04).** Единственный счётный
-  разрыв между PUC 135 уникальных table-published function entries и
-  zig 143 .Builtin + require; PUC публикует mt.__tostring через
-  luaL_setfuncs, zig — нет. Отдельный parity-gap вне identity-модели.
+- [ ] **file mt `__tostring` не опубликован как функция (BLOCKER,
+  pre-existing, ORDINARY-BACKLOG; найден scresv2 2026-10-04).** Единственный счётный
+  разрыв между PUC 145 source-published function entries и zig 143
+  `.Builtin` + require `.Closure` = 144; PUC публикует mt.__tostring через
+  luaL_setfuncs, zig — нет. `tostring(io.stdout)` наблюдаемо отличается;
+  отдельный parity-gap вне identity-модели.
 
-- [ ] **G1(scresv): ERRMEM не ловится pcall в product VM-lane (HIGH,
-  pre-existing; найден scresv 2026-10-04).** PUC ловит OOM защищённым
+- [ ] **`coroutine.status` свежей пустой корутины расходится с PUC
+  (BLOCKER, pre-existing, ORDINARY-BACKLOG; найден scresv2
+  2026-10-04).** PUC возвращает `dead` для никогда не запущенной
+  корутины с пустым стеком; zig возвращает `suspended`.
+  `scresv2_fresh.c` и Y1pre в `/tmp/opencode/scresv2_ymx_*.out`;
+  не является причиной R4, поскольку Y2 проверяет уже running co.
+
+- [ ] **G1(scresv): ERRMEM не ловится pcall в product VM-lane (BLOCKER,
+  pre-existing, ORDINARY-BACKLOG; найден scresv 2026-10-04).** PUC ловит OOM защищённым
   вызовом; zig — нет. Доказано на чистом master VM-lane коде (без
   прототипа). Отдельный от F-A6T класс? — решающий эксперимент в
   отчёте scresv.
@@ -74,8 +83,8 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   Затрагивает каждый вызов getinfo с function-аргументом, независимо
   от .Builtin identity. Cut 0 в плане scres (Variant A).
 
-- [ ] **scres architecture verification: stdlib C trampoline не доказан
-  на target lua_State и OOM/GC (HIGH, FIX-NOW для research handoff).**
+- [x] **scres architecture verification: target lua_State и OOM/GC
+  (HIGH, research handoff завершён).**
   Research e9e0261 рекомендует Option A, но его throwaway trampoline
   выбирает activeBytecodeThread вместо thread переданного L. Независимый
   raw differential /tmp/scres_thread_raw.c: прямой вызов указателя
@@ -87,6 +96,11 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   differential разделён по режимам не был. Нужна bounded verification
   target-thread adapter, cleanup/roots, точного inventory и perf
   provenance до owner decision; product-код master не менялся.
+  REVIEW scresv2/`5eaaceb`: исследовательская проверка принята со
+  сработавшим STOP. Target-thread/OOM/provenance проверены для
+  non-yield прототипа; полный Option A опровергнут Y1/Y2/D3 и вынесен
+  в отдельный открытый R4 выше. Исторический текст этого пункта
+  описывает состояние до scresv2.
 
 - [ ] **GC finalizer thread-routing parity-gap (ARCHITECTURAL-BACKLOG;
   f1gc2, 2026-10-03).** PUC на host lua_gc(worker) aborts via panic-
@@ -583,6 +597,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   состоянии (7 errors), scresv_tr_ad/rf (18:56) устарели относительно
   финального mx-прогона (19:07) — вердикт опирается на raw mx-выводы;
   при implementation rebuild-верификация adapter'а обязательна. Owner
+  decision — только после review этой verification.
   V2 VERIFICATION VERDICT (scresv2, 2026-10-04, к `19331d0`; отчёт
   /tmp/opencode/scresv2_report.md, hashes scresv2_hashes.txt):
   ВЕРДИКТ ИЗМЕНЁН — R4 материализовался в confirmed BLOCKER:
@@ -607,7 +622,6 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   master (bin == 19331d0): PUC ловит ERRMEM под pcall, master escape.
   G2 воспроизведён точно (252 foreign frees / 78749 B) и ВЛИТ в
   существующий пункт C API allocator owner (второй долг не создавался).
-  decision — только после review этой verification.
   REVIEW 2026-10-04: INCONCLUSIVE для implementation handoff.
   Source inventory и базовый identity-gap подтверждены, но prototype
   не выполняет contract прямого f(L) на coroutine того же VM; OOM/GC
@@ -626,6 +640,17 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   JSON содержит A/B1, а 21-seed B2 counters не предъявлены. Нужна
   bounded verification по следующему prompt.md; owner decision пока
   рано. Это вывод ревью, прошлый report.md не переписывается.
+  REVIEW scresv2/`5eaaceb` 2026-10-04: ACCEPT + RECORD bounded research
+  со сработавшим STOP. Прежнее «Option A доказан» опровергнуто raw
+  yield Y1/Y2/D3; non-yield `f(co)` подтверждён, full A требует
+  архитектурного R4-решения. Сохранённый perf JSON фактически A/B2
+  (`scres_bench/run_ab.py` указывает B2 binary), B1 повторён 21 seeds;
+  ранняя метка A/B1 в REVIEW была ошибочной. Результат perf:
+  C-call bookkeeping доминирует; нулевая стоимость lookup не доказана
+  (math B1/B2 отличаются на 6.2 процентного пункта к A). Указанные в
+  scresv2 отчёте `scresv2_al_*`/`ol_*`/`bl_*` raw stdout не сохранены;
+  ревью воспроизвело k=1..3, повторный вызов, GC и 16 B
+  negative-before. Research принят, product-модель не утверждена.
 
 - [ ] **`package.loadlib(path, "*")` возвращает function вместо true
   (BLOCKER, pre-existing, ORDINARY-BACKLOG).** PUC `loadlib.c:391–394`

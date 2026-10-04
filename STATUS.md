@@ -136,6 +136,25 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   region-end floor на func_slot+1; pre-existence доказан на
   пред-коррекционном proto; мин-репро + полная батарея зелёные
   (перенести в product — cut P0.5). Cut P1-P5 из syres РАЗБЛОКИРОВАН
+  FRESH-CLOSE VERDICT (syfc, 2026-10-04, к `5421ad4`; отчёт
+  /tmp/opencode/syfc_report.md, артефакты /tmp/opencode/syfc/):
+  review-negative ЗАКРЫТ в прототипе — координатор верифицировал
+  лично: syfc_corr_freshcallk byte-identical чистому PUC 5.5.0
+  (MARKED/CLOSE/AFTER st=0 closed=1 co_st=0 co_top=0 main_top=1).
+  Fix: catch lua_callk в throwaway-прототипе запускает ОБЩИЙ
+  crossCloseErrorRaise transport для cross-thread RuntimeError/OOM ДО
+  context restore (переиспользует доказанную sync-close механику),
+  relaying MainDestined/machinery-OOM/unexpected по lane; same-thread
+  путь не изменён. Расширенные формы E1-E9 + E2b — IDENTICAL (E2/E2b/
+  E3/E5 расхождения исправлены полной reset-семантикой; E9 panic
+  contract 134/134). Новый OOM-probe (syfc_oomcallk.c): AFTER-строки
+  IDENTICAL (one-shots поглощены; sticky -> st=4 not enough memory;
+  чистый reuse). Полная батарея: 10 PASS + 6 pre-existing принятых
+  расхождений идентичны прежним записям (регрессий нет). Perf на
+  финальном identity: +0.0000/+0.0000/+0.0002% (catch-only, cold).
+  Итог: SY-R4 fresh-close CLOSED в proto; cuts P1-P5 РАЗБЛОКИРОВАНЫ с
+  этим transport'ом в том же cut (fresh-close + прежние
+  SY-R4-close/pad доказаны ВМЕСТЕ).
   после включения closeprotected+main-pad в транспорт; обновлённый
   порядок в отчёте §7.
   REVIEW 2026-10-05 к `72f7886`: **INCONCLUSIVE** для implementation

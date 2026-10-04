@@ -4051,6 +4051,14 @@ pub const Value = union(enum) {
     // metatable and uservalues. Distinct from LightUserdata (which is a bare
     // pointer, not GC'd). See `Userdata` struct above.
     Userdata: *Userdata,
+    // PUC LUA_VLCF (lobject.h): a light C function — the lua_CFunction
+    // pointer itself stored in the Value, with NO heap object and NO
+    // upvalue cells (PUC lua_pushcclosure with n == 0). Not GC-managed
+    // (iscollectable is false); identity is the function pointer. Nullable:
+    // PUC allows lua_pushcclosure(L, NULL, 0) — type "function",
+    // iscfunction true, tocfunction NULL; CALLING it is PUC UB and is
+    // never tested (the unwrap at the call boundary crashes equivalently).
+    LightCFunction: ?*const fn (?*lua_State) callconv(.c) c_int,
 
     pub fn typeName(self: Value) []const u8 {
         return switch (self) {
@@ -4059,7 +4067,7 @@ pub const Value = union(enum) {
             .Int, .Num => "number",
             .String => "string",
             .Table => "table",
-            .Builtin, .Closure => "function",
+            .Builtin, .Closure, .LightCFunction => "function",
             .Thread => "thread",
             .LightUserdata, .Userdata => "userdata",
         };
@@ -7652,6 +7660,7 @@ pub const Vm = struct {
                 }
             },
             .Closure => |cl| return exposeDispatchResult([]Value, self.runClosure(cl, resolved.args, resolved.ccmt)),
+            .LightCFunction => return exposeDispatchResult([]Value, self.callLightCFunction(resolved.callee, resolved.args, resolved.ccmt)),
             else => unreachable,
         }
     }
@@ -13550,6 +13559,12 @@ pub const Vm = struct {
                     opname,
                 ) };
             },
+            .LightCFunction => {
+                return .{ .value = try self.callResolvedMetamethodSync(
+                    resolved,
+                    opname,
+                ) };
+            },
             else => unreachable, // resolveCallable errors on non-callable
         }
     }
@@ -13581,6 +13596,11 @@ pub const Vm = struct {
             },
             .Closure => |cl| blk: {
                 const ret = try self.runClosure(cl, resolved.args, resolved.ccmt);
+                defer self.alloc.free(ret);
+                break :blk if (ret.len > 0) ret[0] else .Nil;
+            },
+            .LightCFunction => blk: {
+                const ret = try self.callLightCFunction(resolved.callee, resolved.args, resolved.ccmt);
                 defer self.alloc.free(ret);
                 break :blk if (ret.len > 0) ret[0] else .Nil;
             },
@@ -14455,6 +14475,11 @@ pub const Vm = struct {
                     defer self.alloc.free(ret);
                     break :blk if (ret.len > 0) ret[0] else .Nil;
                 },
+                .LightCFunction => blk: {
+                    const ret = try self.callLightCFunction(resolved.callee, resolved.args, resolved.ccmt);
+                    defer self.alloc.free(ret);
+                    break :blk if (ret.len > 0) ret[0] else .Nil;
+                },
                 else => unreachable,
             };
             _ = scope.protectValueAssumeCapacity(acc);
@@ -14962,7 +14987,9 @@ pub const Vm = struct {
                     try self.appendBytecodeGsubResult(state, value);
                     try self.advanceBytecodeGsubAfterMatch(state);
                 },
-                .Builtin => {
+                .Builtin, .LightCFunction => {
+                    // PUC add_value: a builtin or VLCF repl is a plain C
+                    // activation — the synchronous path (no continuation).
                     const value = try self.runGsubReplacementFunction(
                         state.replacement,
                         s,
@@ -20265,9 +20292,10 @@ pub const Vm = struct {
                                 .Int, .Num => "number",
                                 .String => "string",
                                 .Bool => "boolean",
-                                .Builtin, .Closure => "function",
+                                .Builtin, .Closure, .LightCFunction => "function",
+                                .Thread => "thread",
+                                .LightUserdata, .Userdata => "userdata",
                                 .Table => unreachable,
-                                else => "table",
                             };
                             return self.fail("attempt to index a {s} value (upvalue '{s}')", .{ tn, upv_name });
                         }
@@ -23269,7 +23297,7 @@ pub const Vm = struct {
         var chain_depth: u4 = 0;
         while (true) {
             switch (ctx.regs[a + 4]) {
-                .Closure, .Builtin => break,
+                .Closure, .Builtin, .LightCFunction => break,
                 else => {
                     const current_callee = ctx.regs[a + 4];
                     self.tryCallMetamethodInPlace(
@@ -23427,6 +23455,36 @@ pub const Vm = struct {
                     error.Yield => {
                         // Outermost-dispatch test — 1 with the base
                         // frame, 0 only on hand-made test threads.
+                        if (ctx.boundary_depth == bytecodeOuterBoundary(ctx.exec_frames)) {
+                            if (self.current_thread) |th| {
+                                th.bytecode_inplace_suspended = true;
+                                ctx.yielded_in_place.* = true;
+                            }
+                        }
+                        return error.Yield;
+                    },
+                    else => {
+                        self.clearPendingCall(ctx.exec_frames.getPtr(ctx.frame_index));
+                        return call_err;
+                    },
+                };
+                self.clearPendingCall(ctx.exec_frames.getPtr(ctx.frame_index));
+                break :blk values;
+            },
+            .LightCFunction => blk: {
+                // PUC OP_TFORCALL → luaD_call → precallC for a VLCF iterator:
+                // a real C activation (callCFunction pushes the C-frame and
+                // fires the CALL hook on it); the pending call covers the
+                // error/yield unwind exactly like the C-closure arm.
+                try self.setPendingCall(ctx.exec_frames.getPtr(ctx.frame_index), .{
+                    .callee = callee_val,
+                    .completion = .{ .results = .{
+                        .dst = a + 4,
+                        .nresults = @intCast(nresults),
+                    } },
+                });
+                const values = self.callLightCFunction(callee_val, rargs_builtin, chain_depth) catch |call_err| switch (call_err) {
+                    error.Yield => {
                         if (ctx.boundary_depth == bytecodeOuterBoundary(ctx.exec_frames)) {
                             if (self.current_thread) |th| {
                                 th.bytecode_inplace_suspended = true;
@@ -23753,7 +23811,7 @@ pub const Vm = struct {
         var chain_depth: u4 = 0;
         while (true) {
             switch (ctx.regs[a]) {
-                .Closure, .Builtin => break,
+                .Closure, .Builtin, .LightCFunction => break,
                 else => {
                     const current_callee = ctx.regs[a];
                     // As in bytecodeIndexValue: the "attempt to call"
@@ -23909,6 +23967,10 @@ pub const Vm = struct {
                 }
                 // C closure: callCFunction fires the event on its C-frame.
             },
+            // Light C function: callCFunction fires the event on its own
+            // C-frame push (PUC precallC — a fresh CallInfo without
+            // CIST_TAIL, plain LUA_HOOKCALL).
+            .LightCFunction => {},
             else => unreachable,
         }
 
@@ -24365,6 +24427,39 @@ pub const Vm = struct {
                 self.clearPendingCall(ctx.exec_frames.getPtr(ctx.frame_index));
                 break :blk values;
             },
+            .LightCFunction => blk: {
+                // PUC OP_TAILCALL → luaD_pretailcall → precallC for a VLCF:
+                // a fresh C activation (no frame reuse); the pending call
+                // covers the error/yield unwind exactly like the C-closure
+                // arm.
+                try self.setPendingCall(ctx.exec_frames.getPtr(ctx.frame_index), .{
+                    .callee = callee_val,
+                    .completion = .{ .results = .{
+                        .dst = a,
+                        .nresults = -1,
+                        .tail_return = true,
+                    } },
+                });
+                const values = self.callLightCFunction(callee_val, call_args, chain_depth) catch |call_err| switch (call_err) {
+                    error.Yield => {
+                        // Outermost-dispatch test — 1 with the base
+                        // frame, 0 only on hand-made test threads.
+                        if (ctx.boundary_depth == bytecodeOuterBoundary(ctx.exec_frames)) {
+                            if (self.current_thread) |th| {
+                                th.bytecode_inplace_suspended = true;
+                                ctx.yielded_in_place.* = true;
+                            }
+                        }
+                        return error.Yield;
+                    },
+                    else => {
+                        self.clearPendingCall(ctx.exec_frames.getPtr(ctx.frame_index));
+                        return call_err;
+                    },
+                };
+                self.clearPendingCall(ctx.exec_frames.getPtr(ctx.frame_index));
+                break :blk values;
+            },
             else => unreachable,
         };
         var ret_owned = true;
@@ -24532,7 +24627,7 @@ pub const Vm = struct {
         var chain_depth: u4 = 0;
         while (true) {
             switch (ctx.regs[a]) {
-                .Closure, .Builtin => break,
+                .Closure, .Builtin, .LightCFunction => break,
                 else => {
                     const current_callee = ctx.regs[a];
                     // As in bytecodeIndexValue: the "attempt to call"
@@ -24692,6 +24787,10 @@ pub const Vm = struct {
                     deferred_builtin_call_hook = true;
                 }
             },
+            // Light C function: callCFunction fires the event on its own
+            // C-frame push (PUC precallC ordering — the CallInfo exists
+            // before LUA_HOOKCALL fires).
+            .LightCFunction => {},
             else => unreachable,
         }
 
@@ -25296,6 +25395,79 @@ pub const Vm = struct {
                 // P16.50-review-7 BLOCKER 3.2: the hook path adopts the
                 // post payload on every error — disarm our mirror owner
                 // when it errors.
+                const hook_pushed = self.tryPushBytecodeDebugHook(
+                    ctx.exec_frames,
+                    ctx.frame_index,
+                    "return",
+                    null,
+                    callee_val,
+                    ret,
+                    1,
+                    .{ .store_results = .{
+                        .continuation = .{ .dst = a, .nresults = nresults },
+                        .values = ret,
+                    } },
+                ) catch |err| {
+                    ret_owned = false;
+                    return err;
+                };
+                if (hook_pushed) {
+                    ret_owned = false;
+                    return .continue_frame_loop;
+                }
+                try self.dispatchBytecodeHookWithCallee("return", callee_val, ret);
+                const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
+                try self.growCtxFrame(ctx, a + nstore);
+                for (0..nstore) |i| {
+                    ctx.regs[a + i] = if (i < ret.len) ret[i] else .Nil;
+                }
+                // Multret producer publication (PUC moveresults): the
+                // occupied bound OVERWRITES the window so the following
+                // B==0 consumer reads the exact count.
+                if (nresults < 0) ctx.th.top = ctx.base + a + ret.len;
+                self.alloc.free(ret);
+                ret_owned = false;
+            },
+            .LightCFunction => {
+                // PUC OP_CALL → luaD_precall → precallC for a VLCF: a real C
+                // activation (callCFunction pushes the C-frame and fires the
+                // CALL hook on it). Same window/pending/hook/store contract
+                // as the C-closure lane above.
+                const fr_cc = ctx.exec_frames.getPtr(ctx.frame_index);
+                if (!fr_cc.isC()) fr_cc.limit = ctx.cap + 1;
+                try self.setPendingCall(ctx.exec_frames.getPtr(ctx.frame_index), .{
+                    .callee = callee_val,
+                    .completion = .{ .results = .{
+                        .dst = a,
+                        .nresults = nresults,
+                    } },
+                });
+                const ret = self.callLightCFunction(callee_val, rargs, chain_depth) catch |call_err| switch (call_err) {
+                    error.Yield => {
+                        // Outermost-dispatch test — 1 with the base
+                        // frame, 0 only on hand-made test threads.
+                        if (ctx.boundary_depth == bytecodeOuterBoundary(ctx.exec_frames)) {
+                            if (self.current_thread) |th| {
+                                th.bytecode_inplace_suspended = true;
+                                ctx.yielded_in_place.* = true;
+                            }
+                        }
+                        return error.Yield;
+                    },
+                    else => {
+                        self.clearPendingCall(ctx.exec_frames.getPtr(ctx.frame_index));
+                        return call_err;
+                    },
+                };
+                self.clearPendingCall(ctx.exec_frames.getPtr(ctx.frame_index));
+                var ret_owned = true;
+                errdefer if (ret_owned) self.alloc.free(ret);
+                // Root the C-function results across the hook machinery (the
+                // transfer dupe, the Lua hook body) and the frame growth
+                // below — same contract as the .owned arm above.
+                var scope = try self.openRootScope(ret.len, 0);
+                defer scope.close();
+                for (ret) |v| _ = scope.protectValueAssumeCapacity(v);
                 const hook_pushed = self.tryPushBytecodeDebugHook(
                     ctx.exec_frames,
                     ctx.frame_index,
@@ -27414,7 +27586,7 @@ pub const Vm = struct {
             .Int, .Num => "number",
             .String => "string",
             .Table => "table",
-            .Builtin, .Closure => "function",
+            .Builtin, .Closure, .LightCFunction => "function",
             .Thread => "thread",
             .LightUserdata, .Userdata => "userdata",
         };
@@ -28086,14 +28258,20 @@ pub const Vm = struct {
                     .span => |sp| return try self.ownedPcallOk(try self.materializeResumeSpan(sp)),
                 }
             },
-            .Closure => |cl| {
+            .Closure, .LightCFunction => {
                 // PUC luaD_pcall: save old_top (L->top) and old_ci (L->ci)
                 // before calling f. On error, restore them so error value
                 // has room.
                 const th_pcall = self.activeBytecodeThread();
                 const saved_top = th_pcall.top;
                 const saved_frame_count = th_pcall.call_frames.len();
-                const ret = self.runClosure(cl, resolved.args, resolved.ccmt) catch |e| switch (e) {
+                const ret = switch (resolved.callee) {
+                    .Closure => |cl| self.runClosure(cl, resolved.args, resolved.ccmt),
+                    // PUC luaD_pcall → luaD_call → precallC: the VLCF runs
+                    // as a plain C activation inside the same protection.
+                    .LightCFunction => self.callLightCFunction(resolved.callee, resolved.args, resolved.ccmt),
+                    else => unreachable,
+                } catch |e| switch (e) {
                     error.Yield => {
                         yield_exit = true;
                         return e;
@@ -28170,7 +28348,7 @@ pub const Vm = struct {
         // that rule.
         if (args.len < 2) return self.failArgerror("bad argument #2 to 'xpcall' (function expected, got no value)", .{});
         switch (args[1]) {
-            .Closure, .Builtin => {},
+            .Closure, .Builtin, .LightCFunction => {},
             else => return self.failArgerror("bad argument #2 to 'xpcall' (function expected, got {s})", .{self.valueTypeName(args[1])}),
         }
         // PUC luaB_xpcall → lua_pcallk(L, 1, LUA_MULTRET, 2, finishpcall)
@@ -28468,7 +28646,7 @@ pub const Vm = struct {
                     .span => |sp| return try self.ownedPcallOk(try self.materializeResumeSpan(sp)),
                 }
             },
-            .Closure => |cl| {
+            .Closure, .LightCFunction => {
                 // PUC luaD_pcall: save old_top (L->top) and old_ci (L->ci)
                 // before calling f. On error, restore them so the error
                 // value has room (the handler already ran at the throw
@@ -28476,7 +28654,15 @@ pub const Vm = struct {
                 const th_xpcall = self.activeBytecodeThread();
                 const saved_top = th_xpcall.top;
                 const saved_frame_count = th_xpcall.call_frames.len();
-                const ret = self.runClosure(cl, resolved.args, resolved.ccmt) catch |e| switch (e) {
+                const ret = switch (resolved.callee) {
+                    .Closure => |cl| self.runClosure(cl, resolved.args, resolved.ccmt),
+                    // PUC luaD_pcall → luaD_call → precallC for a VLCF
+                    // target: a plain C activation inside the protection;
+                    // the armed message handler sees its errors like any
+                    // other callee's.
+                    .LightCFunction => self.callLightCFunction(resolved.callee, resolved.args, resolved.ccmt),
+                    else => unreachable,
+                } catch |e| switch (e) {
                     error.Yield => {
                         yield_exit = true;
                         return e;
@@ -30451,6 +30637,62 @@ pub const Vm = struct {
                             payload_n = ret.len;
                             payload_heap = true;
                         }
+                    }
+                },
+                .LightCFunction => {
+                    // PUC lua_resume → ccall → luaD_precall on a VLCF body:
+                    // a plain C activation run synchronously at the resume
+                    // boundary (no CallInfo bytecode frame, no trampoline).
+                    // Mirrors the CClosure-body shape above (yield suspends
+                    // the coroutine; a NULL-continuation yield finishes the
+                    // body on the next resume — PUC unroll semantics).
+                    const ret_opt: ?[]Value = retblk: {
+                        const r = self.callLightCFunction(resolved.callee, resolved.args, resolved.ccmt) catch |e| switch (e) {
+                            error.Yield => {
+                                yielded = true;
+                                break :retblk null;
+                            },
+                            error.MainDestined => {
+                                main_destined = true;
+                                return e;
+                            },
+                            error.RuntimeError, error.OutOfMemory => {
+                                if (e == error.OutOfMemory) self.setOutOfMemoryError();
+                                if (e == error.RuntimeError and th.yieldedValues() != null and th.capture_yield_id != 0) {
+                                    yielded = true;
+                                    break :retblk null;
+                                }
+                                if (e == error.RuntimeError and th.close_mode and
+                                    !self.forced_close_had_error and
+                                    !self.isStackOverflowRuntimeError())
+                                {
+                                    forced_close_ok = true;
+                                } else recovered: {
+                                    const rec = self.precover(th) catch |pe| switch (pe) {
+                                        error.Yield => {
+                                            yielded = true;
+                                            break :recovered;
+                                        },
+                                        else => return pe,
+                                    };
+                                    if (!rec) {
+                                        if (e == error.OutOfMemory) return error.OutOfMemory;
+                                        ok = false;
+                                        break :recovered;
+                                    }
+                                    th.bytecode_inplace_suspended = true;
+                                    recovered_to_unroll = true;
+                                }
+                                break :retblk null;
+                            },
+                            else => return e,
+                        };
+                        break :retblk r;
+                    };
+                    if (ret_opt) |ret| {
+                        payload = ret;
+                        payload_n = ret.len;
+                        payload_heap = true;
                     }
                 },
                 else => return self.fail("coroutine.resume: bad thread", .{}),
@@ -33112,7 +33354,7 @@ pub const Vm = struct {
                 self.nil_metatable = mt;
                 break :blk true;
             },
-            .Builtin, .Closure => blk: {
+            .Builtin, .Closure, .LightCFunction => blk: {
                 self.function_metatable = mt;
                 break :blk true;
             },
@@ -36182,10 +36424,15 @@ pub const Vm = struct {
 
     fn builtinStringDump(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
-        if (args.len == 0) return self.fail("string.dump expects function", .{});
+        // PUC 5.5 str_dump (lstrlib.c): luaL_argcheck(type == LUA_TFUNCTION
+        // && !lua_iscfunction, 1, "Lua function expected") — a C closure,
+        // builtin, or light C function is rejected by the ARGUMENT check
+        // (never reaches lua_dump).
+        if (args.len == 0) return self.failArgerror("bad argument #1 to 'string.dump' (Lua function expected)", .{});
         const cl = switch (args[0]) {
             .Closure => |c| c,
-            else => return self.fail("string.dump expects function", .{}),
+            .Builtin, .LightCFunction => return self.failArgerror("bad argument #1 to 'string.dump' (Lua function expected)", .{}),
+            else => return self.failArgerror("bad argument #1 to 'string.dump' (Lua function expected)", .{}),
         };
         const strip = if (args.len > 1) isTruthy(args[1]) else false;
 
@@ -36197,9 +36444,10 @@ pub const Vm = struct {
         // (source, names, line info, locals, upvalue names) while writing
         // the semantic fields unchanged.
         const proto = cl.proto orelse {
-            // C closures (no Proto) cannot be dumped. PUC Lua's `string.dump`
-            // raises "unable to dump given function" for non-Lua functions.
-            return self.fail("string.dump: unable to dump given function", .{});
+            // C closures (no Proto) are C functions — rejected by the same
+            // PUC 5.5 argument check (lua_iscfunction true), never by
+            // lua_dump's "unable to dump given function".
+            return self.failArgerror("bad argument #1 to 'string.dump' (Lua function expected)", .{});
         };
 
         // Serialize the Proto tree via `DumpWriter.dumpChunk`. This writes
@@ -36962,6 +37210,21 @@ pub const Vm = struct {
                             defer self.alloc.free(ret);
                             piece = if (ret.len > 0) ret[0] else .Nil;
                         },
+                        .LightCFunction => {
+                            // PUC lua_load's reader is lua_CallReader →
+                            // luaD_call → precallC: a VLCF reader is a plain
+                            // C activation.
+                            const ret = self.callLightCFunction(resolved.callee, resolved.args, resolved.ccmt) catch {
+                                outs[0] = .Nil;
+                                if (outs.len > 1) {
+                                    const istr3 = try self.internStr(self.errorString());
+                                    outs[1] = .{ .String = istr3 };
+                                }
+                                return;
+                            };
+                            defer self.alloc.free(ret);
+                            piece = if (ret.len > 0) ret[0] else .Nil;
+                        },
                         else => unreachable,
                     }
                     switch (piece) {
@@ -37531,7 +37794,10 @@ pub const Vm = struct {
             _ = scope.protectValueAssumeCapacity(r1);
             _ = scope.protectValueAssumeCapacity(r2);
             switch (r1) {
-                .Builtin, .Closure => return .{ .loader = r1, .data = r2 },
+                // PUC findloader (loadlib.c:640): "if (lua_isfunction(L, -2))"
+                // — any function tag, including a VLCF returned by a
+                // user-replaced searcher, is the loader.
+                .Builtin, .Closure, .LightCFunction => return .{ .loader = r1, .data = r2 },
                 .String => |s| {
                     try msg_buf.appendSlice(self.alloc, s.bytes());
                     try msg_buf.appendSlice(self.alloc, "\n\t");
@@ -37961,6 +38227,8 @@ pub const Vm = struct {
         return switch (target_callee) {
             .Builtin => |target_id| candidate == .Builtin and candidate.Builtin == target_id,
             .Closure => |target_cl| candidate == .Closure and candidate.Closure == target_cl,
+            // PUC: a VLCF frame's callee matches by raw fn-pointer equality.
+            .LightCFunction => |target_f| candidate == .LightCFunction and candidate.LightCFunction == target_f,
             else => false,
         };
     }
@@ -38435,6 +38703,29 @@ pub const Vm = struct {
                 }
                 if (has_f) try self.setField(t, "func", fnv);
             },
+            .LightCFunction => {
+                // PUC auxgetinfo (ldebug.c): a light C function has no
+                // Closure — funcinfo's noLuaClosure arm: what "C", source
+                // "=[C]", no definition lines, 0 upvalues, vararg.
+                const has_s = what.len == 0 or debugInfoHasOpt(what, 'S');
+                const has_f = what.len == 0 or debugInfoHasOpt(what, 'f');
+                if (has_s) {
+                    try self.setField(t, "what", .{ .String = try self.internStr("C") });
+                    try self.setField(t, "source", .{ .String = try self.internStr("=[C]") });
+                    try self.setField(t, "short_src", .{ .String = try self.internStr("[C]") });
+                    try self.setField(t, "linedefined", .{ .Int = -1 });
+                    try self.setField(t, "lastlinedefined", .{ .Int = -1 });
+                }
+                if (what.len == 0 or debugInfoHasOpt(what, 'u')) {
+                    try self.setField(t, "nups", .{ .Int = 0 });
+                    try self.setField(t, "nparams", .{ .Int = 0 });
+                    try self.setField(t, "isvararg", .{ .Bool = true });
+                }
+                if (debugInfoHasOpt(what, 'L')) {
+                    try self.setField(t, "activelines", .Nil);
+                }
+                if (has_f) try self.setField(t, "func", fnv);
+            },
             else => return self.fail("bad argument #1 to 'getinfo' (function or level expected)", .{}),
         }
     }
@@ -38652,23 +38943,28 @@ pub const Vm = struct {
                         if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
                             try self.setField(t, "func", co_stack[fr.func_slot]);
                         }
-                        if (co_stack[fr.func_slot] == .Closure or co_stack[fr.func_slot] == .Builtin) {
+                        if (co_stack[fr.func_slot] == .Closure or co_stack[fr.func_slot] == .Builtin or co_stack[fr.func_slot] == .LightCFunction) {
                             // PUC funcinfo (ldebug.c): the frame's what/
                             // source come from the function object itself —
                             // what="C", source="=[C]", linedefined=-1 for
-                            // every non-Lua callee (builtin or C closure),
-                            // the Proto metadata for bytecode closures. C
-                            // frames are real, visible stack citizens
-                            // (P16.41 Cut 1).
+                            // every non-Lua callee (builtin, C closure, or
+                            // light C function), the Proto metadata for
+                            // bytecode closures. C frames are real, visible
+                            // stack citizens (P16.41 Cut 1).
                             try self.debugFillInfoFromFunction(t, co_stack[fr.func_slot], what);
                         }
                     },
                 }
             },
-            .Builtin, .Closure => {
+            .Builtin, .Closure, .LightCFunction => {
                 if (target_thread != null) {
                     return self.fail("bad argument #1 to 'getinfo' (function or level expected)", .{});
                 }
+                // F3 (PUC auxgetinfo 'l', ldebug.c): a function argument has
+                // no active frame (i_ci == NULL) — currentline is -1 for
+                // EVERY function kind (the old 0 was a pre-existing
+                // divergence; verified against the 5.5 reference binary).
+                try self.setField(t, "currentline", .{ .Int = -1 });
                 if (what.len == 0 or debugInfoHasOpt(what, 'n')) {
                     try self.setField(t, "name", .Nil);
                     try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
@@ -39258,7 +39554,7 @@ pub const Vm = struct {
                     try self.debugGetLocalNameFromProto(proto, local_index, outs);
                 }
             },
-            .Builtin => {},
+            .Builtin, .LightCFunction => {},
             else => return self.fail("bad argument #1 to 'getlocal' (function or level expected)", .{}),
         }
     }
@@ -39320,7 +39616,7 @@ pub const Vm = struct {
                 };
                 try self.debugSetLocalInFrame(resolved.frame, local_index, new_value, outs, resolved.index);
             },
-            .Closure, .Builtin => {},
+            .Closure, .Builtin, .LightCFunction => {},
             else => return self.fail("bad argument #1 to 'setlocal' (function or level expected)", .{}),
         }
     }
@@ -39356,6 +39652,11 @@ pub const Vm = struct {
     fn builtinDebugGetupvalue(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len > 0) outs[0] = .Nil;
         if (outs.len > 1) outs[1] = .Nil;
+        // F4 (PUC auxupvalue, ldblib.c): a missing upvalue returns ZERO
+        // results (lua_getupvalue NULL -> db_getupvalue returns 0), not a
+        // (nil, nil) pair. debug_getupvalue is in builtinHasDynamicOutCount;
+        // every no-upvalue exit below sets the produced count to 0.
+        self.last_builtin_out_count = 0;
         if (args.len < 2) return self.fail("debug.getupvalue expects (func, up)", .{});
         const idx = switch (args[1]) {
             .Int => |i| i,
@@ -39373,6 +39674,7 @@ pub const Vm = struct {
                     outs[0] = .{ .String = istr };
                 }
                 if (outs.len > 1) outs[1] = cl.upvalues[uidx].get(self);
+                self.last_builtin_out_count = 2;
             },
             .Builtin => {
                 if (uidx != 0) return;
@@ -39380,7 +39682,12 @@ pub const Vm = struct {
                     const istr2 = try self.internStr("");
                     outs[0] = .{ .String = istr2 };
                 }
+                self.last_builtin_out_count = 1;
             },
+            // PUC aux_upvalue default arm: a light C function has no
+            // upvalues — lua_getupvalue returns NULL, db_getupvalue
+            // returns 0 results.
+            .LightCFunction => {},
             else => return self.fail("bad argument #1 to 'getupvalue' (function expected)", .{}),
         }
     }
@@ -39406,6 +39713,8 @@ pub const Vm = struct {
                 }
             },
             .Builtin => {},
+            // PUC lua_setupvalue on a VLCF: no upvalues — NULL, no results.
+            .LightCFunction => {},
             else => return self.fail("bad argument #1 to 'setupvalue' (function expected)", .{}),
         }
     }
@@ -39429,6 +39738,11 @@ pub const Vm = struct {
             .Builtin => |id| {
                 if (uidx != 0) return;
                 if (outs.len > 0) outs[0] = try self.debugLightUserdataForId(0x4000_0000 + @as(u64, @intFromEnum(id)));
+            },
+            // PUC lua_upvalueid (lapi.c): a light C function has no
+            // upvalues — NULL; db_upvalueid pushes fail (false).
+            .LightCFunction => {
+                if (outs.len > 0) outs[0] = .{ .Bool = false };
             },
             else => return self.fail("bad argument #1 to 'upvalueid' (function expected)", .{}),
         }
@@ -39838,6 +40152,12 @@ pub const Vm = struct {
                 const ret = try self.runClosure(cl, argv_buf[0..argc], 0);
                 self.alloc.free(ret);
             },
+            // PUC ldblib.c hookf → lua_call: a VLCF hook is a plain C
+            // activation (precallC) — results discarded.
+            .LightCFunction => {
+                const ret = try self.callLightCFunction(hook, argv_buf[0..argc], 0);
+                self.alloc.free(ret);
+            },
             else => {},
         }
     }
@@ -40228,7 +40548,7 @@ pub const Vm = struct {
     /// .Builtin values — match those too (PUC finds C functions in _LOADED
     /// the same way; used by writeSyntheticTopCFrame's pushfuncname fallback).
     fn debugFindGlobalFuncName(self: *Vm, callee: Value) ?[]const u8 {
-        if (callee != .Closure and callee != .Builtin) return null;
+        if (callee != .Closure and callee != .Builtin and callee != .LightCFunction) return null;
         const gt = self.registryGlobalsTable() orelse return null;
         for (gt.hash) |*node| {
             if (!ltable.Node.isStringTag(node.key_tt)) continue;
@@ -40239,6 +40559,9 @@ pub const Vm = struct {
             const matches = switch (node.value) {
                 .Closure => |cl| callee == .Closure and cl == callee.Closure,
                 .Builtin => |b| callee == .Builtin and b == callee.Builtin,
+                // PUC pushglobalfuncname: raw equality — a VLCF global
+                // matches by fn-pointer identity (lvm.c:641).
+                .LightCFunction => |f| callee == .LightCFunction and f == callee.LightCFunction,
                 else => false,
             };
             if (matches) {
@@ -40309,7 +40632,7 @@ pub const Vm = struct {
 
         const hook = args[i];
         switch (hook) {
-            .Builtin, .Closure => {},
+            .Builtin, .Closure, .LightCFunction => {},
             else => return self.fail("debug.sethook expects function or nil", .{}),
         }
         hook_state.func = hook;
@@ -40545,6 +40868,15 @@ pub const Vm = struct {
                     defer self.alloc.free(ret);
                     // P16.39 Cut 3 (correctness): runClosure may have
                     // reallocated stack — re-derive before writing.
+                    const outw = self.refreshBuiltinOuts() orelse outs;
+                    const n = @min(outw.len, ret.len);
+                    for (0..n) |i| outw[i] = ret[i];
+                },
+                .LightCFunction => {
+                    // PUC luaB_pairs calls __pairs via lua_callk → luaD_call
+                    // → precallC: a VLCF __pairs is a plain C activation.
+                    const ret = try self.callLightCFunction(resolved.callee, resolved.args, resolved.ccmt);
+                    defer self.alloc.free(ret);
                     const outw = self.refreshBuiltinOuts() orelse outs;
                     const n = @min(outw.len, ret.len);
                     for (0..n) |i| outw[i] = ret[i];
@@ -43629,6 +43961,9 @@ pub const Vm = struct {
                         .Closure => |cl| try std.fmt.allocPrint(self.alloc, "0x{x}", .{@intFromPtr(cl)}),
                         .Thread => |th| try std.fmt.allocPrint(self.alloc, "0x{x}", .{@intFromPtr(th)}),
                         .Builtin => |id| try std.fmt.allocPrint(self.alloc, "0x{x}", .{@intFromEnum(id)}),
+                        // PUC string.format %p → lua_topointer: the function
+                        // pointer itself for a VLCF (lapi.c:495).
+                        .LightCFunction => |f| try std.fmt.allocPrint(self.alloc, "0x{x}", .{@intFromPtr(f)}),
                         .String => |s| blk: {
                             if (s.len() <= 40) {
                                 break :blk try std.fmt.allocPrint(self.alloc, "0x{x}", .{std.hash_map.hashString(s.bytes())});
@@ -45934,6 +46269,14 @@ pub const Vm = struct {
                 if (ret.len == 0) break :blk .Nil;
                 break :blk ret[0];
             },
+            .LightCFunction => blk: {
+                // PUC add_value (lstrlib.c): LUA_TFUNCTION repl is called via
+                // lua_call — a VLCF repl is a plain C activation.
+                const ret = try self.callLightCFunction(resolved.callee, resolved.args, resolved.ccmt);
+                defer self.alloc.free(ret);
+                if (ret.len == 0) break :blk .Nil;
+                break :blk ret[0];
+            },
             else => .Nil,
         };
     }
@@ -46014,7 +46357,7 @@ pub const Vm = struct {
                                 }
                             }
                         },
-                        .Builtin, .Closure => {
+                        .Builtin, .Closure, .LightCFunction => {
                             const rv = try self.runGsubReplacementFunction(repl, s, i, i + pat.len, &[_]Capture{.{}} ** 10);
                             if (rv == .Nil or rv == .Bool and rv.Bool == false) {
                                 try out.appendSlice(self.alloc, s[i .. i + pat.len]);
@@ -46093,7 +46436,7 @@ pub const Vm = struct {
                                     }
                                 }
                             },
-                            .Builtin, .Closure => {
+                            .Builtin, .Closure, .LightCFunction => {
                                 const rv = try self.runGsubReplacementFunction(repl, s, i, e, &caps);
                                 if (rv == .Nil or rv == .Bool and rv.Bool == false) {
                                     try out.appendSlice(self.alloc, s[i..e]);
@@ -46137,7 +46480,7 @@ pub const Vm = struct {
                                 }
                             }
                         },
-                        .Builtin, .Closure => {
+                        .Builtin, .Closure, .LightCFunction => {
                             const rv = try self.runGsubReplacementFunction(repl, s, i, e, &caps);
                             if (rv == .Nil or rv == .Bool and rv.Bool == false) {
                                 try out.appendSlice(self.alloc, s[i..e]);
@@ -47131,6 +47474,14 @@ pub const Vm = struct {
                     defer self.alloc.free(ret);
                     outv = if (ret.len > 0) ret[0] else .Nil;
                 },
+                .LightCFunction => {
+                    // PUC sort_comp → lua_call → precallC: a VLCF comparator
+                    // is a plain C activation (ltablib.c:346-355).
+                    const call_args = [_]Value{ a, b };
+                    const ret = try self.callLightCFunction(cf, call_args[0..], 0);
+                    defer self.alloc.free(ret);
+                    outv = if (ret.len > 0) ret[0] else .Nil;
+                },
                 else => {
                     var call_args = [_]Value{ a, b };
                     const resolved = try self.resolveCallable(cf, call_args[0..], null);
@@ -47144,6 +47495,11 @@ pub const Vm = struct {
                         },
                         .Closure => |cl| {
                             const ret = try self.runClosure(cl, resolved.args, resolved.ccmt);
+                            defer self.alloc.free(ret);
+                            outv = if (ret.len > 0) ret[0] else .Nil;
+                        },
+                        .LightCFunction => {
+                            const ret = try self.callLightCFunction(resolved.callee, resolved.args, resolved.ccmt);
                             defer self.alloc.free(ret);
                             outv = if (ret.len > 0) ret[0] else .Nil;
                         },
@@ -47211,7 +47567,7 @@ pub const Vm = struct {
         // got <type>)", raised via luaL_checktype -> luaL_argerror.
         if (args.len >= 2 and args[1] != .Nil) {
             switch (args[1]) {
-                .Closure, .Builtin => {},
+                .Closure, .Builtin, .LightCFunction => {},
                 else => return self.failArgerror("bad argument #2 to 'sort' (function expected, got {s})", .{self.valueTypeName(args[1])}),
             }
         }
@@ -47464,6 +47820,13 @@ pub const Vm = struct {
             .Table => |t| try w.print("table: 0x{x}", .{@intFromPtr(t)}),
             .Builtin => |id| try w.print("function: builtin {s}", .{id.name()}),
             .Closure => |cl| try w.print("function: {s}", .{if (cl.proto) |p| p.name() else "<bytecode>"}),
+            // PUC luaL_tolstring default arm for VLCF: "%s: %p" of
+            // lua_topointer = the function pointer itself (lapi.c:495).
+            // "%p" of NULL renders "(null)" (glibc), like PUC's sprintf.
+            .LightCFunction => |f| if (f) |fp|
+                try w.print("function: 0x{x}", .{@intFromPtr(fp)})
+            else
+                try w.writeAll("function: (null)"),
             .Thread => |th| try w.print("thread: 0x{x}", .{@intFromPtr(th)}),
             .LightUserdata => |p| try w.print("userdata: 0x{x}", .{@intFromPtr(p)}),
             .Userdata => |ud| try w.print("userdata: 0x{x}", .{@intFromPtr(ud)}),
@@ -47492,6 +47855,12 @@ pub const Vm = struct {
             .Table => |t| try std.fmt.allocPrint(self.alloc, "{s}: 0x{x}", .{ self.valueTypeName(v), @intFromPtr(t) }),
             .Builtin => |id| try std.fmt.allocPrint(self.alloc, "function: builtin {s}", .{id.name()}),
             .Closure => |cl| try std.fmt.allocPrint(self.alloc, "function: {s}", .{if (cl.proto) |p| p.name() else "<bytecode>"}),
+            // PUC luaL_tolstring for VLCF: "function: 0x<p>" of the function
+            // pointer (lua_topointer, lapi.c:495); NULL renders "(null)".
+            .LightCFunction => |f| if (f) |fp|
+                try std.fmt.allocPrint(self.alloc, "function: 0x{x}", .{@intFromPtr(fp)})
+            else
+                try std.fmt.allocPrint(self.alloc, "function: (null)", .{}),
             .Thread => |th| try std.fmt.allocPrint(self.alloc, "{s}: 0x{x}", .{ self.valueTypeName(v), @intFromPtr(th) }),
             .LightUserdata => |p| try std.fmt.allocPrint(self.alloc, "{s}: 0x{x}", .{ self.valueTypeName(v), @intFromPtr(p) }),
             .Userdata => |ud| try std.fmt.allocPrint(self.alloc, "{s}: 0x{x}", .{ self.valueTypeName(v), @intFromPtr(ud) }),
@@ -47849,6 +48218,14 @@ pub const Vm = struct {
                 defer self.alloc.free(ret);
                 break :blk if (ret.len > 0) ret[0] else Value.Nil;
             },
+            .LightCFunction => blk: {
+                // PUC luaV_finishget → luaT_callTMres → precallC: a VLCF
+                // __index is a plain C activation.
+                var call_args = [_]Value{ .{ .Table = tbl }, key };
+                const ret = try self.callLightCFunction(mm, call_args[0..], 0);
+                defer self.alloc.free(ret);
+                break :blk if (ret.len > 0) ret[0] else Value.Nil;
+            },
             else => return self.fail("attempt to index a {s} value", .{mm.typeName()}),
         };
     }
@@ -47865,7 +48242,7 @@ pub const Vm = struct {
     /// `__index` metamethod.
     fn callResolvedIndexMetamethod(self: *Vm, mm: Value, obj: Value, key: Value) DispatchError!Value {
         return switch (mm) {
-            .Builtin, .Closure => try self.callMetamethod(mm, "index", &.{ obj, key }),
+            .Builtin, .Closure, .LightCFunction => try self.callMetamethod(mm, "index", &.{ obj, key }),
             else => try self.indexValue(mm, key),
         };
     }
@@ -47875,7 +48252,7 @@ pub const Vm = struct {
     /// chain: `t = tm` and loop (via `setIndexValue`).
     fn callResolvedNewIndexMetamethod(self: *Vm, mm: Value, obj: Value, key: Value, val: Value) DispatchError!void {
         switch (mm) {
-            .Builtin, .Closure => _ = try self.callMetamethod(mm, "newindex", &.{ obj, key, val }),
+            .Builtin, .Closure, .LightCFunction => _ = try self.callMetamethod(mm, "newindex", &.{ obj, key, val }),
             else => try self.setIndexValue(mm, key, val),
         }
     }
@@ -47915,6 +48292,14 @@ pub const Vm = struct {
                 defer self.alloc.free(ret);
                 break :blk if (ret.len > 0) ret[0] else Value.Nil;
             },
+            .LightCFunction => blk: {
+                // PUC luaV_finishget → luaT_callTMres → precallC: a VLCF
+                // __index is a plain C activation.
+                var call_args = [_]Value{ object, key };
+                const ret = try self.callLightCFunction(mmv, call_args[0..], 0);
+                defer self.alloc.free(ret);
+                break :blk if (ret.len > 0) ret[0] else Value.Nil;
+            },
             else => return self.fail("attempt to index a {s} value", .{object.typeName()}),
         };
     }
@@ -47951,6 +48336,14 @@ pub const Vm = struct {
                     defer self.alloc.free(ret);
                     return;
                 },
+                .LightCFunction => {
+                    // PUC luaV_finishset → luaT_callTM → precallC: a VLCF
+                    // __newindex is a plain C activation; results discarded.
+                    var call_args = [_]Value{ object, key, val };
+                    const ret = try self.callLightCFunction(mm, call_args[0..], 0);
+                    defer self.alloc.free(ret);
+                    return;
+                },
                 else => return self.fail("attempt to index a {s} value", .{object.typeName()}),
             }
         }
@@ -47976,6 +48369,14 @@ pub const Vm = struct {
                 defer self.alloc.free(ret);
                 return;
             },
+            .LightCFunction => {
+                // PUC luaV_finishset → luaT_callTM → precallC: a VLCF
+                // __newindex is a plain C activation; results discarded.
+                var call_args = [_]Value{ object, key, val };
+                const ret = try self.callLightCFunction(mm.?.*, call_args[0..], 0);
+                defer self.alloc.free(ret);
+                return;
+            },
             else => return self.fail("attempt to index a {s} value", .{object.typeName()}),
         }
     }
@@ -47987,7 +48388,7 @@ pub const Vm = struct {
             .Int, .Num => self.number_metatable,
             .Bool => self.boolean_metatable,
             .Nil => self.nil_metatable,
-            .Builtin, .Closure => self.function_metatable,
+            .Builtin, .Closure, .LightCFunction => self.function_metatable,
             .Thread => self.thread_metatable,
             .LightUserdata => self.light_userdata_metatable,
             .Userdata => |ud| ud.metatable,
@@ -48237,6 +48638,13 @@ pub const Vm = struct {
             },
             .Closure => |cl| blk: {
                 const ret = try self.runClosure(cl, resolved.args, resolved.ccmt);
+                defer self.alloc.free(ret);
+                break :blk if (ret.len > 0) ret[0] else .Nil;
+            },
+            .LightCFunction => blk: {
+                // PUC luaT_callTMres → luaD_call → precallC: a VLCF
+                // metamethod is a plain C activation.
+                const ret = try self.callLightCFunction(resolved.callee, resolved.args, resolved.ccmt);
                 defer self.alloc.free(ret);
                 break :blk if (ret.len > 0) ret[0] else .Nil;
             },
@@ -48914,7 +49322,9 @@ pub const Vm = struct {
 
         while (true) {
             switch (callee) {
-                .Builtin, .Closure => return .{ .callee = callee, .args = args, .owned_args = owned, .ccmt = depth },
+                // PUC tryfuncTM runs only for non-function values: a light C
+                // function is directly callable (no __call lookup).
+                .Builtin, .Closure, .LightCFunction => return .{ .callee = callee, .args = args, .owned_args = owned, .ccmt = depth },
                 else => {
                     // PUC tryfuncTM order: look up __call FIRST (a value
                     // without __call is a plain call error even at the
@@ -49877,6 +50287,21 @@ pub const Vm = struct {
         return saved_results;
     }
 
+    /// Invoke a light C function value (PUC LUA_VLCF — luaD_precall's C path
+    /// with the function pointer taken directly from the TValue). The callee
+    /// Value itself is staged at the C-frame's func_slot exactly like a
+    /// CClosure (PUC ci->func points at the called value either way).
+    /// Calling a null pointer (lua_pushcclosure(L, NULL, 0)) is PUC UB; the
+    /// unwrap crashes equivalently instead of masking it as a Lua error.
+    fn callLightCFunction(
+        self: *Vm,
+        callee: Value,
+        args: []const Value,
+        ccmt: u4,
+    ) DispatchError![]Value {
+        return self.callCFunction(callee.LightCFunction.?, callee, args, ccmt);
+    }
+
     fn valueToIntForBitwise(v: Value) ?i64 {
         return switch (v) {
             .Int => |i| i,
@@ -50412,6 +50837,12 @@ pub const Vm = struct {
             },
             .Closure => |lc| switch (rhs) {
                 .Closure => |rc| lc == rc,
+                else => false,
+            },
+            // PUC luaV_equalobj LUA_VLCF case (lvm.c:641): raw function
+            // pointer equality (NULL == NULL is true).
+            .LightCFunction => |lf| switch (rhs) {
+                .LightCFunction => |rf| lf == rf,
                 else => false,
             },
             .Thread => |lt| switch (rhs) {
@@ -52773,7 +53204,7 @@ pub const Vm = struct {
                 if (cargs.len != 1) return self.fail("testC isfunction expects 1 arg", .{});
                 const idx = try self.parseTestcIndexMaybe(cargs[0], win.count());
                 const b = if (idx) |i| switch (win.slot(i)) {
-                    .Builtin, .Closure => true,
+                    .Builtin, .Closure, .LightCFunction => true,
                     else => false,
                 } else false;
                 try win.push(.{ .Bool = b });
@@ -52782,7 +53213,7 @@ pub const Vm = struct {
                 if (cargs.len != 1) return self.fail("testC iscfunction expects 1 arg", .{});
                 const idx = try self.parseTestcIndexMaybe(cargs[0], win.count());
                 const b = if (idx) |i| switch (win.slot(i)) {
-                    .Builtin => true,
+                    .Builtin, .LightCFunction => true,
                     else => false,
                 } else false;
                 try win.push(.{ .Bool = b });
@@ -52866,6 +53297,7 @@ pub const Vm = struct {
                         },
                         .Table => |t| makeTestcPointerValue(@intCast(@intFromPtr(t))),
                         .Closure => |cl| makeTestcPointerValue(@intCast(@intFromPtr(cl))),
+                        .LightCFunction => |f| makeTestcPointerValue(@intCast(@intFromPtr(f))),
                         .Builtin => |id| makeTestcPointerValue(@as(u64, 0x8000_0000) + @as(u64, @intFromEnum(id))),
                         .Thread => |th| makeTestcPointerValue(@intCast(@intFromPtr(th))),
                         .LightUserdata => |p| makeTestcPointerValue(@intCast(@intFromPtr(p))),
@@ -52880,6 +53312,9 @@ pub const Vm = struct {
                 const outv: Value = if (idx) |i| switch (win.slot(i)) {
                     .Builtin => |id| .{ .Int = 1 + @as(i64, @intCast(@intFromEnum(id))) },
                     .Closure => |cl| .{ .Int = @intCast(@intFromPtr(cl)) },
+                    // PUC ltests func2num: lua_tocfunction pointer as an
+                    // integer (NULL fn -> 0).
+                    .LightCFunction => |f| .{ .Int = @intCast(@intFromPtr(f)) },
                     else => .{ .Int = 0 },
                 } else .{ .Int = 0 };
                 try win.push(outv);
@@ -52889,6 +53324,10 @@ pub const Vm = struct {
                 const idx = try self.parseTestcIndexMaybe(cargs[0], win.count());
                 const outv: Value = if (idx) |i| switch (win.slot(i)) {
                     .Builtin => win.slot(i),
+                    // PUC ltests tocfunction: pushcfunction(tocfunction(idx))
+                    // — a fresh VLCF with the same pointer; identity here
+                    // (equality is by fn pointer).
+                    .LightCFunction => win.slot(i),
                     else => .Nil,
                 } else .Nil;
                 try win.push(outv);
@@ -54253,7 +54692,7 @@ pub const Vm = struct {
 
     fn isCallableValue(v: Value) bool {
         return switch (v) {
-            .Builtin, .Closure, .Table => true,
+            .Builtin, .Closure, .LightCFunction, .Table => true,
             else => false,
         };
     }
@@ -54334,6 +54773,8 @@ pub const Vm = struct {
                 const matches = switch (field_node.value) {
                     .Closure => |cl| func == .Closure and cFuncEqual(cl, func.Closure),
                     .Builtin => |b| func == .Builtin and b == func.Builtin,
+                    // PUC VLCF: raw fn-pointer equality (lvm.c:641).
+                    .LightCFunction => |f| func == .LightCFunction and f == func.LightCFunction,
                     else => false,
                 };
                 if (!matches) continue;
@@ -54454,6 +54895,11 @@ pub const Vm = struct {
                 defer self.alloc.free(ret);
                 break :blk if (ret.len > 0) ret[0] else .Nil;
             },
+            .LightCFunction => blk: {
+                const ret = self.callLightCFunction(fnv, &[_]Value{}, 0) catch return 0.0;
+                defer self.alloc.free(ret);
+                break :blk if (ret.len > 0) ret[0] else .Nil;
+            },
             else => return 0.0,
         };
         const bytes: f64 = switch (retv) {
@@ -54486,7 +54932,7 @@ pub const Vm = struct {
             for ([_]BuiltinId{
                 .coroutine_close, .utf8_codepoint, .io_lines_iter, .io_read,
                 .file_read,       .file_close,     .io_close,      .io_popen,
-                .os_execute,      .io_lines,       .file_lines,
+                .os_execute,      .io_lines,       .file_lines,    .debug_getupvalue,
             }) |d| t[@intFromEnum(d)] = true;
             break :blk t;
         };
@@ -55318,6 +55764,431 @@ test "vm: callCFunction with zero results" {
     defer vm.alloc.free(ret);
 
     try testing.expectEqual(@as(usize, 0), ret.len);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// D1 cut 1: Value.LightCFunction focused coverage (internal construction
+// only — producers stay CClosure until cut 3; these tests build light
+// values directly and inject them via apiSetGlobal). PUC parity anchors:
+// lapi.c:295 iscfunction, lapi.c:455 tocfunction, lapi.c:483-497 topointer,
+// lvm.c:641 raw equality, ltm.c shared function metatable, ldo.c precallC.
+
+fn vimpl1Cf42(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    c_api.lua_pushinteger(L, 42);
+    return 1;
+}
+
+fn vimpl1Doubler(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    var isnum: c_int = 0;
+    const n = c_api.lua_tointegerx(L, 1, &isnum);
+    if (isnum == 0) return 0;
+    c_api.lua_pushinteger(L, n * 2);
+    return 1;
+}
+
+/// Arg 1 must be vimpl1Cf42 as a light value; verifies the PUC C-API
+/// predicates (lapi.c) on it and pushes one boolean.
+fn vimpl1Probe(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    const ok =
+        c_api.lua_type(L, 1) == 6 and // LUA_TFUNCTION
+        c_api.lua_iscfunction(L, 1) == 1 and
+        c_api.lua_tocfunction(L, 1) == &vimpl1Cf42 and
+        c_api.lua_topointer(L, 1) == @as(?*anyopaque, @ptrCast(@constCast(&vimpl1Cf42)));
+    c_api.lua_pushboolean(L, if (ok) 1 else 0);
+    return 1;
+}
+
+fn vimpl1Index(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    const k = c_api.lua_tolstring(L, 2, null) orelse "nil";
+    _ = c_api.lua_pushfstring(L, "IDX:%s", k);
+    return 1;
+}
+
+fn vimpl1Newindex(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    c_api.lua_rawset(L, 1);
+    return 0;
+}
+
+fn vimpl1Add(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    c_api.lua_pushinteger(L, 42);
+    return 1;
+}
+
+fn vimpl1Concat(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    c_api.lua_pushliteral(L, "CAT");
+    return 1;
+}
+
+fn vimpl1Handler(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    const m = c_api.lua_tolstring(L, 1, null) orelse "nil";
+    _ = c_api.lua_pushfstring(L, "H:%s", m);
+    return 1;
+}
+
+/// Coroutine body: yield 5 without a continuation, then (if ever resumed
+/// again) return 7 — mirrors the PUC V9 control.
+fn vimpl1Body(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    c_api.lua_pushinteger(L, 5);
+    return c_api.lua_yieldk(L, 1, 0, null);
+}
+
+fn vimpl1Call(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    c_api.lua_pushinteger(L, c_api.lua_tointegerx(L, 2, null) + 1);
+    return 1;
+}
+
+var vimpl1_iter_calls: c_int = 0;
+
+/// Stateless-looking light iterator for OP_TFORCALL: yields "one" on the
+/// first call, nil afterwards.
+fn vimpl1Iter(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    if (vimpl1_iter_calls == 0) {
+        vimpl1_iter_calls += 1;
+        c_api.lua_pushliteral(L, "one");
+        return 1;
+    }
+    c_api.lua_pushnil(L);
+    return 1;
+}
+
+/// Compile and run a Lua chunk inside an existing VM, returning its results.
+/// Shared helper for the light-C-function cut-1 tests below.
+fn vimpl1RunIn(vm: *Vm, src: []const u8, name: []const u8) ![]Value {
+    const chunk_v = try vm.compileChunkValue(src, name);
+    var scope = try vm.openRootScope(1, 0);
+    defer scope.close();
+    _ = scope.protectValueAssumeCapacity(chunk_v);
+    const cl = chunk_v.Closure;
+    return vm.runBytecode(cl.proto.?, cl.upvalues, &.{}, cl);
+}
+
+test "vm: light C function classification, identity, tostring, topointer" {
+    const testing = std.testing;
+
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    _ = try vm.setupMainHandle();
+    defer vm.freeStateHandle(vm.main_handle.?);
+
+    const light = Value{ .LightCFunction = &vimpl1Cf42 };
+    const light_null = Value{ .LightCFunction = null };
+
+    // Type name and shared function metatable (ltm.c: no per-value mt).
+    try testing.expectEqualStrings("function", light.typeName());
+    try testing.expectEqualStrings("function", light_null.typeName());
+    try testing.expect(vm.valueMetatable(light) == vm.function_metatable);
+    try testing.expect(vm.valueMetatable(light_null) == vm.function_metatable);
+
+    // Raw equality (lvm.c:641): pointer identity; null == null.
+    try testing.expect(Vm.valuesEqual(light, light));
+    try testing.expect(!Vm.valuesEqual(light, .{ .LightCFunction = &vimpl1Doubler }));
+    try testing.expect(Vm.valuesEqual(light_null, .{ .LightCFunction = null }));
+    try testing.expect(!Vm.valuesEqual(light, light_null));
+
+    // tostring (luaL_tolstring "%s: %p" of the fn pointer).
+    const s = try vm.valueToStringAlloc(light);
+    defer vm.alloc.free(s);
+    try testing.expectEqualStrings("function: 0x", s[0..12]);
+    const s2 = try vm.valueToStringAlloc(light_null);
+    defer vm.alloc.free(s2);
+    try testing.expectEqualStrings("function: (null)", s2);
+
+    // C-API predicates through a light callee with the light value as arg
+    // (lapi.c:295/455/483-497): type, iscfunction, tocfunction identity,
+    // topointer == the fn pointer itself.
+    const args = [_]Value{light};
+    const ret = try vm.apiCall(.nonyieldable, .{ .LightCFunction = &vimpl1Probe }, args[0..]);
+    defer vm.alloc.free(ret);
+    try testing.expectEqual(@as(usize, 1), ret.len);
+    try testing.expect(ret[0] == .Bool and ret[0].Bool);
+
+    // A NULL light value reports as a C function (iscfunction) with a NULL
+    // pointer (tocfunction/topointer) — pushcclosure(L, NULL, 0) shape.
+    const args2 = [_]Value{light_null};
+    const ret2 = try vm.apiCall(.nonyieldable, .{ .LightCFunction = &vimpl1NullProbe }, args2[0..]);
+    defer vm.alloc.free(ret2);
+    try testing.expect(ret2[0] == .Bool and ret2[0].Bool);
+}
+
+fn vimpl1NullProbe(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    const ok =
+        c_api.lua_type(L, 1) == 6 and // LUA_TFUNCTION
+        c_api.lua_iscfunction(L, 1) == 1 and
+        c_api.lua_tocfunction(L, 1) == null and
+        c_api.lua_topointer(L, 1) == null;
+    c_api.lua_pushboolean(L, if (ok) 1 else 0);
+    return 1;
+}
+
+test "vm: light C function call paths (apiCall, OP_CALL, OP_TAILCALL, OP_TFORCALL)" {
+    const testing = std.testing;
+
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    _ = try vm.setupMainHandle();
+    defer vm.freeStateHandle(vm.main_handle.?);
+
+    // Direct apiCall (resolveCallable direct-return set).
+    const args = [_]Value{.{ .Int = 21 }};
+    const ret = try vm.apiCall(.nonyieldable, .{ .LightCFunction = &vimpl1Doubler }, args[0..]);
+    defer vm.alloc.free(ret);
+    try testing.expectEqual(@as(usize, 1), ret.len);
+    try testing.expectEqual(@as(i64, 42), ret[0].Int);
+
+    // OP_CALL / OP_TAILCALL / OP_TFORCALL through bytecode with the light
+    // value injected as a global.
+    try vm.apiSetGlobal("f", .{ .LightCFunction = &vimpl1Doubler });
+    vimpl1_iter_calls = 0;
+    try vm.apiSetGlobal("iter", .{ .LightCFunction = &vimpl1Iter });
+    const ret2 = try vimpl1RunIn(&vm,
+        \\local function tailf() return f(10) end
+        \\local t = {}
+        \\for x in iter do t[#t + 1] = x end
+        \\return f(9), tailf(), t[1], #t
+    , "=vimpl1-callpaths");
+    defer vm.alloc.free(ret2);
+    try testing.expectEqual(@as(usize, 4), ret2.len);
+    try testing.expectEqual(@as(i64, 18), ret2[0].Int);
+    try testing.expectEqual(@as(i64, 20), ret2[1].Int);
+    try testing.expectEqualStrings("one", ret2[2].String.bytes());
+    try testing.expectEqual(@as(i64, 1), ret2[3].Int);
+}
+
+test "vm: light C function protected calls (pcall, xpcall)" {
+    const testing = std.testing;
+
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    try vm.apiSetGlobal("f", .{ .LightCFunction = &vimpl1Cf42 });
+    try vm.apiSetGlobal("h", .{ .LightCFunction = &vimpl1Handler });
+
+    const ret = try vimpl1RunIn(&vm,
+        \\local ok, v = pcall(f)
+        \\local ok2, e = xpcall(function() error('boom', 0) end, h)
+        \\return ok, v, ok2, e
+    , "=vimpl1-pcall");
+    defer vm.alloc.free(ret);
+    try testing.expectEqual(@as(usize, 4), ret.len);
+    try testing.expect(ret[0] == .Bool and ret[0].Bool);
+    try testing.expectEqual(@as(i64, 42), ret[1].Int);
+    try testing.expect(ret[2] == .Bool and !ret[2].Bool);
+    try testing.expectEqualStrings("H:boom", ret[3].String.bytes());
+}
+
+test "vm: light C function metamethods (__index/__newindex/__add/__concat/__call)" {
+    const testing = std.testing;
+
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    try vm.apiSetGlobal("cf_index", .{ .LightCFunction = &vimpl1Index });
+    try vm.apiSetGlobal("cf_newindex", .{ .LightCFunction = &vimpl1Newindex });
+    try vm.apiSetGlobal("cf_add", .{ .LightCFunction = &vimpl1Add });
+    try vm.apiSetGlobal("cf_concat", .{ .LightCFunction = &vimpl1Concat });
+    try vm.apiSetGlobal("cf_call", .{ .LightCFunction = &vimpl1Call });
+
+    const ret = try vimpl1RunIn(&vm,
+        \\local t1 = setmetatable({}, {__index = cf_index})
+        \\local t2 = setmetatable({}, {__newindex = cf_newindex})
+        \\t2.x = 5
+        \\local t3 = setmetatable({}, {__add = cf_add})
+        \\local t4 = setmetatable({}, {__concat = cf_concat})
+        \\local t5 = setmetatable({}, {__call = cf_call})
+        \\return t1.foo, t2.x, (t3 + t3), (t4 .. 'x'), t5(3)
+    , "=vimpl1-meta");
+    defer vm.alloc.free(ret);
+    try testing.expectEqual(@as(usize, 5), ret.len);
+    try testing.expectEqualStrings("IDX:foo", ret[0].String.bytes());
+    try testing.expectEqual(@as(i64, 5), ret[1].Int);
+    try testing.expectEqual(@as(i64, 42), ret[2].Int);
+    try testing.expectEqualStrings("CAT", ret[3].String.bytes());
+    try testing.expectEqual(@as(i64, 4), ret[4].Int);
+}
+
+test "vm: light C function coroutine body (create/resume/yield/resume)" {
+    const testing = std.testing;
+
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    try vm.apiSetGlobal("cf_body", .{ .LightCFunction = &vimpl1Body });
+
+    // PUC V9: first resume -> true, 5; second resume -> true (a yield
+    // without a continuation finishes the C body — no further values).
+    const ret = try vimpl1RunIn(&vm,
+        \\local co = coroutine.create(cf_body)
+        \\local r1 = {coroutine.resume(co)}
+        \\local r2 = {coroutine.resume(co)}
+        \\return r1[1], r1[2], r2[1], #r2, coroutine.status(co)
+    , "=vimpl1-coroutine");
+    defer vm.alloc.free(ret);
+    try testing.expectEqual(@as(usize, 5), ret.len);
+    try testing.expect(ret[0] == .Bool and ret[0].Bool);
+    try testing.expectEqual(@as(i64, 5), ret[1].Int);
+    try testing.expect(ret[2] == .Bool and ret[2].Bool);
+    try testing.expectEqual(@as(i64, 1), ret[3].Int);
+    try testing.expectEqualStrings("dead", ret[4].String.bytes());
+}
+
+test "vm: light C function GC non-registration and survival across a full GC" {
+    const testing = std.testing;
+
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    _ = try vm.setupMainHandle();
+    defer vm.freeStateHandle(vm.main_handle.?);
+
+    const light = Value{ .LightCFunction = &vimpl1Cf42 };
+    // Not a GC object: no GcObject view, nothing to register or mark.
+    try testing.expect(GcObject.fromValue(light) == null);
+
+    // Stored in a global, survives a full collect, still callable.
+    try vm.apiSetGlobal("f", light);
+    const ret = try vimpl1RunIn(&vm,
+        \\collectgarbage('collect')
+        \\return f()
+    , "=vimpl1-gc");
+    defer vm.alloc.free(ret);
+    try testing.expectEqual(@as(usize, 1), ret.len);
+    try testing.expectEqual(@as(i64, 42), ret[0].Int);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// D1 cut 2: stdlib/coroutine/debug consumers of light C functions
+// (differential controls V4/V5/V6/V11/V11b/V14/V15 + the searcher
+// classification), internal construction via apiSetGlobal as above.
+
+fn vimpl1GsubRepl(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    const m = c_api.lua_tolstring(L, 1, null) orelse "nil";
+    _ = c_api.lua_pushfstring(L, "<%s>", m);
+    return 1;
+}
+
+fn vimpl1Cmp(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    c_api.lua_pushboolean(L, if (c_api.lua_tointegerx(L, 1, null) > c_api.lua_tointegerx(L, 2, null)) 1 else 0);
+    return 1;
+}
+
+var vimpl1_read_calls: c_int = 0;
+
+fn vimpl1Read(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    if (vimpl1_read_calls == 0) {
+        vimpl1_read_calls += 1;
+        c_api.lua_pushliteral(L, "return 19");
+        return 1;
+    }
+    c_api.lua_pushnil(L);
+    return 1;
+}
+
+fn vimpl1Hook(L: ?*lua_State) callconv(.c) c_int {
+    const c_api = @import("c_api.zig");
+    _ = c_api.lua_getglobal(L, "hn");
+    const n = c_api.lua_tointegerx(L, -1, null);
+    c_api.lua_pop(L, 1);
+    c_api.lua_pushinteger(L, n + 1);
+    c_api.lua_setglobal(L, "hn");
+    return 0;
+}
+
+test "vm: light C function stdlib consumers (gsub, sort, load reader)" {
+    const testing = std.testing;
+
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    // Lua-level `load` needs a text compiler (the CLI installs one; plain
+    // test VMs default to none).
+    vm.setDynamicBytecodeCompiler(&defaultBytecodeCompiler);
+    try vm.apiSetGlobal("cf_gsub", .{ .LightCFunction = &vimpl1GsubRepl });
+    try vm.apiSetGlobal("cf_cmp", .{ .LightCFunction = &vimpl1Cmp });
+    vimpl1_read_calls = 0;
+    try vm.apiSetGlobal("cf_read", .{ .LightCFunction = &vimpl1Read });
+
+    const ret = try vimpl1RunIn(&vm,
+        \\local s, n = ('hello'):gsub('l', cf_gsub)
+        \\local t = {3, 1, 2}
+        \\table.sort(t, cf_cmp)
+        \\local f = load(cf_read)
+        \\return s, n, table.concat(t, ','), f and f()
+    , "=vimpl1-stdlib");
+    defer vm.alloc.free(ret);
+    try testing.expectEqual(@as(usize, 4), ret.len);
+    try testing.expectEqualStrings("he<l><l>o", ret[0].String.bytes());
+    try testing.expectEqual(@as(i64, 2), ret[1].Int);
+    try testing.expectEqualStrings("3,2,1", ret[2].String.bytes());
+    try testing.expectEqual(@as(i64, 19), ret[3].Int);
+}
+
+test "vm: light C function debug library (getinfo, getupvalue, dump, hook)" {
+    const testing = std.testing;
+
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    try vm.apiSetGlobal("cf42", .{ .LightCFunction = &vimpl1Cf42 });
+    try vm.apiSetGlobal("cf_hook", .{ .LightCFunction = &vimpl1Hook });
+
+    const ret = try vimpl1RunIn(&vm,
+        \\local i = debug.getinfo(cf42)
+        \\local nup = select('#', debug.getupvalue(cf42, 1))
+        \\local ok, err = pcall(string.dump, cf42)
+        \\hn = 0
+        \\debug.sethook(cf_hook, 'line')
+        \\local x = 1
+        \\local y = 2
+        \\debug.sethook()
+        \\return i.what, i.source, i.short_src, i.currentline, i.nups,
+        \\  nup, ok, (err:find('Lua function expected%)$') ~= nil), hn > 0
+    , "=vimpl1-debug");
+    defer vm.alloc.free(ret);
+    // V11 (PUC 5.5 reference): what C, source =[C], short_src [C],
+    // currentline -1 (no active frame), nups 0.
+    try testing.expectEqual(@as(usize, 9), ret.len);
+    try testing.expectEqualStrings("C", ret[0].String.bytes());
+    try testing.expectEqualStrings("=[C]", ret[1].String.bytes());
+    try testing.expectEqualStrings("[C]", ret[2].String.bytes());
+    try testing.expectEqual(@as(i64, -1), ret[3].Int);
+    try testing.expectEqual(@as(i64, 0), ret[4].Int);
+    // V11b: a missing upvalue returns ZERO results.
+    try testing.expectEqual(@as(i64, 0), ret[5].Int);
+    // V14: PUC 5.5 rejects a C function by the argument check.
+    try testing.expect(ret[6] == .Bool and !ret[6].Bool);
+    try testing.expect(ret[7] == .Bool and ret[7].Bool);
+    // V15: the light hook actually runs.
+    try testing.expect(ret[8] == .Bool and ret[8].Bool);
+}
+
+test "vm: light C function as a require searcher-result loader" {
+    const testing = std.testing;
+
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    try vm.apiSetGlobal("cf42", .{ .LightCFunction = &vimpl1Cf42 });
+
+    // findloader (loadlib.c:640 lua_isfunction): a searcher returning a
+    // light C function is a valid loader; require calls it and caches its
+    // first result.
+    const ret = try vimpl1RunIn(&vm,
+        \\package.searchers = {function(name) return cf42 end}
+        \\local m = require('vimpl1mod')
+        \\return m, package.loaded.vimpl1mod
+    , "=vimpl1-searcher");
+    defer vm.alloc.free(ret);
+    try testing.expectEqual(@as(usize, 2), ret.len);
+    try testing.expectEqual(@as(i64, 42), ret[0].Int);
+    try testing.expectEqual(@as(i64, 42), ret[1].Int);
 }
 
 test "vm: table constructor and access" {

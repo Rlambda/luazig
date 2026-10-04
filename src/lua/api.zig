@@ -619,13 +619,15 @@ pub const State = struct {
         return v == .Int;
     }
 
-    /// PUC `lua_iscfunction` (lapi.c): true if the value is a C closure
-    /// (a Closure with `c_func != null`). Lua closures (bytecode protos)
-    /// return false.
+    /// PUC `lua_iscfunction` (lapi.c:295): true for a C closure OR a light C
+    /// function (`ttislcf(o) || ttisCclosure(o)`) — a light value is a C
+    /// function even when its pointer is NULL (pushcclosure(L, NULL, 0)).
+    /// Lua closures (bytecode protos) return false.
     pub fn iscfunction(self: *const State, idx: i32) bool {
         const v = self.index2value(idx);
         return switch (v) {
             .Closure => |c| c.c_func != null,
+            .LightCFunction => true,
             else => false,
         };
     }
@@ -732,12 +734,14 @@ pub const State = struct {
         };
     }
 
-    /// PUC `lua_tocfunction` (lapi.c:lua_tocfunction): return the C function
-    /// pointer from a Closure, or null if the value is not a C closure.
+    /// PUC `lua_tocfunction` (lapi.c:455): return the C function pointer from
+    /// a C closure or a light C function (possibly NULL for
+    /// pushcclosure(L, NULL, 0)), or null if the value is not a C function.
     pub fn tocfunction(self: *const State, idx: i32) ?*const fn (?*vm_mod.lua_State) callconv(.c) c_int {
         const v = self.index2value(idx);
         return switch (v) {
             .Closure => |c| c.c_func,
+            .LightCFunction => |f| f,
             else => null,
         };
     }
@@ -1460,7 +1464,11 @@ pub const State = struct {
         };
     }
 
-    /// Return raw pointer for GC objects (userdata, table, thread, string).
+    /// PUC `lua_topointer` (lapi.c:483-497): the raw pointer for GC objects
+    /// and functions — userdata, table, thread, string, the heap closure
+    /// object for a Closure (PUC returns clCvalue/clLvalue, never NULL for
+    /// a function value), and the function pointer itself for a light C
+    /// function (lapi.c:495). Other values (nil/bool/number) return NULL.
     pub fn topointer(self: *State, idx: i32) ?*anyopaque {
         const v = self.index2value(idx);
         return switch (v) {
@@ -1469,6 +1477,8 @@ pub const State = struct {
             .Table => |t| @ptrCast(t),
             .Thread => |th| @ptrCast(th),
             .String => |s| @ptrCast(s),
+            .Closure => |cl| @ptrCast(cl),
+            .LightCFunction => |f| if (f) |fp| @ptrCast(@constCast(fp)) else null,
             else => null,
         };
     }
@@ -1854,7 +1864,7 @@ pub const State = struct {
 
 pub fn isCallableValue(vm: *vm_mod.Vm, v: vm_mod.Value) bool {
     return switch (v) {
-        .Builtin, .Closure => true,
+        .Builtin, .Closure, .LightCFunction => true,
         .Table => |t| t.metatable != null and vm.getFieldOpt(t.metatable.?, "__call") != null,
         else => false,
     };
@@ -1868,7 +1878,7 @@ pub fn valueType(v: vm_mod.Value) Type {
         .Int, .Num => .number,
         .String => .string,
         .Table => .table,
-        .Builtin, .Closure => .function,
+        .Builtin, .Closure, .LightCFunction => .function,
         .Thread => .thread,
         .LightUserdata => .lightuserdata,
         .Userdata => .userdata,

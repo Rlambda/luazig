@@ -58,6 +58,11 @@ pub const NodeKeyTag = enum(u8) {
     /// thread keys. Can become a dead key if the userdata is collected while
     /// the table entry survives (PUC `LUA_TDEADKEY` transition).
     userdata,
+    /// PUC LUA_VLCF as a table key: a light C function pointer. Hashes by
+    /// the function address (PUC `hashpointer`) and compares by identity,
+    /// exactly like lightuserdata. NOT garbage-collected — a node with this
+    /// key tag can never become a dead key.
+    light_cfunc,
 };
 
 /// Bare 8-byte payload union used inside Node alongside a `NodeKeyTag`.
@@ -82,6 +87,7 @@ const NodeKeyPayload = extern union {
     builtin: BuiltinId,
     lightuserdata: ?*anyopaque,
     userdata: *vm.Userdata,
+    light_cfunc: ?*const fn (?*vm.lua_State) callconv(.c) c_int,
     /// Raw GC-pointer view of the payload. All collectable key variants
     /// (string/table/closure/thread/userdata) store an 8-byte pointer at
     /// offset 0 of this extern union, so they all alias `gc_ptr`. Used ONLY
@@ -186,7 +192,7 @@ pub const Node = struct {
             .closure => @ptrCast(self.key_val.closure),
             .thread => @ptrCast(self.key_val.thread),
             .userdata => @ptrCast(self.key_val.userdata),
-            .empty, .dead, .int, .num, .bool_, .builtin, .lightuserdata => null,
+            .empty, .dead, .int, .num, .bool_, .builtin, .lightuserdata, .light_cfunc => null,
         };
     }
 
@@ -233,6 +239,7 @@ pub const Node = struct {
             .builtin => .{ .Builtin = self.key_val.builtin },
             .lightuserdata => .{ .LightUserdata = self.key_val.lightuserdata },
             .userdata => .{ .Userdata = self.key_val.userdata },
+            .light_cfunc => .{ .LightCFunction = self.key_val.light_cfunc },
         };
     }
 
@@ -264,6 +271,7 @@ pub const Node = struct {
             .builtin => key == .Builtin and self.key_val.builtin == key.Builtin,
             .lightuserdata => key == .LightUserdata and self.key_val.lightuserdata == key.LightUserdata,
             .userdata => key == .Userdata and self.key_val.userdata == key.Userdata,
+            .light_cfunc => key == .LightCFunction and self.key_val.light_cfunc == key.LightCFunction,
         };
     }
 
@@ -341,6 +349,10 @@ pub const Node = struct {
             .Userdata => |u| {
                 self.key_tt = .userdata;
                 self.key_val = .{ .userdata = u };
+            },
+            .LightCFunction => |f| {
+                self.key_tt = .light_cfunc;
+                self.key_val = .{ .light_cfunc = f };
             },
         }
     }
@@ -464,6 +476,9 @@ pub inline fn mainPosition(len: usize, key: Value) usize {
         .Closure => |c| pointerIndex(len, @intFromPtr(c)),
         .Thread => |t| pointerIndex(len, @intFromPtr(t)),
         .Builtin => |b| intIndex(len, @intFromEnum(b)),
+        // PUC hashpointer on the lua_CFunction pointer (a light C function
+        // key hashes by the function address, like every pointer key).
+        .LightCFunction => |f| pointerIndex(len, @intFromPtr(f)),
         .LightUserdata => |p| pointerIndex(len, @intFromPtr(p)),
         .Userdata => |u| pointerIndex(len, @intFromPtr(u)),
         .Nil => 0, // never a valid key; callers reject Nil before lookup
@@ -488,6 +503,7 @@ inline fn mainPositionOfNode(len: usize, n: *const Node) usize {
         .builtin => intIndex(len, @intFromEnum(n.key_val.builtin)),
         .lightuserdata => pointerIndex(len, @intFromPtr(n.key_val.lightuserdata)),
         .userdata => pointerIndex(len, @intFromPtr(n.key_val.userdata)),
+        .light_cfunc => pointerIndex(len, @intFromPtr(n.key_val.light_cfunc)),
     };
 }
 

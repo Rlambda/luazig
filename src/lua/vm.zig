@@ -51325,6 +51325,12 @@ pub const Vm = struct {
         // script's leftover window: the C epilogue reads the top nret
         // slots, which is exactly the PUC poscall shape.
         var scope = self.openRootScope(vals.len, 0) catch {
+            // The reserve failed before the scope opened: no roots to
+            // unwind, but the transport slice is owned. The OOM tail
+            // below never returns (armed boundary → _longjmp, else
+            // abort), so the matching defer does NOT run — this is the
+            // only free on this exit, mirroring the push-failure catch.
+            self.infraAlloc().free(vals);
             return self.testcLightCFuncError(error.OutOfMemory);
         };
         defer scope.close();
@@ -56306,6 +56312,186 @@ test "vm: testC pushcclosure 0 publishes a real light C function" {
     defer vm.alloc.free(r3);
     try testing.expectEqual(@as(usize, 1), r3.len);
     try testing.expectEqual(true, r3[0].Bool);
+}
+
+/// Test-only recording allocator for the infraAlloc seam
+/// (`testc_alloc_base`): logs every allocation (byte length, free count)
+/// and can fail permanently starting from a chosen index — the same
+/// equality semantics as `std.testing.FailingAllocator` with
+/// `resize_fail_index = 0` (every resize/remap refuses, so all growth is
+/// a fresh allocation and the indices are deterministic). Frees are
+/// matched back to their allocation entry by address+length, proving
+/// exactly-once ownership of a specific buffer.
+const TestcOomSeamRecorder = struct {
+    const max_entries = 64;
+    back: std.mem.Allocator,
+    lens: [max_entries]usize = undefined,
+    addrs: [max_entries]usize = undefined,
+    free_counts: [max_entries]u16 = [_]u16{0} ** max_entries,
+    n: usize = 0,
+    fail_from: usize = std.math.maxInt(usize),
+
+    fn allocator(self: *TestcOomSeamRecorder) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = allocCb,
+            .resize = resizeCb,
+            .remap = remapCb,
+            .free = freeCb,
+        } };
+    }
+
+    fn allocCb(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *TestcOomSeamRecorder = @ptrCast(@alignCast(ctx));
+        if (self.n >= self.fail_from) return null;
+        const p = self.back.rawAlloc(len, alignment, ra) orelse return null;
+        self.lens[self.n] = len;
+        self.addrs[self.n] = @intFromPtr(p);
+        self.free_counts[self.n] = 0;
+        self.n += 1;
+        return p;
+    }
+
+    fn resizeCb(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        _ = .{ ctx, memory, alignment, new_len, ra };
+        return false;
+    }
+
+    fn remapCb(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        _ = .{ ctx, memory, alignment, new_len, ra };
+        return null;
+    }
+
+    fn freeCb(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *TestcOomSeamRecorder = @ptrCast(@alignCast(ctx));
+        const addr = @intFromPtr(memory.ptr);
+        // The seam is a ROUTER: it also carries frees of memory that was
+        // allocated before arming (e.g. the replaced root-list buffer) —
+        // those simply do not match; a double free of a tracked buffer
+        // still bumps the same entry's count and is caught by the
+        // exactly-once assertions.
+        var i: usize = self.n;
+        while (i > 0) {
+            i -= 1;
+            if (self.addrs[i] == addr and self.lens[i] == memory.len) {
+                self.free_counts[i] += 1;
+                break;
+            }
+        }
+        self.back.rawFree(memory, alignment, ra);
+    }
+};
+
+test "vm: testC light C function owns its result slice across the OOM exits" {
+    const testing = std.testing;
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+    _ = try vm.setupMainHandle();
+    defer vm.freeStateHandle(vm.main_handle.?);
+
+    // Publish the light testC entry (PUC pushcclosure-0 lane) and root it
+    // for the whole test.
+    const pub_args = [_]Value{.{ .String = try vm.internStr("pushcclosure 0; return 1") }};
+    const pub_ret = try vm.apiCall(.nonyieldable, .{ .Builtin = .testc_testC }, pub_args[0..]);
+    defer vm.alloc.free(pub_ret);
+    var keep = try vm.openRootScope(2, 0);
+    defer keep.close();
+    const light = pub_ret[0];
+    _ = keep.protectValueAssumeCapacity(light);
+
+    // Five results: the transport slice (5 Values) is the ONLY seam
+    // allocation with its byte length in this call — the script
+    // normalizer and the root-list growth differ — so the slice's
+    // allocation is identifiable in the trace by length alone.
+    const nres = 5;
+    const slice_len = nres * @sizeOf(Value);
+    const script = try vm.internStr("pushint 1; pushint 2; pushint 3; pushint 4; pushint 5; return 5");
+    // Root the script string: the recovery section runs a REAL full GC
+    // cycle, and the only other reference is this Zig local (not a GC
+    // root) — the interned string would be swept mid-test.
+    _ = keep.protectValueAssumeCapacity(.{ .String = script });
+    const call_args = [_]Value{.{ .String = script }};
+
+    // Healthy trace run: pin the allocation ORDER (normalizer, transport
+    // slice, root-list reserve) and the normal path's exactly-once free.
+    // The root vectors are pinned to exact capacity first (the reserve
+    // MUST allocate, keeping it a discrete failure site).
+    var seam: TestcOomSeamRecorder = .{ .back = testing.allocator };
+    vm.gc_root_values.shrinkAndFree(vm.infraAlloc(), vm.gc_root_values.items.len);
+    vm.gc_root_cells.shrinkAndFree(vm.infraAlloc(), vm.gc_root_cells.items.len);
+    vm.testc_alloc_base = seam.allocator();
+    const ok = try vm.apiCall(.nonyieldable, light, call_args[0..]);
+    vm.testc_alloc_base = null;
+    defer vm.alloc.free(ok);
+    try testing.expectEqual(@as(usize, nres), ok.len);
+    for (ok, 1..) |v, want| try testing.expectEqual(@as(i64, @intCast(want)), v.Int);
+
+    var slice_idx: usize = 0;
+    var slice_sightings: usize = 0;
+    for (0..seam.n) |i| {
+        if (seam.lens[i] == slice_len) {
+            slice_sightings += 1;
+            slice_idx = i;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), slice_sightings);
+    // The reserve follows the slice: the failure site under test.
+    const reserve_idx = slice_idx + 1;
+    try testing.expect(seam.n > reserve_idx);
+    // Normal return: the slice was freed exactly once (the callback's
+    // defer; no explicit release on this path).
+    try testing.expectEqual(@as(u16, 1), seam.free_counts[slice_idx]);
+
+    // Failure matrix over every seam allocation BEFORE and INCLUDING the
+    // reserve. Each arm: the failure surfaces as LUA_ERRMEM (the
+    // "not enough memory" object, never a RuntimeError), the root state
+    // is byte-exact, the C boundary is disarmed, and every transport
+    // slice the callback managed to allocate is freed exactly once (the
+    // normalizer's buffer belongs to runTestcScript's own defer scope;
+    // the retained root-list capacity legitimately outlives the call).
+    for (0..reserve_idx + 1) |fi| {
+        seam = .{ .back = testing.allocator, .fail_from = fi };
+        vm.gc_root_values.shrinkAndFree(vm.infraAlloc(), vm.gc_root_values.items.len);
+        vm.gc_root_cells.shrinkAndFree(vm.infraAlloc(), vm.gc_root_cells.items.len);
+        const mark = vm.rootMark();
+        const roots_cap = vm.gc_root_values.capacity;
+        vm.testc_alloc_base = seam.allocator();
+        const failed = vm.apiCall(.nonyieldable, light, call_args[0..]);
+        vm.testc_alloc_base = null;
+        if (failed) |_| {
+            return error.TestUnexpectedResult;
+        } else |e| {
+            try testing.expect(e == error.OutOfMemory);
+        }
+        try testing.expectEqualStrings("not enough memory", vm.errThread().err_obj.String.bytes());
+        try testing.expect(mark.eql(vm.rootMark()));
+        // When the failure lands on the root-list reserve itself (the
+        // site under test), even the unobservable capacity is unchanged:
+        // the growth allocation is what failed.
+        if (fi == reserve_idx)
+            try testing.expectEqual(roots_cap, vm.gc_root_values.capacity);
+        try testing.expect(vm.c_error_jmp == null);
+        // The failing allocation is the LAST one seen: every earlier seam
+        // allocation succeeded and the OOM transport itself allocates
+        // nothing through the seam.
+        try testing.expectEqual(fi, seam.n);
+        for (0..seam.n) |i| {
+            if (seam.lens[i] == slice_len)
+                try testing.expectEqual(@as(u16, 1), seam.free_counts[i]);
+        }
+    }
+
+    // Recovery after the last failure: the same light call succeeds with
+    // a healthy seam, a REAL full GC cycle leaves the VM consistent, and
+    // the callable keeps working.
+    const again = try vm.apiCall(.nonyieldable, light, call_args[0..]);
+    defer vm.alloc.free(again);
+    try testing.expectEqual(@as(usize, nres), again.len);
+    try testing.expectEqual(@as(i64, 3), again[2].Int);
+    _ = vm.gcControl(2, 0, -1); // LUA_GCCOLLECT
+    const after_gc = try vm.apiCall(.nonyieldable, light, call_args[0..]);
+    defer vm.alloc.free(after_gc);
+    try testing.expectEqual(@as(usize, nres), after_gc.len);
+    for (after_gc, 1..) |v, want| try testing.expectEqual(@as(i64, @intCast(want)), v.Int);
 }
 
 test "vm: api.pushcclosure(0)/registerfuncs(0) publish light values" {

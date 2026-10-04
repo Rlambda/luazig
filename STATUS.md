@@ -45,6 +45,13 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
+- [ ] **lua_getinfo '>'-режим (прямой function-аргумент) не реализован
+  (HIGH, pre-existing; найден scres 2026-10-04).** c_api.zig:3764
+  возвращает 0 для ВСЕХ видов функций; PUC lapi.c ldebug.c обрабатывает
+  '>'-префикс (what смещается, func берётся со стека до вызова).
+  Затрагивает каждый вызов getinfo с function-аргументом, независимо
+  от .Builtin identity. Cut 0 в плане scres (Variant A).
+
 - [ ] **GC finalizer thread-routing parity-gap (ARCHITECTURAL-BACKLOG;
   f1gc2, 2026-10-03).** PUC на host lua_gc(worker) aborts via panic-
   hook с thrower = исходный target; zig исполняет finalizers на
@@ -482,6 +489,31 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   Та же модель затрагивает другие standard-library nup=0 функции;
   полный scope и архитектура миграции требуют отдельного owner choice.
   Не смешивать с D1 для externally pushed C functions без решения.
+  RESEARCH VERDICT (scres, 2026-10-04, к `e759061`; отчёт
+  /tmp/opencode/scres_report.md, артефакты /tmp/opencode/scres_*):
+  полный inventory — ~141 опубликованная stdlib-функция как .Builtin;
+  классы PUC доказаны исходниками+динамически: nup=0 light (~139),
+  CClosure(1) ТОЛЬКО math.random/randomseed (RanState-upvalue; zig:
+  состояние в Vm, nups=0 — отдельное расхождение), require/searchers
+  уже CClosure (не light), gmatch/io.lines — stateful (io.lines вообще
+  Table). Дифференциал 124 пробы: PUC 0 fail / zig HEAD 713 —
+  расхождение строго равномерное (isc/toc/top/getinfo-C-API/getupvalue
+  для КАЖДОГО .Builtin; координатор верифицировал лично: print.isc/toc
+  got=0 want=1). НОВЫЙ независимый gap: lua_getinfo '>'-режим (прямой
+  function-аргумент) не реализован — c_api.zig:3764 возвращает 0 для
+  ВСЕХ видов функций (ниже отдельным пунктом). Прототип Option A
+  (throwaway worktree, master чист): trampoline'ы на базе
+  testcLightCFunc-паттерна — identity 42 функций зелёная, прямой raw
+  f(L) вызов, cross-state вызов+rawequal=1 (указатель НЕ фиктивный);
+  PERF: наивный fast-path +10..+84% (transport-bound) → продукт-форма
+  ОБЯЗАНА нормализовывать known-light -> нативный .Builtin arm на
+  входе диспетчеризации (perf-гейт ~1% в cut-плане). Рекомендация:
+  Variant A (light-публикация + dispatch-entry normalization), cuts
+  0-5: getinfo '>' -> utf8-пилот с perf-гейтом -> полный nup=0 sweep
+  -> math.random CClosure -> stateful-итераторы отдельным milestone
+  -> cleanup; Variant B (identity-зеркалирование на .Builtin) —
+  задокументированный fallback. Owner decision требуется до
+  implementation; STOP-условия в отчёте.
 
 - [ ] **`package.loadlib(path, "*")` возвращает function вместо true
   (BLOCKER, pre-existing, ORDINARY-BACKLOG).** PUC `loadlib.c:391–394`

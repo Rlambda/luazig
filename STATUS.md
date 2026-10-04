@@ -45,6 +45,15 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
+- [ ] **no-arg park window underflow: lua_gettop crash на co,
+  припаркованной безаргументным coroutine.yield() (BLOCKER,
+  pre-existing; найден sycp 2026-10-04).** Корень: callBuiltin .host
+  region-end floor на func_slot+1 — окно пустого yield-парка ниже
+  границы. Доказан на пред-коррекционном prototype; исправлен в
+  throwaway-прототипе (мин-репро + батарея зелёные). Перенести в
+  product (кандидат cut P0.5 syres-плана); raw:
+  /tmp/opencode/sycp_report.md §bonus.
+
 - [ ] **SY-R4-close (BLOCKER, FIX-NOW для A-full research): unarmed raw
   yield теряет TBC close и closer error.** После первого resume на co с
   живым `<close>`/`lua_toclose` host raw `coroutine.yield(co)` ведёт в

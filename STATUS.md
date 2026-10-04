@@ -149,6 +149,25 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   JSON не содержит заявленных SHA/source identity; численный результат
   предварителен до привязки финального исходника.
 
+- [ ] **SY-R4-fresh-close (BLOCKER, FIX-NOW для A-full research):
+  sycp-прототип теряет TBC mark при raw yield из C-вызова на ещё не
+  resumed coroutine (review 2026-10-05 к `dab3760`/`aa28343`).**
+  Независимый differential `/tmp/sycp_review_freshcallk.c`: `driver` на
+  main делает yieldable `lua_callk(co, ..., k!=NULL)`; вызванный на
+  `co` C callback ставит `lua_toclose(L,-1)` и вызывает raw
+  `coroutine.yield(co)`. PUC печатает
+  `MARKED / CLOSE`, возвращает `st=0`, `co_st=0`, `main_top=1`;
+  sycp-прототип печатает только `MARKED`, возвращает `st=0`,
+  `co_st=0`, `main_top=2`. Mark действительно
+  зарегистрирован на co: контроль с `lua_closeslot(L,-1)` вызывает closer
+  в Zig. First wrong op: `unarmedResetClose` (`vm.zig:51981-52007` в
+  throwaway-прототипе) для `!th.started` pop'ает C-кадр и опускает top
+  перед `closeThreadRegionsOnClosedThread`; заявленный close-before-reset
+  не соблюдён. sycp **CORRECT**, P1-P5 остаются заблокированы до
+  исправления и повторной проверки owner-контракта. Сохранённые
+  close/pad batteries подтверждают только уже resumed формы; perf
+  утверждение без финальных source/binary hashes остаётся предварительным.
+
 - [ ] **file mt `__tostring` не опубликован как функция (BLOCKER,
   pre-existing, ORDINARY-BACKLOG; найден scresv2 2026-10-04).** Единственный счётный
   разрыв между PUC 145 source-published function entries и zig 143

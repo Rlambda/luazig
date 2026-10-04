@@ -114,6 +114,30 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   существующего пункта); F3 fresh-co статус / F4 stale-flag аудит /
   F5 имя host-C-fn — pre-existing, судьбы в отчёте. Owner review ->
   implementation prompt.
+  CLOSEPAD VERDICT (sycp, 2026-10-04, к `676723b`; отчёт
+  /tmp/opencode/sycp_report.md, артефакты /tmp/opencode/sycp_*):
+  ОБА review-negative закрыты в скорректированной owner-модели
+  прототипа: closeprotected-before-reset (оба класса marks — C-API и
+  bytecode), main-owned pad targeting с публикацией/копией error
+  object, panic-hook contract (panicHookAbort + defaultPanic
+  byte-parity), zombie defer, thread-aware YieldAbsorbed. Координатор
+  верифицировал лично: close/pad batteries byte-identical против
+  clean PUC 5.5.0; K1-K4 k-пробы (k==NULL = yield-across-C-boundary
+  st=2); tbc/tbc_err/suspended_tbc/r7/rep IDENTICAL; yieldmx Y1
+  улучшен до dead=PUC. K-users: ВСЕ 4 stdlib k-users (pairs/dofile/
+  pcall/xpcall) yield на ARMED L — raw-transport из stdlib
+  НЕДОСТИЖИМ (сужает cut P1: transport нужен только для host raw
+  вызовов). OOM: oomdrive D0/D1#1-16/repeats IDENTICAL; D2 =
+  pre-existing G1 (доказано chunkoom-пробой); утечек нет. Perf:
+  B <= A на всех 3 workloads (-0.05..-0.14%), выводы идентичны —
+  регрессии нет. БОНУС-BLOCKER (pre-existing, найден и закрыт в
+  прототипе): no-arg park window underflow — lua_gettop crash на co,
+  припаркованной coroutine.yield(); корень — callBuiltin .host
+  region-end floor на func_slot+1; pre-existence доказан на
+  пред-коррекционном proto; мин-репро + полная батарея зелёные
+  (перенести в product — cut P0.5). Cut P1-P5 из syres РАЗБЛОКИРОВАН
+  после включения closeprotected+main-pad в транспорт; обновлённый
+  порядок в отчёте §7.
   REVIEW 2026-10-05 к `72f7886`: **INCONCLUSIVE** для implementation
   handoff. R1–R8 равны на сохранённых пробах, но независимые
   SY-R4-close и SY-R4-pad выше опровергают полный close/boundary

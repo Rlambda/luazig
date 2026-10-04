@@ -57,6 +57,34 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   A-full как целевой дизайн (2026-10-04). Следующий этап — bounded
   research typed yield/continuation transport до implementation. Raw:
   /tmp/opencode/scresv2_{ymx,y2d}_{puc,ad}.out.
+  RESEARCH VERDICT (syres, 2026-10-04, к `dbe1b66`; отчёт
+  /tmp/opencode/syres_report.md, прототип /tmp/opencode/syres_proto,
+  hashes syres_hashes.txt): STOP НЕ сработал — yield transport
+  ПРЕДСТАВИМ. Механизм доказан прототипом: unarmedRawYieldTransport
+  (resetthread -> push на main -> sentinel c_error_status=1 -> longjmp)
+  + raw_yield_absorb_pending + absorbRawYieldWindow (pcall skip=0 /
+  xpcall skip=2) + raw-пропагация в drive-loop (критично: иначе
+  recoverBytecodeDispatchError фолдил в RuntimeError без объекта);
+  sentinel именно 1, не 0 (0 — unset-дефолт многих longjmp-сайтов).
+  Пробы R1-R8 — byte-identical с чистым PUC 5.5.0 (координатор
+  верифицировал личнo diff syres_rep_{puc,proto}.out); yieldmx/y2diag
+  — только 2 pre-existing divergence (fresh-co статус F3, имя
+  host-C-fn F5). OOM-инъекция в ОБОИХ новых переходах: dupe — PUC
+  tryagain parity; push-growth — достижимость доказана сканом, sticky
+  -> relay с очисткой флага, repeat работает. Perf (paired
+  instructions, 21 seed): +0.15%/+0.22%/+0.05% — обоснованная цена
+  (единственное hot-добавление — epilogue-сравнение в callCFunction);
+  ~1% gate не действует. Рекомендация R2-lookup: immutable comptime
+  array + linear scan, БЕЗ mutable table. Cut-план P0-P5:
+  getinfo('>') prerequisite -> raw-yield boundary транспорт -> nup=0
+  publication + dispatch-entry normalization -> R1 attribution ->
+  R2/R3/R5 -> CClosure/stateful; delete-list .Builtin arms по cuts.
+  Findings: F1 MEDIUM/ORDINARY (ownedPcallFail heap-tuple при тотальном
+  OOM — PUC кладёт memerrmsg на стек; pre-existing, O1c-контроль);
+  F2 = G2/allocator-owner (init ~78KB/state мимо lua_Alloc — дополнение
+  существующего пункта); F3 fresh-co статус / F4 stale-flag аудит /
+  F5 имя host-C-fn — pre-existing, судьбы в отчёте. Owner review ->
+  implementation prompt.
 
 - [ ] **file mt `__tostring` не опубликован как функция (BLOCKER,
   pre-existing, ORDINARY-BACKLOG; найден scresv2 2026-10-04).** Единственный счётный

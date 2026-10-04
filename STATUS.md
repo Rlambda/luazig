@@ -45,6 +45,26 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
+- [ ] **SY-R4-close (BLOCKER, FIX-NOW для A-full research): unarmed raw
+  yield теряет TBC close и closer error.** После первого resume на co с
+  живым `<close>`/`lua_toclose` host raw `coroutine.yield(co)` ведёт в
+  PUC `luaE_resetthread -> luaD_closeprotected`: closer вызывается,
+  co становится dead; при ошибке closer наружу идут status/object.
+  Prototype `unarmedRawYieldTransport` опускает top и pop'ает frames
+  без closeprotected: closer не вызван, co остаётся suspended, ошибка
+  теряется. Независимые пробы `/tmp/opencode/syres_review_tbc.c` и
+  `syres_review_tbc_err.c` (PUC/proto binaries рядом). Требуется
+  close/status/GC owner proof до implementation.
+
+- [ ] **SY-R4-pad (BLOCKER, FIX-NOW для A-full research): unarmed raw
+  yield приходит на pad другого thread.** В вложенном C driver/coroutine
+  raw yield третьей fresh co PUC переносит управление к main boundary;
+  prototype с единым `c_error_jmp` возвращается во внутренний pcall и
+  продолжает оба C callback, меняя main result window (1 -> 0).
+  `/tmp/opencode/syres_review_r7.c` + PUC/proto binaries; прежняя R7
+  сравнивала только пустой stdout и не наблюдала состояние после вызова.
+  Нужен per-thread pad-owner/main-directed relay contract.
+
 - [ ] **R4(scresv2, BLOCKER): yield-транспорт в stdlib C trampoline
   сломан — raw yield из C callback на running coroutine превращается
   в ERRMEM (2026-10-04).** PUC поглощает raw yield как results с full
@@ -85,6 +105,16 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   существующего пункта); F3 fresh-co статус / F4 stale-flag аудит /
   F5 имя host-C-fn — pre-existing, судьбы в отчёте. Owner review ->
   implementation prompt.
+  REVIEW 2026-10-05 к `72f7886`: **INCONCLUSIVE** для implementation
+  handoff. R1–R8 равны на сохранённых пробах, но независимые
+  SY-R4-close и SY-R4-pad выше опровергают полный close/boundary
+  invariant. «STOP не сработал» — исторический вывод автора, не
+  принятый вердикт. A-full остаётся утверждённой целью; нужна bounded
+  research correction по новому prompt.md. F1 — наблюдаемая неверная
+  ERRMEM-семантика (BLOCKER по AGENTS), относится к открытому G1,
+  а не новый MEDIUM-долг. Perf A/B binary hashes совпадают, однако
+  JSON не содержит заявленных SHA/source identity; численный результат
+  предварителен до привязки финального исходника.
 
 - [ ] **file mt `__tostring` не опубликован как функция (BLOCKER,
   pre-existing, ORDINARY-BACKLOG; найден scresv2 2026-10-04).** Единственный счётный

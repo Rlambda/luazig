@@ -350,12 +350,16 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   прототипа). Отдельный от F-A6T класс? — решающий эксперимент в
   отчёте scresv.
 
-- [ ] **lua_getinfo '>'-режим (прямой function-аргумент) не реализован
+- [x] **lua_getinfo '>'-режим (прямой function-аргумент) не реализован
   (BLOCKER, pre-existing; найден scres 2026-10-04).** c_api.zig:3764
   возвращает 0 для ВСЕХ видов функций; PUC lapi.c ldebug.c обрабатывает
   '>'-префикс (what смещается, func берётся со стека до вызова).
   Затрагивает каждый вызов getinfo с function-аргументом, независимо
   от .Builtin identity. Cut 0 в плане scres (Variant A).
+  CLOSED (A-full foundation P0, `7519c48`, 2026-10-05): value-based
+  resolver (light/CClosure/Lua + non-closure C-shape), точный stack
+  effect; suite 42_getinfo_fn baseline 28 FAIL -> byte-identical PUC
+  D+RF (координатор лично).
 
 - [x] **scres architecture verification: target lua_State и OOM/GC
   (HIGH, research handoff завершён).**

@@ -189,6 +189,14 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   residual: защитный ensureThreadApiHandle OOM-arm в
   closeThreadRegionsOnClosedThread (недостижим практически; marks
   выживают, closers бы не звались) — пункт ниже.
+  REVIEW 2026-10-05 к `3afbde9`: **CORRECT**. Sticky OOM-detach форма
+  действительно byte-identical PUC (`st=2 closed=1`, исходный `boom`),
+  но reserve-at-registration внёс новый allocator-owner BLOCKER ниже.
+  Поэтому вывод «все SY-R4 corrections доказаны / P1–P5 готовы» не принят.
+  Отдельно: заявленные +2.02% для TBC-saturated workload не подтверждены
+  ссылочными raw: `/tmp/opencode/syo_run_perf_ab.py` и
+  `/tmp/opencode/syo_perf_ab.json` содержат только string/math/gsub loops
+  (MEDIUM, incomplete provenance). Число не считать измеренным.
   REVIEW 2026-10-05 к `72f7886`: **INCONCLUSIVE** для implementation
   handoff. R1–R8 равны на сохранённых пробах, но независимые
   SY-R4-close и SY-R4-pad выше опровергают полный close/boundary
@@ -219,7 +227,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   close/pad batteries подтверждают только уже resumed формы; perf
   утверждение без финальных source/binary hashes остаётся предварительным.
 
-- [ ] **SY-R4-OOM-detach (BLOCKER, FIX-NOW для A-full owner research;
+- [x] **SY-R4-OOM-detach (BLOCKER, FIX-NOW для A-full owner research;
   review 2026-10-05 к `f82a22f`).** На fresh `co` при cross-thread
   `lua_callk` Lua-кадр содержит живой `<close>` mark; C callback
   подготавливает ошибку `boom`, затем перед `lua_error` включает
@@ -237,6 +245,26 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   closeprotected/OOM owner contract и P1-P5 остаются открытыми.
   Отчётный OOM-probe не достигает этого окна: sticky отказ происходит
   до регистрации mark; D1#6-16 в Zig не инъецируют отказ.
+  syo-прототип (`3afbde9`) закрывает именно эту форму: независимый повтор
+  `/tmp/opencode/syo_stickyoom_{zig,puc}` byte-identical; новый owner
+  blocker при mixed C/Lua marks записан отдельно ниже.
+
+- [ ] **SY-R4-mixed-TBC-allocator (BLOCKER, FIX-NOW для A-full owner
+  research; review 2026-10-05 к `3afbde9`).** В throwaway-прототипе
+  `OP_TBC` вызывает `reserveTbcChainMark(th, self.infraAlloc())`, а C
+  `lua_toclose`/testC marks резервируют тот же `c_tbc_chain` через
+  `self.alloc`; chain освобождается через `self.alloc`. При включённом
+  testC adapter `infraAlloc()` возвращает base allocator, тогда как
+  `self.alloc` — tracking/poison adapter. Один ArrayList buffer
+  растёт через разные allocator identities, оставляя stale charged
+  entry либо передавая mmap-backed pointer в base realloc/free.
+  Независимый fixture `/tmp/syo_allocator_fixture.zig`: C mark, затем
+  16 Lua `<close>` marks под poison adapter → `load=0`,
+  `realloc(): invalid pointer`, rc=134. Первый неверный site —
+  `vm.zig` OP_TBC reserve в `/tmp/opencode/syo_syo_only.diff`.
+  Нужен единый allocator owner chain на всех 5 registration sites и
+  deinit, затем повторный mixed-mark/OOM/GC proof. P1–P5 заблокированы
+  до коррекции; product/master этим прототипом не менялись.
 
 - [ ] **file mt `__tostring` не опубликован как функция (BLOCKER,
   pre-existing, ORDINARY-BACKLOG; найден scresv2 2026-10-04).** Единственный счётный

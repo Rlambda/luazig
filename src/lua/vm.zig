@@ -5503,6 +5503,25 @@ pub const Vm = struct {
     /// from the unswallowed push/setfuncs wrappers surfaced to lua_pcall
     /// as LUA_ERRRUN. The boundary folds this into the landing-pad result.
     c_error_status: c_int = 0,
+    /// Raw-yield absorption in flight (the unarmed transport's
+    /// no-recovery fact): set right before the rethrow longjmp, cleared
+    /// by the consumer that converts error.YieldAbsorbed. While set,
+    /// every intermediate error unwind between the throw and the
+    /// landing pad is SUPPRESSED (PUC luaD_pcall with status LUA_OK
+    /// runs no recovery — the abandoned activations stay in place as
+    /// the stale window anchor). Not a routing signal: the routing is
+    /// by error kind only; this only suppresses intermediate unwinds
+    /// of the very activation chain the throw is flying through.
+    raw_yield_absorb_pending: bool = false,
+    /// The thread the in-flight raw-yield absorption was raised FROM (the
+    /// unarmed transport's target). PUC luaD_throw's no-handler branch
+    /// (ldo.c:139-146) calls `g->panic` with that ORIGINAL throwing target
+    /// when the rethrow relay finds no armed boundary on main either — the
+    /// relay terminals (lua_resume / lua_pcallk arms) no longer hold the
+    /// target, so it is recorded here. Set by unarmedRawYieldTransport's
+    /// OK path right before the rethrow; cleared by the consumer alongside
+    /// raw_yield_absorb_pending.
+    raw_yield_absorb_thrower: ?*Thread = null,
     /// P16.50-review-3: the interned "not enough memory" literal (PUC
     /// statMsg[ERRMEM]), interned once at Vm init so the OOM error path
     /// never allocates.
@@ -5793,7 +5812,19 @@ pub const Vm = struct {
     /// regions with it, never finalize its carrier thread as dead) until a
     /// consumer on main publishes it. Routing is by error KIND only — no
     /// VM-global flags, no text matching.
-    pub const Error = std.mem.Allocator.Error || error{ RuntimeError, Yield, MainDestined };
+    ///
+    /// `YieldAbsorbed` (typed transport): an UNARMED raw-call yield (PUC
+    /// luaD_throw's no-errorJmp arm with LUA_YIELD — the target was reset
+    /// like luaE_resetthread, its base-func slot copied to MAIN's top, and
+    /// the throw re-entered MAIN's armed boundary with status LUA_OK).
+    /// PUC luaD_pcall with status OK runs NO recovery: the catching
+    /// conventional pcall on main claims the live stale-anchored window as
+    /// its success results (the luaD_pcall absorption hole). Every
+    /// protected catch between the raise and the consumer PROPAGATES the
+    /// kind raw (never folds it, never unwinds with it — the suppression
+    /// fact rides raw_yield_absorb_pending) until the nearest conventional
+    /// pcall or the embedder boundary converts it.
+    pub const Error = std.mem.Allocator.Error || error{ RuntimeError, Yield, MainDestined, YieldAbsorbed };
 
     /// Private execution-layer signal set. `ThreadSwitch` is raised only while
     /// the bytecode coroutine trampoline is active and must be consumed by
@@ -5870,6 +5901,9 @@ pub const Vm = struct {
             error.Yield => return error.Yield,
             // the kind is part of the public Error set — identity.
             error.MainDestined => return error.MainDestined,
+            // identity — the absorption rides to the nearest conventional
+            // pcall / embedder boundary.
+            error.YieldAbsorbed => return error.YieldAbsorbed,
         };
     }
     /// Create a new VM with entropy-derived hash seed. `noenv` mirrors PUC's
@@ -7453,7 +7487,7 @@ pub const Vm = struct {
     /// same as PUC's longjmp aborts it, only without unwinding the
     /// caller). Callers that cannot propagate MainDestined must use
     /// `gcControl` instead.
-    pub fn gcControlRelay(self: *Vm, what: i32, param: i32, value: i32) error{MainDestined}!i32 {
+    pub fn gcControlRelay(self: *Vm, what: i32, param: i32, value: i32) error{ MainDestined, YieldAbsorbed }!i32 {
         // PUC lapi.c:1174: if gcstp & (GCSTPGC|GCSTPCLS) return -1.
         if (self.gc_stp & (GCSTPGC | GCSTPCLS) != 0) return -1;
         return switch (what) {
@@ -7482,6 +7516,11 @@ pub const Vm = struct {
                 // PUC's throw crosses this frame to the owner's boundary.
                 self.gcFullCollectionForUser() catch |e| switch (e) {
                     error.MainDestined => return error.MainDestined,
+                    // a raw-yield absorption from a finalizer rides to
+                    // main's conventional pcall like MainDestined (PUC:
+                    // the rethrow bypasses the GC machinery; this
+                    // activation is abandoned) — never absorbed here.
+                    error.YieldAbsorbed => return error.YieldAbsorbed,
                     else => {},
                 };
                 break :blk 0;
@@ -7523,6 +7562,8 @@ pub const Vm = struct {
                 // differs. The 17_gccontrol differential test verifies this.
                 const completed = self.gcStep(n) catch |e| switch (e) {
                     error.MainDestined => return error.MainDestined,
+                    // see the LUA_GCCOLLECT arm — never absorbed here.
+                    error.YieldAbsorbed => return error.YieldAbsorbed,
                     else => false,
                 };
                 self.gc_stp = oldstp; // restore previous state
@@ -7546,6 +7587,8 @@ pub const Vm = struct {
                     // arm 2).
                     self.gcEnterGenerational() catch |e| switch (e) {
                         error.MainDestined => return error.MainDestined,
+                        // see the LUA_GCCOLLECT arm — never absorbed here.
+                        error.YieldAbsorbed => return error.YieldAbsorbed,
                         else => {},
                     };
                 } else if (self.gc_mode == .incremental and self.gc_gen_phase == .major) {
@@ -7554,6 +7597,8 @@ pub const Vm = struct {
                     self.gc_gen_phase = .minor;
                     self.gcEnterGenerational() catch |e| switch (e) {
                         error.MainDestined => return error.MainDestined,
+                        // see the LUA_GCCOLLECT arm — never absorbed here.
+                        error.YieldAbsorbed => return error.YieldAbsorbed,
                         else => {},
                     };
                 }
@@ -7588,16 +7633,19 @@ pub const Vm = struct {
     }
 
     /// Infallible wrapper for callers that cannot propagate a relayed
-    /// MainDestined through their i32 return: the tests/CLI entry points
-    /// (which never run the GC on a coroutine with a pending cross-thread
-    /// closer error) and LUA_GCPARAM (which runs no GC). The Lua builtin
-    /// (builtinCollectgarbage), the C-ABI entry (luazigGcFixed) and the
-    /// Zig API entry (apiGc) use gcControlRelay and relay the signal
-    /// properly.
+    /// MainDestined/YieldAbsorbed through their i32 return: the tests/CLI
+    /// entry points (which never run the GC on a coroutine with a pending
+    /// cross-thread closer error or raw-yield absorption) and LUA_GCPARAM
+    /// (which runs no GC). The Lua builtin (builtinCollectgarbage), the
+    /// C-ABI entry (luazigGcFixed) and the Zig API entry (apiGc) use
+    /// gcControlRelay and relay the signal properly.
     pub fn gcControl(self: *Vm, what: i32, param: i32, value: i32) i32 {
         return self.gcControlRelay(what, param, value) catch |e| switch (e) {
             error.MainDestined => @panic(
                 "main-destined error escaped gcControl (use gcControlRelay at boundaries that can relay)",
+            ),
+            error.YieldAbsorbed => @panic(
+                "raw-yield absorption escaped gcControl (use gcControlRelay at boundaries that can relay)",
             ),
         };
     }
@@ -7609,7 +7657,7 @@ pub const Vm = struct {
     /// returning the -3 sentinel (see `callCFunctionWithBoundary`),
     /// which decodes to `error.MainDestined` at the callback's boundary
     /// and propagates to the pcall consumer on main.
-    pub fn apiGc(self: *Vm, what: i32, data: i32) error{MainDestined}!i32 {
+    pub fn apiGc(self: *Vm, what: i32, data: i32) error{ MainDestined, YieldAbsorbed }!i32 {
         // For LUA_GCSTEP, `data` carries the step size (PUC's vararg n).
         // For LUA_GCPARAM, `data` is unused (param/value come separately).
         if (what == 5) return self.gcControlRelay(what, data, -1);
@@ -8486,15 +8534,17 @@ pub const Vm = struct {
     /// RuntimeError, OutOfMemory, a denied yield, ThreadSwitch — by the
     /// defer at the call site.
     /// The anonymous status enum of Thread (no declared name — resolved
-    /// through the struct's field type).
-    const ThreadStatus = blk: {
+    /// through the struct's field type). Pub: c_api's cross-thread
+    /// lua_callk holds a SyncCloseContext by name for its conditional
+    /// entry/restore.
+    pub const ThreadStatus = blk: {
         for (@typeInfo(Thread).@"struct".fields) |f| {
             if (std.mem.eql(u8, f.name, "status")) break :blk f.type;
         }
         unreachable;
     };
 
-    const SyncCloseContext = struct {
+    pub const SyncCloseContext = struct {
         th: *Thread,
         prev_thread: ?*Thread,
         prev_status: ?ThreadStatus,
@@ -9035,7 +9085,7 @@ pub const Vm = struct {
         // unless construction appended (it cannot) — kept for symmetry with
         // gcFreeObject so this helper stays the complete teardown.
         th.bytecode_tbc_regs.deinit(self.infraAlloc());
-        th.c_tbc_chain.deinit(self.alloc);
+        th.c_tbc_chain.deinit(self.infraAlloc());
         th.yielded.deinit(self.alloc);
         th.resume_inbox.deinit(self.alloc);
         self.alloc.destroy(th);
@@ -9984,7 +10034,14 @@ pub const Vm = struct {
     /// `pushBuiltinCFrame`). Called via `defer` after the builtin call
     /// completes. Restores top to the C-frame's func_slot.
     fn popBuiltinCFrame(self: *Vm) void {
-        const th = self.activeBytecodeThread();
+        self.popBuiltinCFrameOn(self.activeBytecodeThread());
+    }
+
+    /// Thread-explicit variant of popBuiltinCFrame: the unarmed
+    /// raw-yield transport resets a target thread that is NOT the
+    /// active runtime (the C-API lua_yieldk lane operates on the
+    /// target's window without switching authority).
+    fn popBuiltinCFrameOn(self: *Vm, th: *Thread) void {
         const cur_len = th.call_frames.len();
         if (cur_len > 0) {
             const frame = th.call_frames.getPtr(cur_len - 1);
@@ -11324,6 +11381,10 @@ pub const Vm = struct {
             error.Yield, error.ThreadSwitch => @panic(
                 "yield crossed the finalizer boundary (non-yieldable GCTM)",
             ),
+            // non-yieldable GCTM boundary: a raw-yield absorption cannot
+            // start here (no host C callback lane); identity keeps the
+            // kind unfolded for the impossible case.
+            error.YieldAbsorbed => return error.YieldAbsorbed,
             error.MainDestined => {
                 const owner: *Thread =
                     if (!snap_fin_has_obj and fin_thread.err_has_obj) fin_thread else self.main_thread.?;
@@ -16567,6 +16628,19 @@ pub const Vm = struct {
                 return error.Yield;
             }
 
+            if (nret_signed == .yield_absorbed) {
+                // typed transport: an unarmed raw-yield absorption
+                // rethrown through this continuation's pad (the transport
+                // already reset its target and copied the base-func slot
+                // to MAIN's live top). PUC: the rethrow's longjmp blasts
+                // through the resume machinery without unwinding anything
+                // here — the C-frame stays in place as a zombie anchor
+                // (the resume boundary's dead-latch is suppressed by
+                // raw_yield_absorb_pending) and the kind propagates
+                // toward MAIN's consumer (the pcall hole).
+                return error.YieldAbsorbed;
+            }
+
             if (nret_signed == .lua_err) {
                 // k called lua_error (or cThrow). The error object is in
                 // c_error_value (C API lua_error) or already in err_obj
@@ -17022,6 +17096,9 @@ pub const Vm = struct {
                         // propagate — the resume-level call site flags
                         // the zombie exit.
                         error.MainDestined => return error.MainDestined,
+                        // propagate — the absorption rides to the
+                        // nearest conventional pcall / embedder boundary.
+                        error.YieldAbsorbed => return error.YieldAbsorbed,
                     }
                     have_step = true;
                 };
@@ -17344,6 +17421,14 @@ pub const Vm = struct {
                             // main-destined closer error — propagate
                             // (the resume-level call site flags the zombie).
                             error.MainDestined => return error.MainDestined,
+                            // unarmed raw-yield absorption: PUC's rethrow
+                            // rides MAINTH's pad chain and BYPASSES the
+                            // resume drive entirely (the drive thread is
+                            // abandoned mid-drive; the no-recovery
+                            // suppression kept its frames). Propagate raw —
+                            // the resume boundary relays toward main's
+                            // conventional pcall / embedder boundary.
+                            error.YieldAbsorbed => return error.YieldAbsorbed,
                         };
                         break :retblk values;
                     };
@@ -17568,6 +17653,9 @@ pub const Vm = struct {
                     // propagate — the resume-level call site flags
                     // the zombie exit.
                     error.MainDestined => return error.MainDestined,
+                    // propagate raw — the absorption rides toward the
+                    // nearest conventional pcall / embedder boundary.
+                    error.YieldAbsorbed => return error.YieldAbsorbed,
                 };
                 if (completed) |ret| {
                     step = .{ .returned = ret };
@@ -17829,7 +17917,7 @@ pub const Vm = struct {
                     state.disposition == .propagate and
                     state.target_depth == state.boundary_depth;
                 if (escapes_dispatch) {
-                    try self.detachLuaFrameTbcMarks(owner, frame);
+                    self.detachLuaFrameTbcMarks(owner, frame);
                 } else if (owner.bytecode_tbc_regs.items.len > frame.tbc_mark) {
                     owner.bytecode_unwinds.at(state_index).* = state;
                     switch (try self.beginBytecodeClose(
@@ -19053,10 +19141,11 @@ pub const Vm = struct {
             // other abort-pop of a marked Lua frame. Idempotent by
             // construction: the semantic unwind (escapes_dispatch) detaches
             // AND pops in one step, so a frame reaching this loop still
-            // owns its regs. Best-effort under OOM (the chain reserve
-            // fails): the marks drop as before — never a silent success.
+            // owns its regs. Infallible by the registration-time reserve
+            // (reserveTbcChainMark): the transfer can never drop a
+            // registered obligation, including under a total OOM.
             if (!frame.isC()) {
-                self.detachLuaFrameTbcMarks(self.activeBytecodeThread(), frame) catch {};
+                self.detachLuaFrameTbcMarks(self.activeBytecodeThread(), frame);
             }
             if (!frame.isC() and frame.hasOpenUpvalues())
                 self.closeBytecodeUpvaluesFrom(frame, 0);
@@ -19159,6 +19248,8 @@ pub const Vm = struct {
                     // pure allocation+interning — unreachable by the
                     // same proof; identity keeps the kind unfolded.
                     error.MainDestined => return error.MainDestined,
+                    // same proof — no control flow inside; identity.
+                    error.YieldAbsorbed => return error.YieldAbsorbed,
                 };
             }
         }
@@ -19281,10 +19372,15 @@ pub const Vm = struct {
         // unwinding (zombie continuation); the errdefer below arms the flag
         // before this assert runs (LIFO: registered after this defer).
         var main_destined_exit = false;
+        // same zombie-exit fact for the unarmed raw-yield absorption
+        // (PUC luaD_pcall status LUA_OK: no recovery — the abandoned
+        // activations survive as the stale window anchor).
+        var yield_absorbed_exit = false;
         defer std.debug.assert(
             exec_frames.len() == boundary_depth or
                 ((yielded_in_place or exec_thread.bytecode_inplace_suspended) and exec_frames.len() > boundary_depth) or
                 main_destined_exit or
+                yield_absorbed_exit or
                 // P15.78: A C-frame may remain as the TOP frame above
                 // boundary_depth after a Lua frame returns to a C-frame
                 // parent. completeBytecodeExecFrame returns the results to
@@ -19320,6 +19416,12 @@ pub const Vm = struct {
         // raise the kind too).
         errdefer |md_err| if (md_err == error.MainDestined) {
             main_destined_exit = true;
+        };
+        // arm the assert's zombie disjunct on EVERY YieldAbsorbed exit
+        // (the no-recovery suppression kept the frames — same LIFO
+        // contract as the MainDestined flag above).
+        errdefer |ya_err| if (ya_err == error.YieldAbsorbed) {
+            yield_absorbed_exit = true;
         };
         // a main-destined closer error (error.MainDestined) skips
         // this unwind ENTIRELY — PUC's re-throw on main (ldo.c:130-138)
@@ -19371,13 +19473,17 @@ pub const Vm = struct {
             };
             const is_suspension_owner = exec_thread.bytecode_inplace_suspended and
                 (boundary_depth == bytecodeOuterBoundary(exec_frames) or boundary_depth <= exec_thread.bytecode_resume_boundary or has_continuation_cframes_above);
-            if (!is_suspension_owner) {
+            if (!is_suspension_owner and !self.raw_yield_absorb_pending) {
                 // P16.50-review-10 BLOCKER 1: the abort unwind's upvalue
                 // close is infallible (overflow fallback — see
                 // closeBoxedUpvaluesReserved): the owned suffix is always
                 // fully released here, exactly once, with no parked-error
                 // residual. The thread never re-enters dispatch on these
                 // frames; the host boundary surfaces the original error.
+                // A raw-yield absorption in flight suppresses the unwind:
+                // PUC luaD_pcall with status LUA_OK runs NO recovery — the
+                // abandoned activations (the stale window anchor included)
+                // survive to the landing pad's consumer.
                 self.unwindBytecodeExecFrames(exec_frames, boundary_depth);
             }
         };
@@ -19426,6 +19532,13 @@ pub const Vm = struct {
                 // frames; the consumer on main (or the next relay) owns
                 // them. Propagate the kind raw.
                 if (dispatch_err == error.MainDestined) return error.MainDestined;
+                // an unarmed raw-yield absorption bypasses the semantic
+                // error unwind exactly like MainDestined (PUC luaD_pcall
+                // with status LUA_OK runs NO recovery — the abandoned
+                // activations stay as the stale window anchor; the
+                // raw_yield_absorb_pending suppression already skipped
+                // the errdefer unwind). Propagate the kind raw.
+                if (dispatch_err == error.YieldAbsorbed) return error.YieldAbsorbed;
                 // P16.27 T1: the forced-close bypass is REMOVED — errors
                 // in closers are ordinary catchable errors; the close
                 // continuation records uncaught ones (last error wins).
@@ -22238,7 +22351,12 @@ pub const Vm = struct {
                             // fail the <close> DECLARATION itself
                             // (locals.lua "memory error inside closing
                             // function" — the mark must survive to close y's
-                            // memerr).
+                            // memerr). The transfer reserve rides the same
+                            // infra lane BEFORE the reg is registered: a
+                            // real OOM fails the declaration with no
+                            // obligation created, and the eventual unwind
+                            // transfer of this reg stays allocation-free.
+                            self.reserveTbcChainMark(ctx.th) catch return error.OutOfMemory;
                             ctx.th.bytecode_tbc_regs.append(self.infraAlloc(), inst.a) catch return error.OutOfMemory;
                         }
                     },
@@ -24309,6 +24427,11 @@ pub const Vm = struct {
                         // semantic unwind must not run for it (zombie
                         // parity; the consumer on main owns the frames).
                         error.MainDestined => return error.MainDestined,
+                        // propagate raw — the no-recovery suppression
+                        // (raw_yield_absorb_pending) keeps the abandoned
+                        // activations; the nearest conventional pcall /
+                        // embedder boundary consumes the kind.
+                        error.YieldAbsorbed => return error.YieldAbsorbed,
                     };
                     // P16.50-review-7 BLOCKER 4: resume's exact owned tuple
                     // is the tail-call transport (no window bound); yield
@@ -24361,6 +24484,11 @@ pub const Vm = struct {
                         // semantic unwind must not run for it (zombie
                         // parity; the consumer on main owns the frames).
                         error.MainDestined => return error.MainDestined,
+                        // propagate raw — the no-recovery suppression
+                        // (raw_yield_absorb_pending) keeps the abandoned
+                        // activations; the nearest conventional pcall /
+                        // embedder boundary consumes the kind.
+                        error.YieldAbsorbed => return error.YieldAbsorbed,
                     };
                 }
                 // P16.50-review-6 BLOCKER 1: owned results (T.testC) are the
@@ -25004,6 +25132,11 @@ pub const Vm = struct {
                         // semantic unwind must not run for it (zombie
                         // parity; the consumer on main owns the frames).
                         error.MainDestined => return error.MainDestined,
+                        // propagate raw — the no-recovery suppression
+                        // (raw_yield_absorb_pending) keeps the abandoned
+                        // activations; the nearest conventional pcall /
+                        // embedder boundary consumes the kind.
+                        error.YieldAbsorbed => return error.YieldAbsorbed,
                     };
                     // P16.50-review-7 BLOCKER 4: resume returns its EXACT
                     // results as an owned slice ([true/false] ++ values —
@@ -25060,6 +25193,11 @@ pub const Vm = struct {
                         // semantic unwind must not run for it (zombie
                         // parity; the consumer on main owns the frames).
                         error.MainDestined => return error.MainDestined,
+                        // propagate raw — the no-recovery suppression
+                        // (raw_yield_absorb_pending) keeps the abandoned
+                        // activations; the nearest conventional pcall /
+                        // embedder boundary consumes the kind.
+                        error.YieldAbsorbed => return error.YieldAbsorbed,
                     };
                 }
                 if (ctx.th.stack.ptr != stack_base_before) {
@@ -27915,6 +28053,40 @@ pub const Vm = struct {
     /// bound; the old 256-slot window truncated every pcall to 255
     /// results). The `outs` window is gone: the exact count is structural
     /// in the slice.
+    /// PUC luaD_pcall with status LUA_OK (the unarmed raw-yield rethrow):
+    /// NO recovery runs — finishpcall (lbaselib.c:471-479) returns the live
+    /// stale-anchored window as the pcall's SUCCESS results: gettop values
+    /// relative to the abandoned raw-callee C-frame (the top C-frame —
+    /// the suppression kept it in place), minus `skip` bottom values
+    /// (xpcall's finishpcall extra=2), with NO `true` prefix. The abandoned
+    /// activations above this pcall's C-frame retire here (PUC poscall).
+    fn absorbRawYieldWindow(
+        self: *Vm,
+        th: *Thread,
+        pcall_frame_idx: ?usize,
+        skip: usize,
+    ) DispatchError!?[]Value {
+        self.raw_yield_absorb_pending = false;
+        self.raw_yield_absorb_thrower = null;
+        const wbase = cWindowBase(th);
+        const start = wbase + skip;
+        const n = if (th.top > start) th.top - start else 0;
+        const res = self.alloc.dupe(Value, th.stack[start .. start + n]) catch {
+            // Zig-necessary window copy (PUC moveresults is pure stack
+            // moves): relay as ERRMEM after retiring the abandoned
+            // activations (the fail path needs a consistent frame level).
+            if (pcall_frame_idx) |idx| {
+                self.unwindBytecodeExecFrames(&th.call_frames, idx + 1);
+            }
+            self.setOutOfMemoryError();
+            return try self.ownedPcallFail();
+        };
+        if (pcall_frame_idx) |idx| {
+            self.unwindBytecodeExecFrames(&th.call_frames, idx + 1);
+        }
+        return res;
+    }
+
     fn builtinPcall(self: *Vm, args: []const Value) DispatchError!?[]Value {
         if (args.len == 0) return self.fail("pcall expects function", .{});
         if (self.protected_call_depth >= 128) {
@@ -28117,6 +28289,12 @@ pub const Vm = struct {
                 yield_exit = true;
                 return e;
             },
+            error.YieldAbsorbed => {
+                // PUC luaD_pcall status LUA_OK: no recovery — the
+                // stale-anchored live window is the success results.
+                if (defer_to_precover) return e;
+                return try self.absorbRawYieldWindow(th_pcall_ef, pcall_frame_idx, 0);
+            },
             error.OutOfMemory => {
                 self.setOutOfMemoryError();
                 rollbackMemoryError(self, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
@@ -28171,6 +28349,12 @@ pub const Vm = struct {
                     error.Yield => {
                         yield_exit = true;
                         return e;
+                    },
+                    error.YieldAbsorbed => {
+                        // PUC luaD_pcall status LUA_OK: no recovery — the
+                        // stale-anchored live window is the success results.
+                        if (defer_to_precover) return e;
+                        return try self.absorbRawYieldWindow(th_pcall_ef, pcall_frame_idx, 0);
                     },
                     error.OutOfMemory => {
                         self.setOutOfMemoryError();
@@ -28267,6 +28451,12 @@ pub const Vm = struct {
                     error.Yield => {
                         yield_exit = true;
                         return e;
+                    },
+                    error.YieldAbsorbed => {
+                        // PUC luaD_pcall status LUA_OK: no recovery — the
+                        // stale-anchored live window is the success results.
+                        if (defer_to_precover) return e;
+                        return try self.absorbRawYieldWindow(th_pcall, pcall_frame_idx, 0);
                     },
                     error.OutOfMemory => {
                         self.setOutOfMemoryError();
@@ -28544,6 +28734,13 @@ pub const Vm = struct {
                 yield_exit = true;
                 return e;
             },
+            error.YieldAbsorbed => {
+                // PUC luaD_pcall status LUA_OK: no recovery —
+                // finishpcall(L, OK, 2) returns the stale-anchored window
+                // minus its bottom `extra` values as success results.
+                if (defer_to_precover) return e;
+                return try self.absorbRawYieldWindow(th_xpcall_ef, pcall_frame_idx, 2);
+            },
             error.OutOfMemory => {
                 self.setOutOfMemoryError();
                 if (defer_to_precover) {
@@ -28592,6 +28789,13 @@ pub const Vm = struct {
                     error.Yield => {
                         yield_exit = true;
                         return e;
+                    },
+                    error.YieldAbsorbed => {
+                        // PUC luaD_pcall status LUA_OK: no recovery —
+                        // finishpcall(L, OK, 2): window minus 2 bottom
+                        // values, no [true] prefix.
+                        if (defer_to_precover) return e;
+                        return try self.absorbRawYieldWindow(th_xpcall_cf, pcall_frame_idx, 2);
                     },
                     error.OutOfMemory => {
                         self.setOutOfMemoryError();
@@ -28658,6 +28862,13 @@ pub const Vm = struct {
                     error.Yield => {
                         yield_exit = true;
                         return e;
+                    },
+                    error.YieldAbsorbed => {
+                        // PUC luaD_pcall status LUA_OK: no recovery —
+                        // finishpcall(L, OK, 2): window minus 2 bottom
+                        // values, no [true] prefix.
+                        if (defer_to_precover) return e;
+                        return try self.absorbRawYieldWindow(th_xpcall, pcall_frame_idx, 2);
                     },
                     error.OutOfMemory => {
                         self.setOutOfMemoryError();
@@ -28851,6 +29062,17 @@ pub const Vm = struct {
         const args = th_cur.stack[fr.func_slot + 1 .. th_cur.top];
         const res = self.auxwrapResume(th, args) catch |e| switch (e) {
             error.RuntimeError => return -1,
+            // unarmed raw-yield absorption: relay across this C frame
+            // with PUC status 0 on the pad (the no-recovery fact); the
+            // nearest conventional pcall / embedder boundary consumes
+            // it. This auxwrap activation is abandoned like PUC's.
+            error.YieldAbsorbed => {
+                if (self.c_error_jmp) |jb| {
+                    self.c_error_status = 1; // LUA_YIELD sentinel: the raw-yield absorption fact
+                    _longjmp(@ptrCast(jb), 1);
+                }
+                std.process.abort();
+            },
             // a main-destined closer error from the wrapped
             // coroutine re-throws on MAIN's armed boundary (PUC
             // ldo.c:130-138) — relay across this C frame with the pad
@@ -28963,6 +29185,16 @@ pub const Vm = struct {
         const vals = res catch |e| switch (e) {
             error.RuntimeError => return -1,
             error.MainDestined => return -3,
+            // unarmed raw-yield absorption: relay with PUC status 0 —
+            // the nearest conventional pcall / embedder boundary
+            // consumes it (this activation is abandoned like PUC's).
+            error.YieldAbsorbed => {
+                if (self.c_error_jmp) |jb| {
+                    self.c_error_status = 1; // LUA_YIELD sentinel: the raw-yield absorption fact
+                    _longjmp(@ptrCast(jb), 1);
+                }
+                std.process.abort();
+            },
             error.OutOfMemory => {
                 if (self.c_error_jmp) |jb| {
                     self.setOutOfMemoryError();
@@ -29837,8 +30069,17 @@ pub const Vm = struct {
             // thread is NOT finalized dead here — it stays a ZOMBIE with
             // status .running / api_status 0 (LUA_OK), frames intact, a
             // later resume rejected as "non-suspended" exactly like PUC's
-            // abandoned caller.
-            if (th.status == .running and !main_destined) {
+            // abandoned caller. An in-flight unarmed raw-yield absorption
+            // (raw_yield_absorb_pending — set by the transport, cleared
+            // only at MAIN's consuming pcall) gets the SAME zombie
+            // treatment: the absorption rethrow bypasses every
+            // intermediate resume boundary on its way to main (PUC: the
+            // longjmp skips them all), so a drive that is still on the
+            // propagation path when its defers run must not latch its
+            // thread dead either.
+            if (th.status == .running and !main_destined and
+                !self.raw_yield_absorb_pending)
+            {
                 th.status = .dead;
                 // P16.50-review-5 B1: an OOM error carries status 4 — the
                 // error object is the FIXED interned "not enough memory"
@@ -30591,6 +30832,12 @@ pub const Vm = struct {
                                     main_destined = true;
                                     return e;
                                 },
+                                // unarmed raw-yield absorption — same
+                                // zombie exit: propagate raw toward the
+                                // resume boundary / main's conventional
+                                // pcall (the no-recovery suppression
+                                // kept the frames).
+                                error.YieldAbsorbed => return e,
                                 error.RuntimeError, error.OutOfMemory => {
                                     if (e == error.OutOfMemory) self.setOutOfMemoryError();
                                     if (e == error.RuntimeError and th.yieldedValues() != null and th.capture_yield_id != 0) {
@@ -30666,6 +30913,12 @@ pub const Vm = struct {
                                 main_destined = true;
                                 return e;
                             },
+                            // unarmed raw-yield absorption — same
+                            // zombie exit: propagate raw toward the
+                            // resume boundary / main's conventional
+                            // pcall (the no-recovery suppression
+                            // kept the frames).
+                            error.YieldAbsorbed => return e,
                             error.RuntimeError, error.OutOfMemory => {
                                 if (e == error.OutOfMemory) self.setOutOfMemoryError();
                                 if (e == error.RuntimeError and th.yieldedValues() != null and th.capture_yield_id != 0) {
@@ -34926,7 +35179,7 @@ pub const Vm = struct {
                 // only an explicit coroutine.close/lua_closethread runs them).
                 // The per-frame parked stacks are freed by freeThreadBytecode
                 // Frames' per-frame teardown (freeCFrameOwnedState).
-                th.c_tbc_chain.deinit(self.alloc);
+                th.c_tbc_chain.deinit(self.infraAlloc());
                 // Free all optional []Value buffers on the Thread.
                 th.yielded.deinit(self.alloc);
                 th.resume_inbox.deinit(self.alloc);
@@ -36863,7 +37116,7 @@ pub const Vm = struct {
         // execution happens, only parsing/compilation/undump which are
         // synchronous and never yield).
         return self.loadChunkImpl(input, bytes, chunk_name, mode, env, pinned_chunk_name) catch |err| switch (err) {
-            error.OutOfMemory, error.RuntimeError, error.Yield, error.MainDestined => |e| return e,
+            error.OutOfMemory, error.RuntimeError, error.Yield, error.MainDestined, error.YieldAbsorbed => |e| return e,
             error.ThreadSwitch => unreachable, // can't happen during loading
         };
     }
@@ -37340,6 +37593,8 @@ pub const Vm = struct {
             // propagate — the load builtin's caller chain carries
             // the kind to main's boundary (loading itself never raises it).
             error.MainDestined => return error.MainDestined,
+            // same proof — loading never raises it; identity.
+            error.YieldAbsorbed => return error.YieldAbsorbed,
         };
         switch (result) {
             .closure => |cl| {
@@ -48808,6 +49063,48 @@ pub const Vm = struct {
         }
     }
 
+    /// TBC transfer reserve: keep the thread-owned chain's capacity ahead of
+    /// every outstanding frame-owned <close> reg plus the one mark being
+    /// registered, so the error-unwind transfer (detachLuaFrameTbcMarks)
+    /// never allocates. PUC threads its tbclist through stack slots and is
+    /// allocation-free from registration to close; the heap-backed chain
+    /// buys that same property by reserving AT REGISTRATION — a failure
+    /// here means the mark was never registered (no close obligation
+    /// exists) and surfaces as the registration site's own OOM error.
+    /// Every growth point of the chain or the regs calls this BEFORE
+    /// appending; all other mutations only shrink lengths or retain
+    /// capacity, so the invariant
+    /// `chain.capacity >= chain.items.len + bytecode_tbc_regs.items.len`
+    /// holds between registrations.
+    ///
+    /// Owner: the chain buffer is infra-owned END-TO-END — this reserve,
+    /// every append/insert, and all three deinit sites
+    /// (destroyUnregisteredThread, gcFreeObject(.thread),
+    /// p50TeardownThread) run through infraAlloc, the same single owner
+    /// as bytecode_tbc_regs. PUC's per-mark registration allocates
+    /// nothing (luaF_newtbcupval threads the mark through the stack
+    /// slot), so the chain is infra bookkeeping with no PUC allocation
+    /// counterpart: charging its growth to the state allocator would
+    /// count allocations PUC never makes, and a testC countdown must not
+    /// fail a registration PUC performs for free. infraAlloc resolves to
+    /// the constructor allocator until a testC adapter is installed and
+    /// back to it after teardown; the installed wrappers
+    /// (installTestcAdapter / testcInstallAdapterOverBase) record the
+    /// constructor allocator as their base, so the resolved identity is
+    /// the SAME allocator for the chain's whole life and the buffer never
+    /// migrates between allocator identities. A wrapper that recorded a
+    /// DIFFERENT base would break that no-transfer proof — the adapter
+    /// passes foreign (infra-owned) blocks through to its base, but the
+    /// base has no pass-through for adapter-charged memory, so mixed
+    /// ownership of one buffer is unrepresentable. A real base
+    /// exhaustion still fails the reserve BEFORE the obligation exists.
+    pub fn reserveTbcChainMark(self: *Vm, th: *Thread) std.mem.Allocator.Error!void {
+        try th.c_tbc_chain.ensureTotalCapacity(
+            self.infraAlloc(),
+            th.c_tbc_chain.items.len + th.bytecode_tbc_regs.items.len + 1,
+        );
+    }
+
     /// Escape detach: convert a dying Lua frame's pending
     /// TBC obligations into detached c_tbc_chain marks WITHOUT running any
     /// closer. PUC parity: lua_resume's error path (ldo.c) never runs
@@ -48845,17 +49142,19 @@ pub const Vm = struct {
     /// coroutine.close's closeThreadRegionsOnClosedThread
     /// (luaE_resetthread → closeprotected, err = the thread's stored
     /// error object) for a failed resume.
-    noinline fn detachLuaFrameTbcMarks(self: *Vm, th: *Thread, frame: *const CallFrame) DispatchError!void {
+    ///
+    /// INFALLIBLE by the registration-time reserve (reserveTbcChainMark):
+    /// the invariant guarantees capacity for all n inserts, so an OOM can
+    /// never abort this transfer — a failing transfer inside an error
+    /// unwind would drop registered marks and replace the in-flight error
+    /// (the abort cleanup used to swallow the failure with a lost
+    /// obligation). detachTbcRegion above is in-place; the inserts are
+    /// capacity-assumed.
+    noinline fn detachLuaFrameTbcMarks(self: *Vm, th: *Thread, frame: *const CallFrame) void {
         self.detachTbcRegion(th, frame.tbc_chain_base);
         const n = th.bytecode_tbc_regs.items.len - frame.tbc_mark;
         if (n == 0) return;
-        // Fallible reserve -> infallible inserts: a failure below must not
-        // leave a partial insertion (a re-detach after the OOM unwinds as a
-        // new error would duplicate the already-inserted marks, double-
-        // closing them later). ensureTotalCapacity leaves the chain
-        // untouched on failure; detachTbcRegion above is in-place and
-        // idempotent, so the retry state stays consistent.
-        try th.c_tbc_chain.ensureTotalCapacity(self.alloc, th.c_tbc_chain.items.len + n);
+        std.debug.assert(th.c_tbc_chain.capacity >= th.c_tbc_chain.items.len + n);
         const base = frame.frameBase();
         const cap = frame.frameCap();
         var i = th.bytecode_tbc_regs.items.len;
@@ -49808,6 +50107,18 @@ pub const Vm = struct {
         /// (zombie parity: PUC abandons the intermediate C activations;
         /// the consumer on main restores its own frame level).
         main_destined,
+        /// typed transport: an UNARMED raw-call yield (PUC luaD_throw's
+        /// no-errorJmp arm with LUA_YIELD): the target thread was already
+        /// reset (luaE_resetthread YIELD→OK replica — window discarded,
+        /// frames dropped) and the "error object" (the target's base-func
+        /// slot) was copied to MAIN's top; the pad longjmp carried PUC
+        /// status 0 (LUA_OK — the luaD_pcall absorption hole: a
+        /// conventional pcall sees OK, runs NO recovery, and finishpcall
+        /// returns the live stale-anchored window as success). The
+        /// C-frame stays in place as the window anchor for the absorbing
+        /// pcall; the consumer is the nearest conventional pcall (or the
+        /// api boundary mapping it to LUA_OK).
+        yield_absorbed,
     };
 
     /// ONE shared protected-C-boundary contract for both `_setjmp`
@@ -49938,7 +50249,10 @@ pub const Vm = struct {
             // callback that caught `error.MainDestined` from a relaying
             // API entry (e.g. `api.State.gc`) and completes the transport
             // with this sentinel instead of longjmping across its own
-            // Zig defers (the object is in MAIN's err state).
+            // Zig defers (the object is in MAIN's err state), -4 = the
+            // same completion for `error.YieldAbsorbed` (an unarmed
+            // raw-yield absorption relayed from a relaying API entry;
+            // the absorption fact rides the boundary's status sentinel).
             // The old i32 passthrough encoded these as
             // plain negatives; the union maps them to the same outcomes
             // without colliding with ThreadSwitch.
@@ -49952,6 +50266,7 @@ pub const Vm = struct {
             if (raw >= 0) return .{ .ok = @intCast(raw) };
             if (raw == -2) return .yield;
             if (raw == -3) return .main_destined;
+            if (raw == -4) return .yield_absorbed;
             return .{ .lua_err = 2 }; // LUA_ERRRUN (testC error sentinel)
         }
         // `_longjmp` landing — BEFORE decoding the status: the payload
@@ -49987,9 +50302,16 @@ pub const Vm = struct {
             return .main_destined;
         }
         {
-            const st: c_int = if (self.c_error_status != 0) self.c_error_status else 2;
+            // Sentinel status 1 (LUA_YIELD) on this landing = the unarmed
+            // raw-yield rethrow (the reset+copy transport). 1 is free on
+            // this lane: every error producer writes 2/4/5 (or leaves the
+            // 0 default, which maps to LUA_ERRRUN below — many longjmp(1)
+            // sites set only the object, not the status); the yield
+            // channel itself lands on sj==2, never here.
+            const st: c_int = self.c_error_status;
             self.c_error_status = 0;
-            return .{ .lua_err = st };
+            if (st == 1) return .yield_absorbed;
+            return .{ .lua_err = if (st != 0) st else 2 };
         }
     }
 
@@ -50083,6 +50405,21 @@ pub const Vm = struct {
         // is the BoundaryResult union — no magic negatives.
         const nret_signed = self.callCFunctionWithBoundary(cf);
 
+        // A transport inside this activation (the unarmed raw-yield
+        // transport or a cross-close error rethrow) may have already
+        // POPPED this C-frame: PUC luaE_resetthread's resetCI cuts the
+        // target's whole ci chain and the re-throw on MAIN's armed
+        // boundary abandons every intermediate activation mid-flight.
+        // When this activation's frame lives on the TARGET thread (a
+        // cross-thread direct call — lua_callk on another thread's
+        // handle), the transport's reset-close pops it and the longjmp
+        // lands on THIS pad: the activation is a zombie. Its owned state
+        // (incl. the result-transport reserve) was already released by
+        // the pop's freeCFrameOwnedState — no arm below may touch the
+        // frame. (The transport leaves the target at [base frame] only,
+        // so an out-of-range index is exactly the popped case.)
+        const frame_popped = my_cframe_idx >= th.call_frames.len();
+
         if (nret_signed == .yield) {
             // P15.78: `lua_yieldk` yielded. The yield values are already
             // stored by `builtinCoroutineYield` (a span into th.stack or
@@ -50094,7 +50431,7 @@ pub const Vm = struct {
             // not this epilogue — release the armed tail reserve (the
             // parked frame's delivery lanes never read it; the buffer's
             // lifetime stays bounded to the synchronous activation).
-            self.cResultTransportRelease(th.call_frames.getPtr(my_cframe_idx));
+            if (!frame_popped) self.cResultTransportRelease(th.call_frames.getPtr(my_cframe_idx));
             return error.Yield;
         }
 
@@ -50107,7 +50444,7 @@ pub const Vm = struct {
             // resume. The switch itself is processed by the active
             // trampoline (error.ThreadSwitch). Same as the yield arm: the
             // results bypass this epilogue — release the tail reserve.
-            self.cResultTransportRelease(th.call_frames.getPtr(my_cframe_idx));
+            if (!frame_popped) self.cResultTransportRelease(th.call_frames.getPtr(my_cframe_idx));
             return error.ThreadSwitch;
         }
 
@@ -50126,11 +50463,39 @@ pub const Vm = struct {
             // state. The consumer on main (or the next relay) decides the
             // fate; this arm only propagates the kind. The abandoned
             // activation cannot consume its reserved return tail.
-            self.cResultTransportRelease(th.call_frames.getPtr(my_cframe_idx));
+            if (!frame_popped) self.cResultTransportRelease(th.call_frames.getPtr(my_cframe_idx));
             return error.MainDestined;
         }
 
+        if (nret_signed == .yield_absorbed) {
+            // typed transport: an UNARMED raw-call yield rethrown on this
+            // pad with PUC status 0 (the transport already reset the
+            // target thread and copied its base-func slot to this
+            // thread's top). PUC luaD_pcall with status OK runs NO
+            // recovery: the abandoned C activation's window (now topped
+            // by the copied value) stays live and is claimed by the
+            // nearest conventional pcall as its success results. Keep
+            // the C-frame as the window anchor (the absorbing pcall
+            // reads cWindowBase..top and unwinds the frame itself);
+            // release the tail reserve like every non-normal exit.
+            // frame_popped (the raw yield fired inside a cross-thread
+            // direct call — this activation's frame WAS the target's
+            // transient frame): the reset already unwound it; the
+            // absorbing pcall anchors on the CALLER's window (the
+            // transport copied the base-func slot onto it) — propagate
+            // the kind only.
+            if (!frame_popped) self.cResultTransportRelease(th.call_frames.getPtr(my_cframe_idx));
+            return error.YieldAbsorbed;
+        }
+
         if (nret_signed == .lua_err) {
+            if (frame_popped) {
+                // Zombie (the transport's OOM relay longjmp'd with the
+                // frame already unwound): the transport installed the
+                // canonical error state on the target before the jump —
+                // propagate the kind only, no frame access, no pop.
+                return if (nret_signed.lua_err == 4) error.OutOfMemory else error.RuntimeError;
+            }
             // The errored activation's return tail is void — release its
             // armed reserve before any error-state work below.
             self.cResultTransportRelease(th.call_frames.getPtr(my_cframe_idx));
@@ -50206,6 +50571,19 @@ pub const Vm = struct {
             .ok => |cnt| cnt,
             else => unreachable, // handled above
         };
+        // PUC luaD_poscall retires every activation above the returning
+        // frame (L->ci = ci->previous): a nested conventional pcall that
+        // converted an absorbed raw yield to OK leaves the abandoned callee
+        // activations above this frame (the no-recovery suppression kept
+        // them). Drop them here — marks pop-detach into the chain (the
+        // region close below closes them), and the stack top is PRESERVED
+        // (PUC poscall moves no slots; the host's return values and the
+        // transported window live above the dropped frames' bases).
+        if (th.call_frames.len() > my_cframe_idx + 1) {
+            const saved_epilogue_top = th.top;
+            self.unwindBytecodeExecFrames(&th.call_frames, my_cframe_idx + 1);
+            th.top = saved_epilogue_top;
+        }
         const wbase = fs + 1;
         const result_start: usize = if (th.top >= nret and th.top - nret >= wbase) th.top - nret else wbase;
         const actual_nret: usize = th.top - result_start;
@@ -51374,6 +51752,16 @@ pub const Vm = struct {
             error.RuntimeError => -1,
             error.MainDestined => -3,
             error.Yield => -2,
+            // unarmed raw-yield absorption: relay with PUC status 0 —
+            // the nearest conventional pcall / embedder boundary
+            // consumes it (this activation is abandoned like PUC's).
+            error.YieldAbsorbed => {
+                if (self.c_error_jmp) |jb| {
+                    self.c_error_status = 1; // LUA_YIELD sentinel: the raw-yield absorption fact
+                    _longjmp(@ptrCast(jb), 1);
+                }
+                std.process.abort();
+            },
             error.OutOfMemory => {
                 if (self.c_error_jmp) |jb| {
                     self.setOutOfMemoryError();
@@ -51391,6 +51779,288 @@ pub const Vm = struct {
                 std.process.abort();
             },
         };
+    }
+
+    // PUC luaD_throw for the raw-call context (prototype replica of
+    // c_api.zig's cThrowOn plus the unarmed-target arm of
+    // crossCloseErrorRaise). `cross` says the target thread was NOT the
+    // active thread at raw-call entry, so the armed C boundary (if any)
+    // belongs to ANOTHER thread's activation and a direct jump from this
+    // target would be PUC's cross-thread throw, not a same-thread one:
+    /// PUC luaD_throw's no-errorJmp arm for a raw LUA_YIELD (ldo.c:125-147):
+    /// `errcode = luaE_resetthread(L, LUA_YIELD)` — YIELD converts to LUA_OK
+    /// inside the reset (resetCI: base_ci.func = stack[0], L->status =
+    /// LUA_OK, errfunc cleared), `luaD_closeprotected(L, 1, LUA_OK)` closes
+    /// EVERY mark (c_tbc_chain entries AND the bytecode TBC regs of parked
+    /// Lua frames, yy=0, last-error-wins), then `L->status = errcode` (0,
+    /// or 2/4 when a closer errored) and the target's `top-1` value (the
+    /// base func slot sentinel on OK; the error object at stack+1 on a
+    /// closer error) is copied onto MAIN's live top before the re-throw on
+    /// MAIN's armed boundary. Fully thread-explicit: works whether or not
+    /// `th` is the active runtime (the adapter lane has it active via the
+    /// cross authority; the C-API lua_yieldk lane operates on the target's
+    /// window without any authority switch).
+    /// PUC ldo.c:139-146 (luaD_throw's no-handler branch): the terminal for
+    /// a rethrow that finds NO armed boundary on main — the panic hook
+    /// (`lua_atpanic`) runs with the ORIGINAL throwing thread, which reads
+    /// the object at its window top (installed by the thrower's
+    /// publish-then-jump contract), and then the process aborts (PUC's
+    /// abort() is silent after the hook). The handle is best-effort: the
+    /// transport's callers always reached the target through its own C-API
+    /// handle, so this normally finds `api_handle` cached; an allocation
+    /// failure here skips only the hook, which runs once immediately
+    /// before the terminal abort (the same best-effort contract as
+    /// cPanicOn's message install in c_api.zig).
+    pub fn panicHookAbort(self: *Vm, thrower: ?*Thread) noreturn {
+        if (thrower) |th| {
+            self.ensureThreadApiHandle(th) catch {};
+            if (th.api_handle) |h| {
+                if (self.c_panicf) |pf| _ = pf(h);
+            }
+        }
+        std.process.abort();
+    }
+
+    pub fn unarmedRawYieldTransport(self: *Vm, th: *Thread) noreturn {
+        const main_th = self.main_thread.?;
+
+        // ---- luaE_resetthread(th, LUA_YIELD): resetCI + closeprotected ----
+        const final_err: ?Value = self.unarmedResetClose(th) catch |e| switch (e) {
+            // A nested unarmed raw-yield transport fired inside a closer
+            // of THIS reset (PUC: the nested rethrow longjmps straight to
+            // MAIN and the outer resetthread NEVER finishes — the outer
+            // target stays a mid-close zombie with status LUA_YIELD).
+            // Relay the in-flight absorption toward its consumer on main;
+            // the outer target's zombie state (status .running — the
+            // drive's finalization defer suppressed the dead latch via
+            // raw_yield_absorb_pending) is the documented Zig-side
+            // approximation of PUC's status-YIELD zombie (residual: the
+            // PUC classification of a mid-close-abandoned target).
+            error.YieldAbsorbed => {
+                if (self.c_error_jmp) |jb| {
+                    self.c_error_status = 1; // LUA_YIELD sentinel
+                    _longjmp(@ptrCast(jb), 1);
+                }
+                // No pad anywhere: PUC panics with the INNER throwing
+                // thread — the inner transport recorded it in
+                // raw_yield_absorb_thrower before its longjmp.
+                self.panicHookAbort(self.raw_yield_absorb_thrower);
+            },
+            // A nested cross-close error transport fired inside a closer:
+            // the nested transport already installed MAIN's err state and
+            // latched ITS target — relay the kind (value 4) toward main.
+            error.MainDestined => {
+                if (self.c_error_jmp) |jb| {
+                    _longjmp(@ptrCast(jb), 4);
+                }
+                // No pad anywhere: PUC panics with the INNER throwing
+                // thread — the inner transport recorded it in
+                // main_destined_thrower before its longjmp.
+                self.panicHookAbort(self.main_destined_thrower);
+            },
+            // The drive's own machinery OOM (PUC's reset is allocation-
+            // free; the Zig drive allocates for the resume tuple): treat
+            // as a closer ERRMEM — resetthread's seterrorobj(ERRMEM)
+            // publishes the FIXED pre-interned object (allocation-free).
+            error.OutOfMemory => .{ .String = self.oom_msg_str.? },
+            // Defensive: a machinery RuntimeError (the close paths latch
+            // closer errors into the result tuple instead of propagating
+            // them, so this arm is not expected to fire).
+            else => if (th.err_has_obj) th.err_obj else .Nil,
+        };
+
+        if (final_err) |fe| {
+            // Closer error (PUC resetthread's seterrorobj tail + luaD_throw's
+            // `L->status = errcode`): the target dies with the FINAL error
+            // latched (last-error-wins) and the rethrow on MAIN carries the
+            // error status — the MainDestined channel (crossCloseErrorRaise's
+            // unarmed tail), consumed at MAIN's conventional pcall with FULL
+            // recovery (api.zig's thread-aware MainDestined arm).
+            const status: i32 =
+                if (fe == .String and fe.String == self.oom_msg_str) 4 else 2;
+            th.status = .dead;
+            th.errfunc = ERRFUNC_NONE; // PUC resetCI
+            th.api_status = status; // PUC luaD_throw: L->status = errcode
+            th.close_has_err = true;
+            th.close_err = fe;
+            // PUC seterrorobj(status, stack+1): the error object at the
+            // target's window anchor (co_top=1), best-effort — the latch
+            // above already carries the object allocation-free.
+            th.top = cWindowBase(th);
+            self.cWindowPush(th, fe) catch {};
+            // MAIN's thread error state is the canonical owner of the
+            // in-flight object (crossCloseErrorRaise's unarmed tail —
+            // the consumer on main publishes from here).
+            main_th.err_has_obj = true;
+            main_th.err_obj = fe;
+            main_th.err_is_oom = status == 4;
+            main_th.err_is_errerr = false;
+            main_th.err_source = null;
+            main_th.err_line = -1;
+            self.err = if (fe == .String) fe.String.bytes() else null;
+            self.main_destined_thrower = th;
+            if (self.c_error_jmp) |jb| {
+                _longjmp(@ptrCast(jb), 4);
+            }
+            // PUC ldo.c:139-146: no armed boundary on main — panic hook
+            // with the throwing target (object already at its window
+            // top), then abort.
+            self.panicHookAbort(th);
+        }
+
+        // ---- OK absorption: L->status = 0, top = stack+1, copy, rethrow ----
+        th.status = .dead;
+        th.errfunc = ERRFUNC_NONE; // PUC resetCI
+        th.api_status = 0; // LUA_OK — PUC luaD_throw: L->status = errcode(0)
+        th.close_has_err = false;
+        th.close_err = .Nil;
+        // PUC resetthread: top = base_ci->func + 1 (the base frame's
+        // window anchor); the discarded window above it dies with the
+        // lowering of top.
+        if (th.call_frames.len() > 0) {
+            th.top = th.call_frames.getConstPtr(0).frameBase();
+        } else {
+            th.top = 1;
+        }
+        // PUC setobjs2s(mainth->top++, th->top - 1): copy the target's
+        // base func slot value onto MAIN's live top (above the abandoned
+        // host-callback window). Zig's checked window growth makes an OOM
+        // reachable where PUC relies on stack slack (no PUC counterpart);
+        // the failure relays as ERRMEM on the same pad.
+        const obj = th.stack[th.top - 1];
+        self.cWindowPushSlice(main_th, &[1]Value{obj}) catch {
+            if (self.c_error_jmp) |jb| {
+                // The absorption is NOT in flight on this arm (the OOM
+                // relay is an ordinary ERRMEM): clear the suppression
+                // flag BEFORE the jump — a stale flag would suppress
+                // every future intermediate unwind.
+                self.raw_yield_absorb_pending = false;
+                self.raw_yield_absorb_thrower = null;
+                self.setOutOfMemoryError();
+                self.latchErrmemRaiseWindow(self.activeBytecodeThread());
+                self.c_error_value = self.errThread().err_obj;
+                self.c_error_status = 4;
+                _longjmp(@ptrCast(jb), 1);
+            }
+            // Zig-only OOM relay with no pad anywhere: the panic-hook
+            // contract still holds (an unprotected error) — install the
+            // fixed ERRMEM object at the target's window top best-effort
+            // (cPanicOn's pattern) so the hook observes the exact object.
+            self.cWindowPush(th, .{ .String = self.oom_msg_str.? }) catch {};
+            self.panicHookAbort(th);
+        };
+        // The re-throw carries the absorption fact — the luaD_pcall
+        // hole: the catching conventional pcall on MAIN runs NO recovery
+        // and finishpcall returns the live stale-anchored window as
+        // success. Arm the no-recovery suppression for every intermediate
+        // unwind between here and the consumer. Sentinel status 1
+        // (LUA_YIELD) rides the pad — 0 is the lane's "unset" default
+        // (see the decode).
+        self.raw_yield_absorb_pending = true;
+        self.raw_yield_absorb_thrower = th;
+        self.c_error_status = 1;
+        if (self.c_error_jmp) |jb| {
+            _longjmp(@ptrCast(jb), 1);
+        }
+        // PUC ldo.c:139-146: no armed boundary on main — panic hook with
+        // the throwing target (the copied base-slot object is at its
+        // window top), then abort.
+        self.panicHookAbort(th);
+    }
+
+    /// The reset-close half of `unarmedRawYieldTransport` — PUC
+    /// `luaE_resetthread(th, LUA_YIELD)`'s closeprotected(1, LUA_OK) over
+    /// EVERY mark, returning the final closer error (last-error-wins) or
+    /// null on success. A suspended-mid-execution target (frames above
+    /// the base) is closed through the forced-close drive — the same
+    /// PUC-resetthread-shaped machinery `builtinCoroutineClose`'s
+    /// suspended arm uses (beginForcedClose + builtinCoroutineResume with
+    /// cur_handle on the target, so the __close closers run ON the
+    /// target's stack exactly like PUC drives them on the reset thread).
+    /// The drive's own entry consumes the parked suspension state
+    /// (yielded / yield_window_base / capture_yield_id) and its unroll
+    /// keys on bytecode_inplace_suspended — none of it is pre-cleared
+    /// here. A fresh or marks-only target (no frames above the base)
+    /// takes the light path: transient suspension bookkeeping cleared,
+    /// then the synchronous region close for any lingering detached
+    /// marks (closeThreadRegionsOnClosedThread, err=nil, yy=0).
+    fn unarmedResetClose(self: *Vm, th: *Thread) DispatchError!?Value {
+        if (!th.started) {
+            // Never-resumed target (PUC: ci == base_ci for a fresh thread —
+            // but a DIRECT C call on the handle (cross-thread lua_callk)
+            // legitimately pushes transient frames on it: the callee's own
+            // C/Lua frames). PUC resetCI just cuts the ci chain — tbclist
+            // entries survive untouched and close in the closeprotected
+            // below. Pop the transient frames with the same discipline:
+            // C-frame chain marks detach in popBuiltinCFrameOn; a Lua
+            // frame's OP_TBC <close> declarations detach FIRST
+            // (detachLuaFrameTbcMarks converts them to detached chain
+            // entries) — popBytecodeExecFrame alone would truncate the
+            // frame's bc_tbc_regs region and silently drop the obligations.
+            while (th.call_frames.len() > 0 and
+                !th.call_frames.getConstPtr(th.call_frames.len() - 1).isBase())
+            {
+                if (th.call_frames.getConstPtr(th.call_frames.len() - 1).isC()) {
+                    self.popBuiltinCFrameOn(th);
+                } else {
+                    self.detachLuaFrameTbcMarks(
+                        th,
+                        th.call_frames.getConstPtr(th.call_frames.len() - 1),
+                    );
+                    self.popBytecodeExecFrame(th, &th.call_frames);
+                }
+            }
+            th.yielded.deinit(self.alloc);
+            th.yield_window_base = null;
+            th.suspended_builtin = null;
+            th.capture_yield_id = 0;
+            th.bytecode_inplace_suspended = false;
+            if (th.c_tbc_chain.items.len > 0) {
+                return try self.closeThreadRegionsOnClosedThread(th, null, 0);
+            }
+            return null;
+        }
+        if (framesAtBase(th)) {
+            // Light path: no parked frames to unroll.
+            th.yielded.deinit(self.alloc);
+            th.yield_window_base = null;
+            th.suspended_builtin = null;
+            th.capture_yield_id = 0;
+            th.bytecode_inplace_suspended = false;
+            if (th.c_tbc_chain.items.len > 0) {
+                return try self.closeThreadRegionsOnClosedThread(th, null, 0);
+            }
+            return null;
+        }
+        // Forced-close drive. The drive's defers own close_mode/forced
+        // flags and the thread switch on BOTH the normal and the error
+        // return (Zig error propagation unwinds the drive's frames
+        // properly); only the ensureThreadApiHandle OOM below predates
+        // the drive's entry, so its failure restores manually.
+        self.beginForcedClose(th);
+        const saved_cur_handle = self.cur_handle;
+        self.ensureThreadApiHandle(th) catch {
+            self.cur_handle = saved_cur_handle;
+            self.clearForcedClose(th);
+            return error.OutOfMemory;
+        };
+        self.cur_handle = th.api_handle.?;
+        defer self.cur_handle = saved_cur_handle;
+        var resume_args = [_]Value{.{ .Thread = th }};
+        const rr = try self.builtinCoroutineResume(resume_args[0..]);
+        const rres = try self.resumeResultOwned(rr);
+        defer self.infraAlloc().free(rres);
+        // Defensive post-drive clears (the drive's completion arms run
+        // clearThreadContinuationScratch; these are belt-and-braces for
+        // the arms that complete through the unroll instead).
+        th.suspended_builtin = null;
+        th.yield_window_base = null;
+        const ok = switch (rres[0]) {
+            .Bool => |b| b,
+            else => false,
+        };
+        if (!ok) return if (rres.len > 1) rres[1] else .Nil;
+        return null;
     }
 
     fn builtinTestcMakeCfunc(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -52310,7 +52980,7 @@ pub const Vm = struct {
         // poscall_close = false: the sub-VM has no testC CallInfo; the
         // panic reset below closes the marks (PUC luaE_resetthread).
         _ = sub_vm.runTestcScript(script, ctx, win, false) catch |err| switch (err) {
-            error.RuntimeError, error.OutOfMemory, error.MainDestined => {
+            error.RuntimeError, error.OutOfMemory, error.MainDestined, error.YieldAbsorbed => {
                 // a MainDestined inside a checkpanic script is the
                 // same panic lane as RuntimeError (PUC: the sub-state has
                 // no errorJmp anywhere — the re-throw on the sub-main hits
@@ -52384,6 +53054,10 @@ pub const Vm = struct {
                             return;
                         },
                         error.Yield, error.ThreadSwitch => return self.fail("checkpanic: unexpected control flow in panic script", .{}),
+                        // the sub-VM has no pads anywhere: the transport
+                        // aborts before this arm can fire; keep the kind
+                        // unfolded for the impossible case.
+                        error.YieldAbsorbed => return error.YieldAbsorbed,
                     };
                     // PUC returns lua_tostring(L1, -1): the sub-VM stack top
                     // after the panic script. Fall back to the error message
@@ -52612,6 +53286,9 @@ pub const Vm = struct {
                     // close propagates the transported kind (the object is
                     // in MAIN's err state; the frames are the consumer's).
                     error.MainDestined => return @as(DispatchError!testc.RunResult, error.MainDestined),
+                    // unarmed raw-yield absorption: propagate the kind
+                    // (the frames are the consumer's — same zombie rule).
+                    error.YieldAbsorbed => return @as(DispatchError!testc.RunResult, error.YieldAbsorbed),
                 };
                 if (final_err) |fe| {
                     // A closer errored: all entries were closed with the
@@ -53766,7 +54443,13 @@ pub const Vm = struct {
                         if (top == .frame_slot and top.frame_slot.cframe_idx == mark_frame_idx and
                             top.frame_slot.slot_idx >= abs_slot) break :toclose_blk;
                     }
-                    try chain.append(self.alloc, .{ .frame_slot = .{
+                    // Reserve the unwind-transfer capacity BEFORE the mark
+                    // exists (reserveTbcChainMark): a failure here leaves
+                    // no obligation and surfaces as this command's own OOM
+                    // error (the existing `try` contract); the eventual
+                    // detach of this mark then never allocates.
+                    try self.reserveTbcChainMark(th);
+                    chain.appendAssumeCapacity(.{ .frame_slot = .{
                         .cframe_idx = mark_frame_idx,
                         .slot_idx = abs_slot,
                     } });
@@ -54464,6 +55147,13 @@ pub const Vm = struct {
                 const saved_errfunc = th_xpcall.errfunc;
                 th_xpcall.errfunc = ERRFUNC_NONE;
                 defer th_xpcall.errfunc = saved_errfunc;
+                // PUC luaD_pcall's old_top (lapi.c f_call's savestack): the
+                // TBC-chain snapshot at pcall ENTRY. The catch below closes
+                // every chain entry above it (luaD_closeprotected) — the
+                // errored callee's OP_TBC marks were pop-detached by the
+                // unwind and own no frame anymore; without the close they
+                // would stay in the chain as stale GC roots forever.
+                const tbc_base = th_xpcall.c_tbc_chain.items.len;
                 const ret = self.apiCall(.nonyieldable, callee, call_args) catch |call_err| {
                     // P16.50-review-5: an OOM from the call PROLOGUE (frame
                     // push / stack growth) propagates without an error
@@ -54483,6 +55173,22 @@ pub const Vm = struct {
                         self.testc_obj_threads = obj_threads_before_call;
                         self.testc_obj_strings = obj_strings_before_call;
                     }
+                    // PUC luaD_pcall (ldo.c:1090-1095): on error, restore
+                    // the stack to the base, run
+                    // luaD_closeprotected(old_top, status) — every TBC
+                    // chain entry above the pcall-entry snapshot closes
+                    // WITH the in-flight error, non-yieldable (yy=0),
+                    // last-error-wins (a closer error REPLACES the error
+                    // object). Same recovery close as api.State.pcall's
+                    // catch (the conventional-pcall lanes): the testC
+                    // "pcall" command is lua_pcall → f_call →
+                    // luaD_callnoyield under luaD_pcall.
+                    self.apiCloseConventionalPcallBoundary(th_xpcall, tbc_base);
+                    // PUC luaD_seterrorobj AFTER closeprotected: a closer
+                    // error REPLACES the in-flight error object
+                    // (last-error-wins); on a clean close the close echoes
+                    // the incoming object back (a no-op re-install).
+                    const errv_final = self.protectedErrorValue();
                     // PUC model: the message handler receives the exact
                     // error object — no source-location stripping. The error
                     // object is the exact Lua value from error() or fail().
@@ -54491,7 +55197,7 @@ pub const Vm = struct {
                     if (handler_val) |h| {
                         var hargs = [_]Value{handler_errv};
                         const hret = self.apiCall(.nonyieldable, h, hargs[0..]) catch {
-                            try win.push(errv);
+                            try win.push(errv_final);
                             last_status.* = "ERRRUN";
                             return null;
                         };
@@ -54502,9 +55208,9 @@ pub const Vm = struct {
                             try win.push(.Nil);
                         }
                     } else {
-                        try win.push(errv);
+                        try win.push(errv_final);
                     }
-                    last_status.* = if (isTestcMemoryErrorValue(errv))
+                    last_status.* = if (isTestcMemoryErrorValue(errv_final))
                         "not enough memory"
                     else
                         "ERRRUN";
@@ -59930,7 +60636,7 @@ fn p50TeardownThread(vm: *Vm, th: *Thread, decrement_counter: bool) void {
     vm.freeThreadBytecodeFrames(th);
     vm.closeThreadOpenUpvalues(th, .teardown);
     vm.freeThreadRuntime(th);
-    th.c_tbc_chain.deinit(vm.alloc);
+    th.c_tbc_chain.deinit(vm.infraAlloc());
     th.yielded.deinit(vm.alloc);
     th.resume_inbox.deinit(vm.alloc);
     vm.gcNoteFree(@sizeOf(Thread));

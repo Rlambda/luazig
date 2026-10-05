@@ -17,6 +17,11 @@ pub const ApiError = std.mem.Allocator.Error || error{
     // C-API shims relay it across the current C frame (cRelayMainDestined)
     // instead of folding it into a caller-local throw.
     MainDestined,
+    // typed transport: an unarmed raw-yield absorption in flight (see
+    // Vm.Error.YieldAbsorbed — PUC luaD_throw's no-errorJmp arm rethrown
+    // on main with status LUA_OK). Identity-mapped; the nearest
+    // conventional pcall or embedder boundary consumes it.
+    YieldAbsorbed,
 };
 
 pub const Type = enum(u8) {
@@ -477,8 +482,10 @@ pub const State = struct {
     /// the callback's boundary decodes it to `error.MainDestined`, which
     /// propagates to the pcall consumer on main (the same transport the
     /// C ABI's lua_gc gives C embedders). Never longjmp out of this call
-    /// directly: the jump would cross arbitrary Zig defers.
-    pub fn gc(self: *State, what: i32, data: i32) error{MainDestined}!i32 {
+    /// directly: the jump would cross arbitrary Zig defers. An unarmed
+    /// raw-yield absorption from a finalizer relays the same way (the
+    /// C-conv callback completes it with the -4 shim sentinel).
+    pub fn gc(self: *State, what: i32, data: i32) error{ MainDestined, YieldAbsorbed }!i32 {
         return self.vm.apiGc(what, data);
     }
 
@@ -937,6 +944,8 @@ pub const State = struct {
             // kind (no user code); propagate it unfolded if a nested path
             // ever produces one.
             error.MainDestined => return error.MainDestined,
+            // same proof — identity propagation, never folded.
+            error.YieldAbsorbed => return error.YieldAbsorbed,
         };
     }
 
@@ -1141,7 +1150,7 @@ pub const State = struct {
         return self.loadbuffer(source.bytes, source.name);
     }
 
-    pub fn pcall(self: *State, nargs: usize, nresults: i32) error{MainDestined}!Status {
+    pub fn pcall(self: *State, nargs: usize, nresults: i32) error{ MainDestined, YieldAbsorbed }!Status {
         const th = self.curThread();
         if (self.count() < nargs + 1) return .runtime_error;
         const func_slot = th.top - nargs - 1;
@@ -1188,6 +1197,24 @@ pub const State = struct {
         th.protected_depth += 1;
         defer th.protected_depth -= 1;
         const ret = self.vm.apiCall(.nonyieldable, callee, args) catch |e| {
+            // PUC luaD_pcall with status LUA_OK (the unarmed raw-yield
+            // rethrow absorbed here): NO recovery — the abandoned callee
+            // window (topped by the transported base-func value) stays
+            // live; the client reads it from the stale-anchored top
+            // (PUC: L->ci stays at the abandoned activation; lua_pcallk
+            // returns LUA_OK and the C client continues).
+            // PUC ldo.c:130-138: the rethrow lands on MAIN's armed
+            // boundary ONLY — an intermediate conventional pcall running
+            // on a coroutine mid-resume is a zombie (bypassed, never
+            // consumed), exactly like the MainDestined arm below.
+            if (e == error.YieldAbsorbed) {
+                if (act != self.vm.main_thread.?) {
+                    return error.YieldAbsorbed;
+                }
+                self.vm.raw_yield_absorb_pending = false;
+                self.vm.raw_yield_absorb_thrower = null;
+                return .ok;
+            }
             // typed transport: a main-destined closer error caught
             // on a NON-main thread must NOT be consumed here — PUC
             // ldo.c:130-138 re-throws it on MAIN's armed boundary,
@@ -1940,6 +1967,10 @@ pub fn mapVmError(err: vm_mod.Vm.Error) ApiError {
         // identity — the kind stays visible to the C-API shim,
         // which relays it (never a caller-local throw).
         error.MainDestined => error.MainDestined,
+        // identity — the unarmed raw-yield absorption rides the pad
+        // chain (never a caller-local throw); consumed by the nearest
+        // conventional pcall / embedder boundary.
+        error.YieldAbsorbed => error.YieldAbsorbed,
     };
 }
 
@@ -1956,6 +1987,8 @@ fn mapDispatchError(err: vm_mod.Vm.DispatchError) ApiError {
         error.ThreadSwitch => @panic("api: thread-switch crossed a host API boundary"),
         // identity — see mapVmError.
         error.MainDestined => error.MainDestined,
+        // identity — see mapVmError.
+        error.YieldAbsorbed => error.YieldAbsorbed,
     };
 }
 
@@ -1980,6 +2013,8 @@ pub fn mapCompileError(err_val: CompileError) Status {
         // compiling runs no user code, so the kind is unreachable on
         // this path — fail loudly instead of folding it into ERRRUN.
         error.MainDestined => @panic("api: main-destined error crossed a load boundary"),
+        // same proof — no user code runs during compilation.
+        error.YieldAbsorbed => @panic("api: raw-yield absorption crossed a load boundary"),
     };
 }
 
@@ -2438,13 +2473,15 @@ fn gcRelayTargetBody(L: ?*vm_mod.lua_State) callconv(.c) c_int {
     const vm = s.vm;
     const th = vm.current_thread.?;
     // PUC lua_toclose(L, 1): mark the OBJ argument's slot TBC in THIS C
-    // frame (the same chain append c_api's lua_toclose performs).
+    // frame (the same reserve+append c_api's lua_toclose performs — the
+    // reserve keeps the eventual unwind detach allocation-free).
     const abs_slot = vm_mod.Vm.cWindowSlot(th, 1) orelse return -1;
     const fi = th.call_frames.len() - 1;
-    th.c_tbc_chain.append(vm.alloc, .{ .frame_slot = .{
+    vm.reserveTbcChainMark(th) catch return -1;
+    th.c_tbc_chain.appendAssumeCapacity(.{ .frame_slot = .{
         .cframe_idx = fi,
         .slot_idx = abs_slot,
-    } }) catch return -1;
+    } });
     // PUC lua_yieldk(L, 0, 0, k): the shared entry reports a successful
     // yield as error.Yield; convert to the -2 yield sentinel.
     vm.luaYieldKShared(th, &.{}, 0, gcRelayKdone, 0) catch |e| switch (e) {
@@ -2467,6 +2504,9 @@ fn gcRelayZgcEntry(L: ?*vm_mod.lua_State) callconv(.c) c_int {
             gc_relay_witnessed = true;
             return -3;
         },
+        // same completion for an unarmed raw-yield absorption: the -4
+        // sentinel decodes to error.YieldAbsorbed at the boundary.
+        error.YieldAbsorbed => return -4,
     };
     return 0; // never reached when the relay fires
 }

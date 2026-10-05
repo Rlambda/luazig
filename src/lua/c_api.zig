@@ -128,6 +128,26 @@ pub const luaL_Buffer = extern struct {
 // C-specific functions (cannot be delegated to api.State)
 // ===========================================================================
 
+/// PUC lauxlib.c:1060-1071 `panic`: the default panic function installed
+/// by `luaL_newstate` via `lua_atpanic`. Prints the error object at the
+/// throwing state's top to stderr ("PANIC: unprotected error in call to
+/// Lua API (%s)"); a non-string object prints the fixed placeholder —
+/// `lua_type` avoids touching a possibly-invalid object, exactly like
+/// PUC's comment there. Write errors are ignored (best-effort last
+/// message before the abort).
+fn defaultPanic(L: ?*lua_State) callconv(.c) c_int {
+    const msg: [*:0]const u8 =
+        if (L != null and lua_type(L, -1) == 4) // LUA_TSTRING
+            lua_tolstring(L, -1, null) orelse "error object is not a string"
+        else
+            "error object is not a string";
+    var errw = stdio.stderr();
+    errw.writeAll("PANIC: unprotected error in call to Lua API (") catch {};
+    errw.writeAll(std.mem.span(msg)) catch {};
+    errw.writeAll(")\n") catch {};
+    return 0; // return to Lua to abort
+}
+
 pub export fn luaL_newstate() ?*lua_State {
     const alloc = std.heap.c_allocator;
     // (b) status contract: lua_newstate returns NULL on failure (PUC
@@ -138,11 +158,17 @@ pub export fn luaL_newstate() ?*lua_State {
     // loadChunk → compileTextChunk works on C API states (matching the
     // CLI which sets this via setDynamicBytecodeCompiler).
     vm.dynamic_bytecode_compiler = vm_mod.defaultBytecodeCompiler;
-    return vm.setupMainHandle() catch {
+    const h = vm.setupMainHandle() catch {
         vm.deinit();
         alloc.destroy(vm);
         return null;
     };
+    // PUC luaL_newstate (lauxlib.c:1129-1137): install the default panic
+    // function — the hook every unprotected terminal (luaD_throw's
+    // no-handler branch, the unarmed transport's no-pad terminals) runs
+    // before aborting.
+    vm.c_panicf = &defaultPanic;
+    return h;
 }
 
 pub export fn lua_close(L: ?*lua_State) void {
@@ -258,6 +284,8 @@ pub fn luaNewThreadTx(parent: *vm_mod.lua_State, vmp: *Vm) error{ OutOfMemory, R
         // unreachable by the same proof (no user code runs).
         error.Yield => unreachable,
         error.MainDestined => unreachable,
+        // same proof — no user code runs in the growth path.
+        error.YieldAbsorbed => unreachable,
     };
     const th = try vmp.alloc.create(vm_mod.Thread);
     // Full teardown — the allocStateHandle failure window
@@ -401,6 +429,17 @@ pub export fn lua_closethread(L: ?*lua_State, from: ?*lua_State) c_int {
             return 2;
         },
         error.Yield => return 2,
+        // unarmed raw-yield absorption raised inside the close's
+        // metamethods: relay with PUC status 0 — the nearest
+        // conventional pcall / embedder boundary consumes it (this
+        // activation is abandoned like PUC's).
+        error.YieldAbsorbed => {
+            if (vm.c_error_jmp) |jb| {
+                vm.c_error_status = 1; // LUA_YIELD sentinel: the raw-yield absorption fact
+                _longjmp(jb, 1);
+            }
+            vm.panicHookAbort(vm.raw_yield_absorb_thrower);
+        },
         // a main-destined closer error raised inside the close's
         // __gc/__close metamethods re-throws on MAIN's armed boundary
         // (PUC ldo.c:130-138) — lua_closethread's status return never
@@ -559,12 +598,16 @@ pub export fn lua_error(L: ?*lua_State) noreturn {
 
 /// PUC `lua_call` (macro): expands to lua_callk(L, n, r, 0, NULL).
 pub export fn lua_call(L: ?*lua_State, nargs: c_int, nresults: c_int) void {
-    lua_callkImpl(L, nargs, nresults);
+    lua_callk(L, nargs, nresults, 0, null);
 }
 
 /// PUC `lua_callk` (lapi.c:1037-1056): call a function with optional
-/// continuation. If k != NULL and yieldable, save k/ctx in the current
-/// C-frame so the callee can yield. If k == NULL, the call is
+/// continuation. The callee and arguments are read from L's window and the
+/// call EXECUTES on L's own thread (PUC luaD_call pushes the callee's
+/// CallInfo on L's stack: a direct call on another thread's handle runs the
+/// callee on THAT thread, with L as its running state — not on the caller's
+/// thread). If k != NULL and yieldable, save k/ctx on L's current frame
+/// (PUC: L->ci — for a fresh coroutine, base_ci). If k == NULL, the call is
 /// non-yieldable (incnny).
 pub export fn lua_callk(
     L: ?*lua_State,
@@ -575,27 +618,6 @@ pub export fn lua_callk(
 ) void {
     const h = L orelse return;
     const vm = h.vm;
-    // PUC lapi.c:1041-1042: api_check(k == NULL || !isLua(L->ci),
-    // "cannot use continuations inside hooks") — unconditional in PUC.
-    // Placed BEFORE the current_thread fallback so a C hook on the MAIN
-    // state (current_thread == null there; the hook flag lives on
-    // main_thread.debug_hook) is checked too. Enforcement: deterministic
-    // runtime error converted to the C boundary via _longjmp (PUC aborts
-    // via lua_assert only in apicheck builds).
-    if (vm.current_thread orelse vm.main_thread) |th_check| {
-        vm.apiCheckHookContinuationInvariant(th_check, k != null, false, 0) catch {
-            if (vm.c_error_jmp) |jb| {
-                vm.c_error_value = vm.errThread().err_obj;
-                _longjmp(jb, 1);
-            }
-            @panic("lua_call hook api_check violation without an active C-function boundary");
-        };
-    }
-
-    const th = vm.current_thread orelse {
-        lua_callkImpl(L, nargs, nresults);
-        return;
-    };
 
     // Read callee/args from the anchored window (PUC: func = L->top -
     // (nargs+1)). The args are DUPED across the call boundary: the slice
@@ -621,7 +643,31 @@ pub export fn lua_callk(
         @panic("lua_call OOM without an active C-function boundary");
     };
 
-    // Delegate k/ctx saving + apiCall to the shared helper (PUC lapi.c:1047-1053).
+    // Cross-thread direct call (the handle's thread is not the active
+    // runtime — e.g. a host C callback on MAIN calling lua_callk(co,...)):
+    // activate the handle's thread as the execution authority for the
+    // whole call — the proven sync-close cross-thread pattern
+    // (enterSyncCloseContext: current_thread/cur_handle switch, caller
+    // status mirror, hook cache refresh). The context is restored on EVERY
+    // exit, including before each _longjmp relay below: a throw from inside
+    // the callee lands at the callee's own armed boundary (armed inside
+    // this activation) and returns here as a Zig error first, so the
+    // restore always runs before control leaves this frame.
+    const cross = wth != vm.activeBytecodeThread();
+    var xctx: ?Vm.SyncCloseContext = null;
+    if (cross) {
+        xctx = vm.enterSyncCloseContext(wth) catch {
+            vm.alloc.free(call_args);
+            if (vm.c_error_jmp) |jb| {
+                vm.c_error_value = .Nil;
+                _longjmp(jb, 1);
+            }
+            @panic("lua_call OOM without an active C-function boundary");
+        };
+    }
+
+    // Delegate the hook-continuation check (PUC: L->ci), k/ctx saving on
+    // L's current frame, and apiCall to the shared helper (lapi.c:1041-1053).
     const kfn: ?*const fn (?*vm_mod.lua_State, c_int, isize) callconv(.c) c_int = if (k) |kf|
         @ptrCast(@alignCast(kf))
     else
@@ -631,8 +677,41 @@ pub export fn lua_callk(
     // publication — see luaCallKShared).
     const fn_idx = func_slot - Vm.cWindowBase(wth);
 
-    const ret = vm.luaCallKShared(th, callee, call_args, nresults, fn_idx, kfn, ctx) catch |err| {
+    const ret = vm.luaCallKShared(wth, callee, call_args, nresults, fn_idx, kfn, ctx) catch |err| {
         vm.alloc.free(call_args);
+        // Capture the error object from the EXECUTION thread's error state
+        // BEFORE the context restore (errThread() resolves through the
+        // active thread; the raise installed the object on wth while the
+        // switch was active).
+        const err_obj: vm_mod.Value = if (err == error.RuntimeError)
+            vm.errThread().err_obj
+        else
+            .Nil;
+        // Cross-thread error transport (PUC luaD_throw's no-errorJmp
+        // branch, ldo.c:129-146): an error raised on the callee's thread
+        // under NO armed protection of its own — any active pcall/resume
+        // on wth sits BELOW this catch on the call chain and would have
+        // consumed the error first — resets the target (PUC
+        // luaE_resetthread: every mark closes with the error status,
+        // last-error-wins; the target dies with the final status and the
+        // final object at its window) and re-throws on MAIN with the
+        // final object. The shared transport (crossCloseErrorRaise — the
+        // proven sync-close site's machinery) runs BEFORE the context
+        // restore so the closers execute on wth through the switch; the
+        // kind relays after it. For OOM the fixed ERRMEM object is
+        // ensured first (idempotent — the raise usually installed it).
+        var cross_md = false;
+        var cross_throw: ?api.ApiError = null;
+        if (xctx != null and (err == error.RuntimeError or err == error.OutOfMemory)) {
+            if (err == error.OutOfMemory) vm.setOutOfMemoryError();
+            const cr = if (vm.crossCloseErrorRaise(xctx.?, wth, vm.errThread().err_obj))
+                error.MainDestined
+            else |re|
+                re;
+            if (cr == error.MainDestined) cross_md = true else cross_throw =
+                if (cr == error.OutOfMemory or err == error.OutOfMemory) error.OutOfMemory else error.Runtime;
+        }
+        if (xctx) |c| vm.restoreSyncCloseContext(c);
         switch (err) {
             error.Yield => {
                 if (vm.c_error_jmp) |jb| {
@@ -640,114 +719,75 @@ pub export fn lua_callk(
                 }
                 @panic("lua_call yield without an active C-function boundary");
             },
-            error.RuntimeError => {
+            error.RuntimeError, error.OutOfMemory => {
+                if (cross_md) {
+                    // The transport finalized wth (or a nested
+                    // main-destined raise from one of its closers
+                    // relayed through): MAIN's err state owns the final
+                    // object; relay the kind toward MAIN's consumer
+                    // (this activation is a zombie — PUC abandons
+                    // intermediate activations mid-flight).
+                    cRelayMainDestined(vm);
+                }
+                if (cross_throw) |t| {
+                    // Transport machinery failure (an ordinary re-throw —
+                    // the context is already restored above).
+                    if (t == error.OutOfMemory) {
+                        vm.setOutOfMemoryError();
+                        vm.latchErrmemRaiseWindow(vm.activeBytecodeThread());
+                        if (vm.c_error_jmp) |jb| {
+                            vm.c_error_value = vm.errThread().err_obj;
+                            vm.c_error_status = 4;
+                            _longjmp(jb, 1);
+                        }
+                        @panic("lua_call OOM without an active C-function boundary");
+                    }
+                    if (vm.c_error_jmp) |jb| {
+                        vm.c_error_value = err_obj;
+                        _longjmp(jb, 1);
+                    }
+                    @panic("lua_call without an active C-function boundary");
+                }
+                // Same-thread call: the caller's own armed boundary
+                // consumes the error directly (PUC L->errorJmp set — a
+                // plain throw, no reset).
                 if (vm.c_error_jmp) |jb| {
-                    vm.c_error_value = vm.errThread().err_obj;
+                    vm.c_error_value = err_obj;
                     _longjmp(jb, 1);
                 }
                 @panic("lua_call without an active C-function boundary");
-            },
-            error.OutOfMemory => {
-                if (vm.c_error_jmp) |jb| {
-                    vm.c_error_value = .Nil;
-                    _longjmp(jb, 1);
-                }
-                @panic("lua_call OOM without an active C-function boundary");
             },
             // a main-destined closer error from the callee relays
             // across this C frame (longjmp value 4) toward MAIN's armed
             // boundary — this activation becomes a zombie (PUC ldo.c
             // re-throw bypasses it).
             error.MainDestined => cRelayMainDestined(vm),
+            // unarmed raw-yield absorption from the callee: relay with
+            // PUC status 0 — the nearest conventional pcall / embedder
+            // boundary consumes it (this activation is abandoned).
+            error.YieldAbsorbed => {
+                if (vm.c_error_jmp) |jb| {
+                    vm.c_error_status = 1; // LUA_YIELD sentinel: the raw-yield absorption fact
+                    _longjmp(jb, 1);
+                }
+                vm.panicHookAbort(vm.raw_yield_absorb_thrower);
+            },
         }
     };
+    if (xctx) |c| vm.restoreSyncCloseContext(c);
     vm.alloc.free(call_args);
-    defer vm.alloc.free(ret);
     // PUC poscall moveresults to the callee's func slot: fixed nresults
-    // nil-fills (class 3), MULTRET copies all, 0 drops all.
+    // nil-fills (class 3), MULTRET copies all, 0 drops all. Freed manually
+    // in the OOM arm — the _longjmp there bypasses any `defer`.
     vm.cWindowMoveResults(wth, func_slot, ret, nresults) catch {
+        vm.alloc.free(ret);
         if (vm.c_error_jmp) |jb| {
             vm.c_error_value = .Nil;
             _longjmp(jb, 1);
         }
         @panic("lua_call OOM without an active C-function boundary");
     };
-}
-
-/// Unprotected call: on failure, rethrows through the active C-function
-/// boundary via longjmp (PUC `luaD_throw`). The success path delegates to
-/// `apiCall`, which marshals results on the window.
-///
-/// P15.78: When the callee yields (error.Yield), we longjmp with value 2
-/// (yield) instead of value 1 (error). This allows `callCFunction` to
-/// distinguish yield from error and propagate `error.Yield` up to the
-/// trampoline, leaving the C-frame in place for `finishCcall` on resume.
-fn lua_callkImpl(L: ?*lua_State, nargs: c_int, nresults: c_int) void {
-    const h = L orelse return;
-    const vm = h.vm;
-    const th = Vm.handleThread(h);
-    const nargs_usize: usize = @intCast(@max(nargs, 0));
-    if (Vm.cWindowCount(th) < nargs_usize + 1) {
-        // Stack underflow — treat as error
-        if (vm.c_error_jmp) |jb| {
-            vm.c_error_value = .Nil;
-            _longjmp(jb, 1);
-        }
-        @panic("lua_call without an active C-function boundary");
-    }
-    const func_slot = th.top - nargs_usize - 1;
-    const callee = th.stack[func_slot];
-    // Dupe the args across the call boundary (the slice would alias
-    // th.stack, which the nested execution may grow).
-    const args = vm.alloc.dupe(vm_mod.Value, th.stack[func_slot + 1 .. th.top]) catch {
-        if (vm.c_error_jmp) |jb| {
-            vm.c_error_value = .Nil;
-            _longjmp(jb, 1);
-        }
-        @panic("lua_call OOM without an active C-function boundary");
-    };
-    const ret = vm.apiCall(.nonyieldable, callee, args) catch |err| {
-        vm.alloc.free(args);
-        switch (err) {
-            error.Yield => {
-                // P15.78: Callee yielded. Longjmp with value 2 (yield) so
-                // callCFunction can propagate error.Yield and leave the C-frame
-                // in place for finishCcall on resume.
-                if (vm.c_error_jmp) |jb| {
-                    _longjmp(jb, 2);
-                }
-                @panic("lua_call yield without an active C-function boundary");
-            },
-            error.RuntimeError => {
-                // Error: propagate through boundary via longjmp
-                if (vm.c_error_jmp) |jb| {
-                    vm.c_error_value = vm.errThread().err_obj;
-                    _longjmp(jb, 1);
-                }
-                @panic("lua_call without an active C-function boundary");
-            },
-            error.OutOfMemory => {
-                if (vm.c_error_jmp) |jb| {
-                    vm.c_error_value = .Nil;
-                    _longjmp(jb, 1);
-                }
-                @panic("lua_call OOM without an active C-function boundary");
-            },
-            // relay a main-destined closer error across this C
-            // frame toward MAIN's armed boundary (zombie activation).
-            error.MainDestined => cRelayMainDestined(vm),
-        }
-    };
-    vm.alloc.free(args);
-    defer vm.alloc.free(ret);
-    // PUC poscall moveresults: fixed nresults nil-fills (class 3).
-    vm.cWindowMoveResults(th, func_slot, ret, nresults) catch {
-        if (vm.c_error_jmp) |jb| {
-            vm.c_error_value = .Nil;
-            _longjmp(jb, 1);
-        }
-        @panic("lua_call OOM without an active C-function boundary");
-    };
+    vm.alloc.free(ret);
 }
 
 /// PUC `lua_pushfstring` (lapi.c): formatted push with C vararg. Delegates
@@ -1008,6 +1048,15 @@ pub export fn lua_load(
         // loading never runs user code, so the kind is unreachable
         // here — relay (never fold) if a regression ever produces one.
         error.MainDestined => cRelayMainDestined(vm),
+        // same proof — loading never raises it; relay if a regression
+        // ever produces one (status 0 rides the pad).
+        error.YieldAbsorbed => {
+            if (vm.c_error_jmp) |jb| {
+                vm.c_error_status = 1; // LUA_YIELD sentinel: the raw-yield absorption fact
+                _longjmp(jb, 1);
+            }
+            vm.panicHookAbort(vm.raw_yield_absorb_thrower);
+        },
     };
     switch (result) {
         .closure => |cl| {
@@ -1209,29 +1258,40 @@ pub export fn lua_numbertocstring(L: ?*lua_State, idx: c_int, buff: [*]u8) c_uin
 pub export fn lua_toclose(L: ?*lua_State, idx: c_int) void {
     const h = L orelse return;
     const vm = h.vm;
-    // Resolve `idx` against the CURRENT EXECUTION's window
-    // on Thread.stack (PUC index2value on the shared L->stack) — the
-    // topmost frame of the thread that owns the current execution. Both
-    // lanes (C function / debug hook) read the same window: a C
-    // function's window is its own frame's [frameBase, th.top); a hook's
-    // window is the interrupted Lua frame's registers (the hook transport
-    // raises th.top to the frame's windowTop while the hook runs, and the
-    // hook's own C-API pushes land above th.top).
-    const th = vm.current_thread orelse vm.main_thread orelse return;
+    // Resolve `idx` against the PASSED STATE's thread (PUC lua_toclose:
+    // index2value(L, idx) + luaF_newtbcmark(L, level) — everything on L).
+    // For the running thread this is the current execution's window (a C
+    // function's own frame / a hook's interrupted Lua frame — the lanes
+    // below); for a host call on ANOTHER thread's handle (e.g. marking a
+    // fresh never-resumed coroutine before a raw f(L) call on it) it is
+    // THAT thread's window — the old `current_thread orelse main_thread`
+    // resolution silently marked (or no-op'd on) the WRONG thread.
+    const th = Vm.handleThread(h);
     const abs_slot = Vm.cWindowSlot(th, idx) orelse return;
-    // The mark goes on the topmost frame of the thread that owns the
-    // current execution (PUC: L->ci — the running activation). While a C
-    // function runs, that is always its own callCFunction frame; while a
-    // debug hook runs (hooks get no frame of their own — PUC luaD_hook
-    // keeps L->ci = the interrupted frame), it is the interrupted Lua
-    // frame.
+    // The mark goes on the topmost frame of the passed state's thread
+    // (PUC: L->ci — the running activation). While a C function runs,
+    // that is always its own callCFunction frame; while a debug hook
+    // runs (hooks get no frame of their own — PUC luaD_hook keeps L->ci
+    // = the interrupted frame), it is the interrupted Lua frame.
     const th_bc = th.call_frames;
-    if (th_bc.len() == 0) return; // no activation: PUC api_check-fail; lenient no-op
+    const chain = &th.c_tbc_chain;
+    if (th_bc.len() == 0) {
+        // Frameless target (a fresh never-resumed coroutine — PUC's
+        // base_ci, a CIST_C frame that always exists, gets the mark).
+        // No frame exists to anchor a frame_slot pair: capture the value
+        // as a detached entry (nothing can execute on the target between
+        // the mark and its close, so the captured value is exactly what
+        // PUC's live-level entry reads at closeprotected time — the
+        // unarmed raw-yield transport's reset closes it).
+        const value = th.stack[abs_slot];
+        vm.reserveTbcChainMark(th) catch |e| cThrowOn(vm, h, e);
+        chain.appendAssumeCapacity(.{ .detached = .{ .value = value, .level = abs_slot } });
+        return;
+    }
     const fi = th_bc.len() - 1;
     const f = th_bc.getConstPtr(fi);
     // P16.31 Cut 5: TbcEntry is a tagged union — live marks are frame_slot
     // pairs (detached entries arise from pop-detach and the hook lane).
-    const chain = &th.c_tbc_chain;
     if (f.isC()) {
         // C-function lane: the slot is an ABSOLUTE Thread.stack index in
         // this frame's window (PUC: a stack LEVEL on the shared L->stack).
@@ -1244,11 +1304,15 @@ pub export fn lua_toclose(L: ?*lua_State, idx: c_int) void {
         }
         // PUC lua_toclose → luaF_newtbcmark → luaM_error: OOM is
         // LUA_ERRMEM (P16.50-review-5 B2 — the old `catch {}` silently
-        // dropped the __close mark).
-        chain.append(vm.alloc, .{ .frame_slot = .{
+        // dropped the __close mark). Reserve the unwind-transfer capacity
+        // BEFORE the mark exists (reserveTbcChainMark) — a failure leaves
+        // no obligation and keeps the LUA_ERRMEM contract; the eventual
+        // detach of this mark then never allocates.
+        vm.reserveTbcChainMark(th) catch |e| cThrowOn(vm, h, e);
+        chain.appendAssumeCapacity(.{ .frame_slot = .{
             .cframe_idx = fi,
             .slot_idx = abs_slot,
-        } }) catch |e| cThrowOn(vm, h, e);
+        } });
     } else {
         // Hook lane (PUC luaD_hook: L->ci = the interrupted Lua frame).
         // PUC marks the frame (CIST_TBC) + the slot's LEVEL in tbclist; the
@@ -1262,10 +1326,12 @@ pub export fn lua_toclose(L: ?*lua_State, idx: c_int) void {
         // level is a PUC shared-stack quirk luazig's split stacks cannot
         // — and need not — reproduce).
         const value = th.stack[abs_slot];
-        // Same luaF_newtbcmark OOM contract as the frame_slot lane above.
-        // The captured level is the mark's PUC tbclist LEVEL — the level,
-        // not the frame, decides which boundary's close runs the closer.
-        chain.append(vm.alloc, .{ .detached = .{ .value = value, .level = abs_slot } }) catch |e| cThrowOn(vm, h, e);
+        // Same luaF_newtbcmark OOM contract as the frame_slot lane above
+        // (reserve first — no obligation on failure). The captured level
+        // is the mark's PUC tbclist LEVEL — the level, not the frame,
+        // decides which boundary's close runs the closer.
+        vm.reserveTbcChainMark(th) catch |e| cThrowOn(vm, h, e);
+        chain.appendAssumeCapacity(.{ .detached = .{ .value = value, .level = abs_slot } });
     }
     // PUC sets CIST_TBC on L->ci (the frame "has marks" hint) — gates the
     // chain-region close at the frame's return (PUC moveresults) and the
@@ -1393,6 +1459,16 @@ pub export fn lua_closeslot(L: ?*lua_State, idx: c_int) void {
         // a nested main-destined raise inside the closer (a
         // cross-thread op on another L) relays to MAIN's boundary.
         error.MainDestined => cRelayMainDestined(vm),
+        // unarmed raw-yield absorption inside the metamethod: relay
+        // with PUC status 0 (the nearest conventional pcall / embedder
+        // boundary consumes it).
+        error.YieldAbsorbed => {
+            if (vm.c_error_jmp) |jb| {
+                vm.c_error_status = 1; // LUA_YIELD sentinel: the raw-yield absorption fact
+                _longjmp(jb, 1);
+            }
+            vm.panicHookAbort(vm.raw_yield_absorb_thrower);
+        },
     };
 }
 
@@ -1432,6 +1508,15 @@ pub export fn luaL_loadbufferx(L: ?*lua_State, buff: [*]const u8, sz: usize, nam
         // loading never runs user code, so the kind is unreachable
         // here — relay (never fold) if a regression ever produces one.
         error.MainDestined => cRelayMainDestined(vm),
+        // same proof — loading never raises it; relay if a regression
+        // ever produces one (status 0 rides the pad).
+        error.YieldAbsorbed => {
+            if (vm.c_error_jmp) |jb| {
+                vm.c_error_status = 1; // LUA_YIELD sentinel: the raw-yield absorption fact
+                _longjmp(jb, 1);
+            }
+            vm.panicHookAbort(vm.raw_yield_absorb_thrower);
+        },
     };
     switch (result) {
         .closure => |cl| {
@@ -1540,6 +1625,17 @@ pub export fn luaL_loadfilex(L: ?*lua_State, filename: [*:0]const u8, mode: ?[*:
             if (!source_bytes_freed_by_load) vm.alloc.free(source.bytes);
             if (prefixed_buf) |b| vm.alloc.free(b);
             cRelayMainDestined(vm);
+        },
+        // same proof — loading never raises it; status 0 rides the pad.
+        error.YieldAbsorbed => {
+            vm.alloc.free(source.name);
+            if (!source_bytes_freed_by_load) vm.alloc.free(source.bytes);
+            if (prefixed_buf) |b| vm.alloc.free(b);
+            if (vm.c_error_jmp) |jb| {
+                vm.c_error_status = 1; // LUA_YIELD sentinel: the raw-yield absorption fact
+                _longjmp(jb, 1);
+            }
+            vm.panicHookAbort(vm.raw_yield_absorb_thrower);
         },
     };
     // source.name is borrowed during loadChunk; free it now (loadChunk has
@@ -1764,7 +1860,7 @@ pub export fn lua_pushlightuserdata(L: ?*lua_State, p: ?*anyopaque) void {
 /// surface as silent success: it longjmps to the nearest pcall anchor
 /// (`c_error_jmp` here — installed by callCFunctionWithBoundary, the
 /// luaD_rawrunprotected analogue) and, with no anchor, calls the
-/// `atpanic` hook then aborts. Matches the existing lua_callkImpl OOM
+/// `atpanic` hook then aborts. Matches the existing lua_callk OOM
 /// arm (which sets c_error_value = .Nil and _longjmps).
 /// typed transport: relay a main-destined closer error across the
 /// current C frame to its landing pad (PUC ldo.c:130-138: the re-throw on
@@ -1861,6 +1957,16 @@ fn cThrowOn(vm: *Vm, throwing: *vm_mod.lua_State, err: api.ApiError) noreturn {
         // throw — relay it across the current C frame toward MAIN's armed
         // boundary (the object is already in main's err state).
         error.MainDestined => cRelayMainDestined(vm),
+        // an in-flight raw-yield absorption is never a caller-local
+        // throw either — relay with PUC status 0 (the nearest
+        // conventional pcall / embedder boundary consumes it).
+        error.YieldAbsorbed => {
+            if (vm.c_error_jmp) |jb| {
+                vm.c_error_status = 1; // LUA_YIELD sentinel: the raw-yield absorption fact
+                _longjmp(jb, 1);
+            }
+            cPanicOn(vm, throwing, null);
+        },
     }
 }
 
@@ -2422,6 +2528,23 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
     // returns ALL results on the stack). Freed via vm.alloc.free (the
     // charged-block registry passes infraAlloc'd blocks through).
     const res = vm.apiResumeThread(co, args) catch |e| {
+        // an unarmed raw-yield absorption escaping the resume (PUC: the
+        // rethrow rides MAINTH's pad chain and BYPASSES lua_resume
+        // entirely — its own error publication never runs for it):
+        // restore the handle and relay with the LUA_YIELD sentinel —
+        // the nearest conventional pcall / embedder boundary consumes
+        // it. This activation is abandoned like PUC's.
+        if (e == error.YieldAbsorbed) {
+            vm.cur_handle = saved_cur_handle;
+            if (vm.c_error_jmp) |jb| {
+                vm.c_error_status = 1; // LUA_YIELD sentinel: the absorption fact
+                _longjmp(jb, 1);
+            }
+            // No pad anywhere: PUC ldo.c:139-146 — the panic hook runs
+            // with the transport target (recorded in
+            // raw_yield_absorb_thrower), then the abort.
+            vm.panicHookAbort(vm.raw_yield_absorb_thrower);
+        }
         // typed transport: a main-destined closer error escaping the
         // resume (the driven coroutine's caller frames are zombies; the
         // object is in MAIN's err state) relays across this C frame to the
@@ -2603,6 +2726,19 @@ pub export fn lua_yieldk(L: ?*lua_State, nresults: c_int, ctx: isize, k: ?*const
     else
         null;
 
+    // PUC lua_yieldk's unarmed arm: when L runs under NO armed protection
+    // of its own (L->errorJmp == NULL — a fresh never-resumed target called
+    // raw from host C), luaD_throw(L, LUA_YIELD) takes the no-errorJmp path
+    // (ldo.c:130-138): the target is RESET, its base func slot value is
+    // copied to MAIN's top, and the throw re-enters MAIN's armed boundary
+    // with status LUA_OK — the yield core never runs (no parking: the
+    // window is discarded by the reset). The yieldable check still
+    // precedes everything (a non-yieldable target falls through to the
+    // core's "attempt to yield" rejection, PUC ldo.c:1013-1017).
+    if (!th.in_resume and th.yieldable()) {
+        vm.unarmedRawYieldTransport(th);
+    }
+
     vm.luaYieldKShared(th, th.stack[base..th.top], nresults, kfn, ctx) catch |err| switch (err) {
         // Yield succeeded: builtinCoroutineYield stored the values in
         // th.yielded and returned error.Yield. Now longjmp to the
@@ -2634,6 +2770,15 @@ pub export fn lua_yieldk(L: ?*lua_State, nresults: c_int, ctx: isize, k: ?*const
         // boundary (the yield machinery itself never raises it; the arm
         // keeps the kind unfolded if a nested path ever produces one).
         error.MainDestined => cRelayMainDestined(vm),
+        // same proof — the yield machinery itself never raises it;
+        // status 0 rides the pad if a nested path ever produces one.
+        error.YieldAbsorbed => {
+            if (vm.c_error_jmp) |jb| {
+                vm.c_error_status = 1; // LUA_YIELD sentinel: the raw-yield absorption fact
+                _longjmp(jb, 1);
+            }
+            vm.panicHookAbort(vm.raw_yield_absorb_thrower);
+        },
     };
     return 1; // LUA_YIELD — shouldn't happen
 }
@@ -2695,6 +2840,18 @@ pub export fn luazigGcFixed(L: ?*lua_State, what: c_int, data: c_int) c_int {
         // longjmp to the innermost landing pad); OOM stays absorbed at
         // this i32 boundary (pre-existing documented trade-off).
         error.MainDestined => cRelayMainDestined(s.vm),
+        // an unarmed raw-yield absorption from a finalizer crosses this
+        // lua_gc C frame the same way (PUC: the rethrow rides MAINTH's
+        // pad chain and bypasses lua_gc entirely): relay with PUC status
+        // 0 — the nearest conventional pcall / embedder boundary consumes
+        // it (this activation is abandoned like PUC's).
+        error.YieldAbsorbed => {
+            if (s.vm.c_error_jmp) |jb| {
+                s.vm.c_error_status = 1; // LUA_YIELD sentinel: the raw-yield absorption fact
+                _longjmp(jb, 1);
+            }
+            s.vm.panicHookAbort(s.vm.raw_yield_absorb_thrower);
+        },
     };
 }
 
@@ -2771,12 +2928,26 @@ pub export fn lua_pcallk(
             // error on a non-main L — relay toward MAIN's boundary.
             const st0 = s.pcall(@intCast(@max(nargs, 0)), nresults) catch |pe| switch (pe) {
                 error.MainDestined => cRelayMainDestined(vm),
+                error.YieldAbsorbed => {
+                    if (vm.c_error_jmp) |jb| {
+                        vm.c_error_status = 1; // LUA_YIELD sentinel
+                        _longjmp(jb, 1);
+                    }
+                    vm.panicHookAbort(vm.raw_yield_absorb_thrower);
+                },
             };
             return statusCode(st0);
         }
         var s = api.State.fromHandle(h);
         const st0 = s.pcall(@intCast(@max(nargs, 0)), nresults) catch |pe| switch (pe) {
             error.MainDestined => cRelayMainDestined(vm),
+            error.YieldAbsorbed => {
+                if (vm.c_error_jmp) |jb| {
+                    vm.c_error_status = 1; // LUA_YIELD sentinel
+                    _longjmp(jb, 1);
+                }
+                vm.panicHookAbort(vm.raw_yield_absorb_thrower);
+            },
         };
         return statusCode(st0);
     };
@@ -2796,12 +2967,26 @@ pub export fn lua_pcallk(
             // see the no-thread arm above.
             const st1 = s.pcall(@intCast(@max(nargs, 0)), nresults) catch |pe| switch (pe) {
                 error.MainDestined => cRelayMainDestined(vm),
+                error.YieldAbsorbed => {
+                    if (vm.c_error_jmp) |jb| {
+                        vm.c_error_status = 1; // LUA_YIELD sentinel
+                        _longjmp(jb, 1);
+                    }
+                    vm.panicHookAbort(vm.raw_yield_absorb_thrower);
+                },
             };
             return statusCode(st1);
         } else {
             var s = api.State.fromHandle(h);
             const st1 = s.pcall(@intCast(@max(nargs, 0)), nresults) catch |pe| switch (pe) {
                 error.MainDestined => cRelayMainDestined(vm),
+                error.YieldAbsorbed => {
+                    if (vm.c_error_jmp) |jb| {
+                        vm.c_error_status = 1; // LUA_YIELD sentinel
+                        _longjmp(jb, 1);
+                    }
+                    vm.panicHookAbort(vm.raw_yield_absorb_thrower);
+                },
             };
             return statusCode(st1);
         }
@@ -2909,6 +3094,17 @@ pub export fn lua_pcallk(
             // exactly like PUC's abandoned CIST_YPCALL activation) —
             // relay across this C frame, no local cleanup.
             error.MainDestined => cRelayMainDestined(vm),
+            // an unarmed raw-yield absorption bypasses the armed YPCALL
+            // frame the same way (PUC: the rethrow rides MAINTH's pad
+            // chain): relay with PUC status 0, no local cleanup — the
+            // nearest conventional pcall / embedder boundary consumes it.
+            error.YieldAbsorbed => {
+                if (vm.c_error_jmp) |jb| {
+                    vm.c_error_status = 1; // LUA_YIELD sentinel: the raw-yield absorption fact
+                    _longjmp(jb, 1);
+                }
+                vm.panicHookAbort(vm.raw_yield_absorb_thrower);
+            },
         }
     };
     vm.alloc.free(call_args);
@@ -4445,6 +4641,15 @@ pub export fn luaopen_package(L: ?*lua_State) c_int {
         error.Yield, error.ThreadSwitch => @panic(
             "luaopen_package: coroutine control flow crossed the constructor boundary",
         ),
+        // the constructor runs no host C callbacks: an absorption cannot
+        // start here; relay if a regression ever produces one.
+        error.YieldAbsorbed => {
+            if (s.vm.c_error_jmp) |jb| {
+                s.vm.c_error_status = 1; // LUA_YIELD sentinel: the raw-yield absorption fact
+                _longjmp(jb, 1);
+            }
+            s.vm.panicHookAbort(s.vm.raw_yield_absorb_thrower);
+        },
     };
     // Root the fresh table across the window push: until the value lands
     // on the thread stack it is visible only to this C frame (the

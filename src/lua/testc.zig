@@ -301,9 +301,12 @@ pub fn execute(st: *api.State, cmd: Command, args: []const []const u8) api.ApiEr
             const nresults = std.fmt.parseInt(i32, args[1], 10) catch return error.Type;
             // a main-destined closer error is never a local pcall
             // failure — propagate the kind (the testC pad's -3 sentinel
-            // relays it toward MAIN's armed boundary).
+            // relays it toward MAIN's armed boundary). Same for an
+            // in-flight raw-yield absorption (status-0 rethrow): it is
+            // consumed at MAIN's conventional pcall only.
             const stc = st.pcall(nargs, nresults) catch |pe| switch (pe) {
                 error.MainDestined => return error.MainDestined,
+                error.YieldAbsorbed => return error.YieldAbsorbed,
             };
             if (stc != .ok) return error.Runtime;
         },

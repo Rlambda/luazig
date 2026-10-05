@@ -45,6 +45,12 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
+- [ ] **F4(syo, LOW/MEDIUM residual): защитный ensureThreadApiHandle
+  OOM-arm в closeThreadRegionsOnClosedThread (2026-10-05).** Практически
+  недостижим (handle уже существует); при достижении marks выживают,
+  но closers не вызвались бы. Рассмотреть при переносе
+  reserve-at-registration в product (cut P1).
+
 - [ ] **no-arg park window underflow: lua_gettop crash на co,
   припаркованной безаргументным coroutine.yield() (BLOCKER,
   pre-existing; найден sycp 2026-10-04).** Корень: callBuiltin .host
@@ -157,6 +163,32 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   Итог: SY-R4 fresh-close CLOSED в proto; cuts P1-P5 РАЗБЛОКИРОВАНЫ с
   этим transport'ом в том же cut (fresh-close + прежние
   SY-R4-close/pad доказаны ВМЕСТЕ).
+  SYFC-OOM VERDICT (syo, 2026-10-05, к `73a085e`; отчёт
+  /tmp/opencode/syo_report.md, manifest /tmp/opencode/syo_manifest.md):
+  review-negative ЗАКРЫТ в прототипе — координатор верифицировал
+  лично: syo_stickyoom byte-identical чистому PUC 5.5.0 (st=2 closed=1
+  attempts=0 co_st=2 co_top=1 co_msg=boom main_top=2 main_msg=boom;
+  было st=4 closed=0 attempts=6 not-enough-memory). Fix: инвариант
+  reserve-at-registration — новый Vm.reserveTbcChainMark на ВСЕХ 5
+  сайтах регистрации marks (OP_TBC/infraAlloc, testc .toclose, обе
+  lua_toclose lanes, gcRelayTargetBody); detachLuaFrameTbcMarks теперь
+  infallible (void + инвариант-ассерт + insertAssumeCapacity);
+  semantic-unwind try, abort-cleanup catch{} и unarmedResetClose try
+  УДАЛЕНЫ. Батареи: review one-shot 25/25; новая multi-mark батарея
+  130/130 (LIFO, last-error-wins вкл. nearer-closer-OOM -> ERRMEM с
+  закрытием дальнего mark); 12/12 сохранённых батарей byte-identical
+  вкл. exit codes; divergent-set неизменен; GC-after-refusal,
+  re-entry, LEAKED-маркеры чистые. Perf (paired, финальная identity):
+  рабочие нагрузки <= 0.08% (шум); TBC-saturated microbench +2.02% —
+  честная цена per-declaration reserve (инвариант оправдывает). STOP
+  НЕ сработал: split-списки гарантируют infallible перенос;
+  owner-design развилка не нужна. Findings: F1 MEDIUM (pre-existing,
+  throwaway-only): zig build test сломан в ПРЕДЫДУЩЕЙ identity
+  прототипа (error.YieldAbsorbed не обработан в двух api.zig
+  switch'ах) — master чист (координатор: 375/375 на 73a085e); F4
+  residual: защитный ensureThreadApiHandle OOM-arm в
+  closeThreadRegionsOnClosedThread (недостижим практически; marks
+  выживают, closers бы не звались) — пункт ниже.
   REVIEW 2026-10-05 к `72f7886`: **INCONCLUSIVE** для implementation
   handoff. R1–R8 равны на сохранённых пробах, но независимые
   SY-R4-close и SY-R4-pad выше опровергают полный close/boundary

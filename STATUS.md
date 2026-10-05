@@ -374,7 +374,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   effect; suite 42_getinfo_fn baseline 28 FAIL -> byte-identical PUC
   D+RF (координатор лично).
 
-- [ ] **A-full P0 `lua_getinfo(">L")` освобождает единственную функцию
+- [x] **A-full P0 `lua_getinfo(">L")` освобождает единственную функцию
   при automatic GC (BLOCKER, FIX-NOW, внесён `7519c48`).** После pop
   function value остаётся только в Zig local; GC сканирует стек до
   `th.top`, а `State.newtable` может собрать Closure/Proto до
@@ -382,6 +382,19 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   `/tmp/afp0_getinfo_gc.zig` → SIGSEGV `c_api.zig:4032`.
   Требуется GC-root через весь resolver/flags/push-back, включая
   OOM/longjmp cleanup, и focused sole-reference `>L` GC test.
+  CLOSED (A-full foundation correction, `b64f913`, 2026-10-05):
+  fn-форма открывает Vm.RootScope ДО pop — protect infallible, defer
+  close на каждый нормальный return, restoreRoots landing pad чистит
+  каждый longjmp (OOM lanes per fail_index). Точный PUC stack effect
+  сохранён; frame-форма не тронута; второго authority/GC-pause/
+  test-ветвления нет. Постоянные локи: poison-oracle unit (pre-fix
+  crash -> green; collector step реально запускается; collect-after-
+  unroot; VM reuse) + OOM-матрица + GC-pressure differential в suite
+  42 (GCGEN+GCRESTART lever). Честное ограничение: C-differential
+  молчит на pre-fix под glibc — poison-oracle обязателен. Координатор
+  верифицировал: suite 42 byte-identical PUC D+RF; 377/377 D+RF;
+  smoke 93/93; matrix zig_fail=0; memerr rc=0; fmt/diff-check;
+  cold-only (A/B не требуется).
 
 - [x] **scres architecture verification: target lua_State и OOM/GC
   (HIGH, research handoff завершён).**

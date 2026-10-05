@@ -21,7 +21,15 @@
  *   - the same queries inside a C function running on a resumed
  *     coroutine (the window lives on the coroutine's state);
  *   - the frame form still works after '>' calls, and ar->i_ci is left
- *     untouched by the '>' form.
+ *     untouched by the '>' form;
+ *   - GC pressure: sole-reference functions queried with the collector
+ *     due at the next allocation (generational mode + LUA_GCRESTART,
+ *     which sets the GC debt to zero — PUC lapi.c:1184). PUC never runs
+ *     a collector step inside lua_getinfo (no luaC_checkGC point between
+ *     the pop and the 'f'/'L' pushes), so a due collector is invisible
+ *     to its output; luazig steps its collector at allocation time, so
+ *     the same sequence exercises the popped function's lifetime across
+ *     the 'L' table construction and the 'f' push.
  *
  * Every printed line must be byte-identical between PUC Lua 5.5 and
  * luazig: no addresses. Exit code is non-zero on any failed check.
@@ -374,10 +382,157 @@ static void part_coroutine(lua_State *L) {
     int rst = lua_resume(co, L, 0, &nres);
     checkeq(rst, LUA_OK, "CO.rst");
     checkeq(nres, 0, "CO.nres");
+    lua_pop(L, 1); /* the finished coroutine thread */
 
     lua_pushcfunction(L, frame_probe);
     int prc = lua_pcall(L, 0, 0, 0);
     checkeq(prc, 0, "FP.pcall");
+}
+
+/* ---------------- GC pressure part ---------------- */
+
+/* Multi-line chunk source: lines 1..102 all carry instructions, so the
+ * activelines table content is a dense, deterministic key set. */
+static char gsrc[4096];
+static size_t gsrc_len;
+
+static void build_gsrc(void) {
+    size_t n = 0;
+    n += (size_t)sprintf(gsrc + n, "local a = 0\n");
+    for (int i = 0; i < 100; i++) n += (size_t)sprintf(gsrc + n, "a = a + 1\n");
+    n += (size_t)sprintf(gsrc + n, "return a\n");
+    gsrc_len = n;
+}
+
+/* One pressure round: a FRESH sole-reference closure (nothing else
+ * references it), the collector forced due at the next allocation, then
+ * the '>' query — inside luazig the 'L' table construction, its inserts
+ * and the 'f' push all allocate with the function already popped. */
+static void gp_query(lua_State *L, const char *what, int want_rc, int want_dtop) {
+    lua_Debug ar;
+    memset(&ar, 0, sizeof ar);
+    int before = lua_gettop(L);
+    check(luaL_loadbufferx(L, gsrc, gsrc_len, "=gcp", NULL) == 0, "GP.load");
+    lua_gc(L, LUA_GCRESTART); /* debt := 0: the next allocation runs a step */
+    int rc = lua_getinfo(L, what, &ar);
+    int dtop = lua_gettop(L) - before;
+    printf("GP[%s] rc=%d dtop=%d\n", what, rc, dtop);
+    checkeq(rc, want_rc, "GP.rc");
+    checkeq(dtop, want_dtop, "GP.dtop");
+    if (strchr(what, 'f') != NULL) {
+        /* 'f' is pushed back BEFORE 'L' regardless of the flag order */
+        check(lua_isfunction(L, strchr(what, 'L') != NULL ? -2 : -1),
+              "GP.f-isfunc");
+    }
+    if (strchr(what, 'L') != NULL) {
+        check(lua_istable(L, -1), "GP.L-istable");
+        dump_lines(L, -1);
+    }
+    lua_settop(L, before);
+}
+
+/* pressure queries on a coroutine's own window */
+static int co_gp_query(lua_State *L) {
+    gp_query(L, ">L", 1, 1);
+    gp_query(L, ">fL", 1, 2);
+    printf("CO.GP.DONE top=%d\n", lua_gettop(L));
+    return 0;
+}
+
+static void part_gc_pressure(lua_State *L) {
+    build_gsrc();
+    /* generational mode: a due step sweeps young objects at once */
+    printf("GP.gen-ret=%d\n", lua_gc(L, LUA_GCGEN)); /* 8: was incremental */
+
+    /* sole-reference Lua closures, every push shape, repeated rounds
+     * (VM reuse across collector steps inside the call) */
+    gp_query(L, ">L", 1, 1);
+    gp_query(L, ">fL", 1, 2);
+    gp_query(L, ">Lf", 1, 2); /* push order is f-then-L regardless */
+    gp_query(L, ">SufL", 1, 2); /* full flag walk under pressure */
+    gp_query(L, ">L", 1, 1);
+
+    /* invalid option with the collector due: rc 0, 'L' still pushed */
+    {
+        lua_Debug ar;
+        memset(&ar, 0, sizeof ar);
+        int b = lua_gettop(L);
+        check(luaL_loadbufferx(L, gsrc, gsrc_len, "=gcp", NULL) == 0, "GP.X-load");
+        lua_gc(L, LUA_GCRESTART);
+        int rc = lua_getinfo(L, ">XL", &ar);
+        printf("GP[>XL] rc=%d dtop=%d\n", rc, lua_gettop(L) - b);
+        checkeq(rc, 0, "GP.X-rc");
+        checkeq(lua_gettop(L) - b, 1, "GP.X-dtop");
+        check(lua_istable(L, -1), "GP.X-L-table");
+        lua_settop(L, b);
+    }
+
+    /* light C function control under the same pressure: 'L' pushes nil */
+    lua_pushcfunction(L, cf_two);
+    lua_gc(L, LUA_GCRESTART);
+    {
+        lua_Debug ar;
+        memset(&ar, 0, sizeof ar);
+        int b = lua_gettop(L);
+        int rc = lua_getinfo(L, ">fL", &ar);
+        printf("GP[light>fL] rc=%d dtop=%d\n", rc, lua_gettop(L) - b);
+        checkeq(rc, 1, "GP.light-rc");
+        checkeq(lua_gettop(L) - b, 1, "GP.light-dtop");
+        check(lua_iscfunction(L, -2), "GP.light-f");
+        check(lua_isnil(L, -1), "GP.light-L-nil");
+    }
+    lua_pop(L, 2); /* pushed-back function + nil */
+
+    /* C closure control under pressure */
+    lua_pushinteger(L, 9);
+    lua_pushcclosure(L, cf_upv, 1);
+    lua_gc(L, LUA_GCRESTART);
+    {
+        lua_Debug ar;
+        memset(&ar, 0, sizeof ar);
+        int b = lua_gettop(L);
+        int rc = lua_getinfo(L, ">fL", &ar);
+        printf("GP[ccl>fL] rc=%d dtop=%d\n", rc, lua_gettop(L) - b);
+        checkeq(rc, 1, "GP.ccl-rc");
+        checkeq(lua_gettop(L) - b, 1, "GP.ccl-dtop");
+        check(lua_iscfunction(L, -2), "GP.ccl-f");
+        check(lua_isnil(L, -1), "GP.ccl-L-nil");
+    }
+    lua_pop(L, 2); /* pushed-back function + nil */
+
+    /* stripped-proto control under pressure: empty activelines table */
+    lua_getglobal(L, "stripped");
+    check(lua_isstring(L, -1), "GP.stripped-isstr");
+    check(luaL_loadbufferx(L, lua_tostring(L, -1), lua_rawlen(L, -1), "=S", "b") == 0,
+          "GP.loadstripped");
+    lua_gc(L, LUA_GCRESTART);
+    {
+        lua_Debug ar;
+        memset(&ar, 0, sizeof ar);
+        int b = lua_gettop(L);
+        int rc = lua_getinfo(L, ">L", &ar);
+        printf("GP[stripped>L] rc=%d dtop=%d\n", rc, lua_gettop(L) - b);
+        checkeq(rc, 1, "GP.stripped-rc");
+        checkeq(lua_gettop(L) - b, 0, "GP.stripped-dtop");
+        check(lua_istable(L, -1), "GP.stripped-L-table");
+        dump_lines(L, -1); /* no lineinfo: empty key set */
+    }
+    lua_pop(L, 2); /* table + the stripped dump string */
+
+    /* the same pressure on a coroutine's own window */
+    lua_State *co = lua_newthread(L);
+    lua_pushcfunction(co, co_gp_query);
+    int nres = 0;
+    int rst = lua_resume(co, L, 0, &nres);
+    checkeq(rst, LUA_OK, "GP.co-rst");
+    checkeq(nres, 0, "GP.co-nres");
+    lua_pop(L, 1); /* the coroutine */
+
+    /* VM reuse after the pressure loop */
+    check(luaL_dostring(L, "return 7") == 0, "GP.reuse");
+    checkeq(lua_tointeger(L, -1), 7, "GP.reuse-val");
+    lua_pop(L, 1);
+    checkeq(lua_gettop(L), 0, "GP.top-balanced");
 }
 
 int main(void) {
@@ -388,6 +543,7 @@ int main(void) {
     part_classes(L);
     part_errors(L);
     part_coroutine(L);
+    part_gc_pressure(L);
 
     lua_close(L);
     printf("FAILS=%d\n", fails);

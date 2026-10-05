@@ -4018,9 +4018,12 @@ fn getinfoFillSource(vm: *Vm, h: *lua_State, ar: *lua_Debug, func: Value) void {
 /// PUC `collectvalidlines` (ldebug.c:292-321): the 'L' flag pushes a table
 /// with a `true` entry per active line for a Lua closure, nil for anything
 /// else. The table is pushed BEFORE it is filled (PUC ldebug.c:302-303):
-/// the window slot roots it across every insert allocation. The line set
-/// is the same computation the Lua-level debug.getinfo 'L' lane uses
-/// (byte-identical to PUC's per-instruction walk on all validated shapes).
+/// the window slot roots it across every insert allocation. The raw Proto
+/// is held across those same allocations, so the caller must keep `func`
+/// rooted for the whole call (the '>' form's RootScope; the frame form's
+/// function slot). The line set is the same computation the Lua-level
+/// debug.getinfo 'L' lane uses (byte-identical to PUC's per-instruction
+/// walk on all validated shapes).
 fn getinfoCollectValidLines(vm: *Vm, h: *lua_State, func: Value) void {
     const proto: ?*const bc.Proto = if (func == .Closure) func.Closure.proto else null;
     if (proto == null) {
@@ -4057,14 +4060,30 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
     var func: Value = .Nil;
     var frame_idx: usize = 0;
     var th: *vm_mod.Thread = undefined;
+    // Temporary GC root for the '>' form's popped function. PUC's pop
+    // (ldebug.c:406) leaves the value above L->top for the rest of the
+    // call, safe only because no luaC_checkGC point runs inside
+    // lua_getinfo; our allocators step the collector at allocation time,
+    // so a sole-reference function must stay rooted across every fallible
+    // section below (the 'S' intern fallback, the 'L' table construction,
+    // the 'f' push). `defer close` covers every normal return lane; a
+    // longjmp out of the call is cleaned by the protected-boundary
+    // landing pad's restoreRoots.
+    var fn_root: ?Vm.RootScope = null;
+    defer if (fn_root != null) fn_root.?.close();
     if (fn_form) {
-        // PUC ldebug.c:401-407: func = s2v(L->top - 1), then pop. An empty
+        // PUC ldebug.c:401-407: func = s2v(L->top.p - 1), then pop. An empty
         // window makes PUC read ci->func (the running function) and pop
         // below the API base — window corruption we do not mirror; the
         // read is kept, the pop clamps at the window base.
         const wth = Vm.handleThread(h);
         if (wth.top == 0) return 0;
         func = wth.stack[wth.top - 1];
+        // Root the function BEFORE the pop: an OOM here leaves the value
+        // on the stack (still a root) and no collector has run (the
+        // reserve uses the NoGC infra allocator).
+        fn_root = vm.openRootScope(1, 0) catch |e| cThrowOn(vm, h, api.mapVmError(e));
+        _ = fn_root.?.protectValueAssumeCapacity(func);
         if (wth.top > Vm.cWindowBase(wth)) wth.top -= 1;
         th = wth;
     } else {
@@ -6108,4 +6127,149 @@ test "c api luaL_getmetafield: every value kind + real type tags (lauxlib.c:884-
         lua_pop(L, 1);
     }
     lua_settop(L, 0);
+}
+
+test "c api lua_getinfo '>' sole-reference function survives in-call collector steps (poison oracle)" {
+    const L = luaL_newstate() orelse return error.OutOfMemory;
+    defer lua_close(L);
+    const vm = L.vm;
+    // The poison/unmap oracle traps every freed block (PROT_NONE): a
+    // Closure/Proto freed while lua_getinfo still reads it faults loudly
+    // instead of silently returning stale lines. The adapter's base must
+    // match the state's own allocator (luaL_newstate uses c_allocator).
+    vm.testcInstallAdapterOverBase(std.heap.c_allocator);
+    vm.testcArmPoisonUnmap();
+    // Generational mode entered BEFORE the probe closures exist: they stay
+    // young, so the first due minor step sweeps them the instant they lose
+    // their last root (the popped stack slot).
+    _ = luazigGcFixed(L, 7, 0); // LUA_GCGENERATIONAL
+
+    var source: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer source.deinit();
+    source.writer.writeAll("local a=0\n") catch return error.OutOfMemory;
+    for (0..120) |_| source.writer.writeAll("a=a+1\n") catch return error.OutOfMemory;
+    source.writer.writeAll("return a\n\x00") catch return error.OutOfMemory;
+
+    var round: usize = 0;
+    while (round < 3) : (round += 1) {
+        const th = vm_mod.Vm.handleThread(L);
+
+        // '>L' (no 'f'): the popped function is NOT pushed back, so the
+        // whole 'L' table construction and every insert run while the
+        // sole reference is off the stack. LUA_GCRESTART leaves the
+        // collector due at the next allocation (PUC lapi.c:1184
+        // luaE_setdebt(g, 0)), so the newtable allocation itself steps
+        // the minor collection.
+        try std.testing.expectEqual(@as(c_int, 0), luaL_loadstring(L, @ptrCast(source.written().ptr)));
+        const cl = th.stack[th.top - 1].Closure;
+        _ = luazigGcFixed(L, 1, 0); // LUA_GCRESTART
+        vm.stats.enabled = true;
+        const steps_before = vm.stats.gc_steps_auto;
+        var ar: lua_Debug = std.mem.zeroes(lua_Debug);
+        try std.testing.expectEqual(@as(c_int, 1), lua_getinfo(L, ">L", &ar));
+        // The pressure is real: the in-call allocation ran a collector
+        // step (otherwise this round would silently prove nothing).
+        try std.testing.expect(vm.stats.gc_steps_auto > steps_before);
+        // PUC stack effect: the table replaces the popped function (net 0).
+        try std.testing.expectEqual(@as(c_int, 1), lua_gettop(L));
+        try std.testing.expect(th.stack[th.top - 1] == .Table);
+        // The Proto survived the steps: first and last chunk lines are set.
+        _ = lua_rawgeti(L, -1, 1);
+        try std.testing.expect(th.stack[th.top - 1] == .Bool);
+        _ = lua_pop(L, 1);
+        _ = lua_rawgeti(L, -1, 122);
+        try std.testing.expect(th.stack[th.top - 1] == .Bool);
+        lua_settop(L, 0);
+
+        // '>fL': the function is pushed back BEFORE the table (PUC
+        // ldebug.c:415-420 order), then the table is built while the
+        // pushed copy roots it — but the pop-to-push window and the push
+        // itself (stack growth) still need the root.
+        try std.testing.expectEqual(@as(c_int, 0), luaL_loadstring(L, @ptrCast(source.written().ptr)));
+        const cl2 = th.stack[th.top - 1].Closure;
+        _ = luazigGcFixed(L, 1, 0);
+        var ar2: lua_Debug = std.mem.zeroes(lua_Debug);
+        try std.testing.expectEqual(@as(c_int, 1), lua_getinfo(L, ">fL", &ar2));
+        try std.testing.expectEqual(@as(c_int, 2), lua_gettop(L));
+        try std.testing.expect(th.stack[th.top - 2] == .Closure);
+        try std.testing.expect(th.stack[th.top - 2].Closure == cl2); // identity, not a copy
+        try std.testing.expect(th.stack[th.top - 1] == .Table);
+        _ = lua_rawgeti(L, -1, 122);
+        try std.testing.expect(th.stack[th.top - 1] == .Bool);
+        lua_settop(L, 0);
+
+        // The in-call root is temporary: with every reference dropped, a
+        // full collection really frees both closures (address-only chain
+        // walk — the freed bodies are unmapped, any stale touch faults).
+        _ = luazigGcFixed(L, 2, 0); // LUA_GCCOLLECT
+        var alive: usize = 0;
+        var node = vm.gc_allgc_head;
+        while (node) |hdr| : (node = hdr.next) {
+            if (@intFromPtr(hdr) == @intFromPtr(&cl.gc)) alive += 1;
+            if (@intFromPtr(hdr) == @intFromPtr(&cl2.gc)) alive += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 0), alive);
+    }
+}
+
+var bN_oom_base: std.mem.Allocator = undefined;
+var bN_oom_failing: std.testing.FailingAllocator = undefined;
+var bN_oom_fail_at: usize = 0;
+
+/// Arms the failing allocator (budget `bN_oom_fail_at`), then runs the
+/// '>'-form 'L' query on its sole-reference argument closure. Every
+/// allocation inside the call — the temporary-root reserve, the newtable,
+/// the line inserts — must turn into a LUA_ERRMEM longjmp, never a crash
+/// or a leaked root.
+fn bNCfGetinfoLOom(L: ?*lua_State) callconv(.c) c_int {
+    bN_oom_failing = std.testing.FailingAllocator.init(bN_oom_base, .{
+        .fail_index = bN_oom_fail_at,
+        .resize_fail_index = bN_oom_fail_at,
+    });
+    L.?.vm.alloc = bN_oom_failing.allocator();
+    var ar: lua_Debug = std.mem.zeroes(lua_Debug);
+    _ = lua_getinfo(L.?, ">L", &ar); // OOM → LUA_ERRMEM longjmp (never returns)
+    return 0;
+}
+
+test "c api lua_getinfo '>' OOM inside the 'L' construction is LUA_ERRMEM with a clean root state" {
+    const L = luaL_newstate() orelse return error.OutOfMemory;
+    defer lua_close(L);
+    const vm = L.vm;
+    _ = luazigGcFixed(L, 7, 0); // LUA_GCGENERATIONAL
+
+    var source: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer source.deinit();
+    source.writer.writeAll("local a=0\n") catch return error.OutOfMemory;
+    for (0..60) |_| source.writer.writeAll("a=a+1\n") catch return error.OutOfMemory;
+    source.writer.writeAll("return a\n\x00") catch return error.OutOfMemory;
+
+    // fail_at walks the fallible sites inside the call: the RootScope
+    // reserve, the newtable creation and the first inserts. Every lane
+    // must raise LUA_ERRMEM through the pcall boundary.
+    var fail_at: usize = 0;
+    while (fail_at < 4) : (fail_at += 1) {
+        // Fresh sole-reference closure as the C function's argument
+        // (PUC call protocol: function first, arguments above it); the
+        // '>' form pops it from the C window.
+        lua_pushcfunction(L, bNCfGetinfoLOom);
+        try std.testing.expectEqual(@as(c_int, 0), luaL_loadstring(L, @ptrCast(source.written().ptr)));
+        bN_oom_base = vm.alloc;
+        bN_oom_fail_at = fail_at;
+        const status = lua_pcallk(L, 1, 0, 0, 0, null);
+        vm.alloc = bN_oom_base; // restore before any other API use
+        try std.testing.expectEqual(@as(c_int, 4), status); // LUA_ERRMEM
+        try std.testing.expect(vm.errThread().err_has_obj);
+        try std.testing.expectEqualStrings("not enough memory", vm.errThread().err_obj.String.bytes());
+        // The landing pad dropped the abandoned in-call scope: the root
+        // state is back to the boundary mark (no leaked temporary root).
+        try std.testing.expectEqual(@as(usize, 0), vm.gc_root_depth);
+        try std.testing.expectEqual(@as(usize, 0), vm.gc_root_values.items.len);
+        // A real next cycle runs (the failed call's popped closure is
+        // unrooted garbage — swept without touching stale state) and the
+        // VM stays reusable.
+        _ = luazigGcFixed(L, 2, 0); // LUA_GCCOLLECT
+        try std.testing.expectEqual(@as(c_int, 0), luaL_loadstring(L, "return 1"));
+        lua_pop(L, 1);
+    }
 }

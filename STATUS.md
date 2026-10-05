@@ -249,7 +249,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   `/tmp/opencode/syo_stickyoom_{zig,puc}` byte-identical; новый owner
   blocker при mixed C/Lua marks записан отдельно ниже.
 
-- [ ] **SY-R4-mixed-TBC-allocator (BLOCKER, FIX-NOW для A-full owner
+- [x] **SY-R4-mixed-TBC-allocator (BLOCKER, FIX-NOW для A-full owner
   research; review 2026-10-05 к `3afbde9`).** В throwaway-прототипе
   `OP_TBC` вызывает `reserveTbcChainMark(th, self.infraAlloc())`, а C
   `lua_toclose`/testC marks резервируют тот же `c_tbc_chain` через
@@ -265,6 +265,22 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   Нужен единый allocator owner chain на всех 5 registration sites и
   deinit, затем повторный mixed-mark/OOM/GC proof. P1–P5 заблокированы
   до коррекции; product/master этим прототипом не менялись.
+  CLOSED (syao, 2026-10-05): reserveTbcChainMark как метод Vm
+  (infraAlloc внутри) на всех 5 registration + 3 deinit sites — ОДИН
+  canonical allocator owner; попутно пойман/откачен freeThreadRuntime
+  double-free near-miss. Координатор верифицировал лично:
+  /tmp/syo_allocator_fixture.zig зелёный в Debug И ReleaseFast
+  (load=0 ok call=0; было realloc(): invalid pointer rc=134). Батареи:
+  21 (15 byte-identical, 6 divergence-set неизменен — 0 регрессий;
+  stickyoom twins D+RF IDENTICAL); variant family v2-v6 зелёная;
+  49-точечный reserve-edge sweep чистый (каждый edge отказывает на
+  registration site, VM reusible, lua_close чист). Reserve-at-
+  registration сохранён; RuntimeError не подменяется. PERF-
+  переатрибция: tbc_loop +0.1163% (детерминированные +2
+  instr/registration — codegen-цена фикса; raw paired counters именно
+  этого workload в syao-артефактах); прежние +2.02% ОТЗВАНЫ. Вердикт
+  PRODUCTIZABLE; P1-P5 РАЗБЛОКИРОВАНЫ; pre-existing F1
+  (api.zig:2003 YieldAbsorbed) и cold-CI-pool divergence — documented.
 
 - [ ] **file mt `__tostring` не опубликован как функция (BLOCKER,
   pre-existing, ORDINARY-BACKLOG; найден scresv2 2026-10-04).** Единственный счётный

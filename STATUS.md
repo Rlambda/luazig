@@ -51,7 +51,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   но closers не вызвались бы. Рассмотреть при переносе
   reserve-at-registration в product (cut P1).
 
-- [ ] **no-arg park window underflow: lua_gettop crash на co,
+- [x] **no-arg park window underflow: lua_gettop crash на co,
   припаркованной безаргументным coroutine.yield() (BLOCKER,
   pre-existing; найден sycp 2026-10-04).** Корень: callBuiltin .host
   region-end floor на func_slot+1 — окно пустого yield-парка ниже
@@ -59,6 +59,12 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   throwaway-прототипе (мин-репро + батарея зелёные). Перенести в
   product (кандидат cut P0.5 syres-плана); raw:
   /tmp/opencode/sycp_report.md §bonus.
+  CLOSED (A-full foundation P0.5, `7519c48`, 2026-10-05): anchor
+  yield_window_base на park top (hook/close lanes не тронуты — их
+  register-file window = PUC parity). Постоянный suite
+  43_yield_park_window: baseline FAILS -> byte-identical PUC D+RF
+  (координатор лично). Контроли: top/base, settop, повторный resume,
+  GC/root, no-arg/one-arg.
 
 - [x] **SY-R4-close (BLOCKER, FIX-NOW для A-full research): unarmed raw
   yield теряет TBC close и closer error.** После первого resume на co с
@@ -281,6 +287,29 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   этого workload в syao-артефактах); прежние +2.02% ОТЗВАНЫ. Вердикт
   PRODUCTIZABLE; P1-P5 РАЗБЛОКИРОВАНЫ; pre-existing F1
   (api.zig:2003 YieldAbsorbed) и cold-CI-pool divergence — documented.
+  A-FULL FOUNDATION EXECUTED (cuts P0 `7519c48` + P0.5 `7519c48` +
+  P1 `459c46d`, 2026-10-05): P0 lua_getinfo('>') value-based resolver
+  (suite 42: baseline 28 FAIL -> byte-identical PUC D+RF); P0.5
+  yield-park window anchor (suite 43); P1 — единый typed raw-yield
+  boundary (unarmedRawYieldTransport/YieldAbsorbed/crossCloseError
+  Raise/sentinel=1/absorbRawYieldWindow/drive-loop/lua_callk-catch/
+  panic hook; legacy catch arms удалены) + TBC
+  reserve-at-registration (Vm.reserveTbcChainMark, 5+3 sites,
+  canonical infraAlloc; detach infallible). Suite
+  44_raw_yield_boundary byte-identical PUC D+RF (координатор лично
+  обе сборки; negative-before чистый). Попутные фиксы gates:
+  lua_toclose cross-thread (Vm.handleThread + detached-entry lane);
+  BLOCKER memerr.lua hang (testC pcall catch без recovery close —
+  detached entry навсегда в chain; фикс: tbc_base snapshot +
+  apiCloseConventionalPcallBoundary; порог tbc 378B = PUC, baseline
+  658). F1(afp0) — отдельный класс: легальные формы byte-identical;
+  репро нарушает PUC api_checkpop. Гейты: 375/375 D+RF, smoke,
+  matrix zig_fail=0, api580 GREEN, memerr rc=0, fmt/diff-check; perf
+  tbc_loop +0.81% (~28 instr/registration — цена reserve,
+  обоснованная), coroutine_yield -0.09% (gate FAIL доказан
+  pre-existing); perf current-* откачены (не публикуются). P2-P5 НЕ
+  product parity — миграция stdlib callable после принятия
+  foundation.
   REVIEW 2026-10-05 к `677cafa`: **ACCEPT + RECORD** для research
   correction. Независимый source audit подтвердил единый infraAlloc owner
   на 5 registration и 3 deinit sites; повторная сборка ReleaseFast

@@ -60,7 +60,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   product (кандидат cut P0.5 syres-плана); raw:
   /tmp/opencode/sycp_report.md §bonus.
 
-- [ ] **SY-R4-close (BLOCKER, FIX-NOW для A-full research): unarmed raw
+- [x] **SY-R4-close (BLOCKER, FIX-NOW для A-full research): unarmed raw
   yield теряет TBC close и closer error.** После первого resume на co с
   живым `<close>`/`lua_toclose` host raw `coroutine.yield(co)` ведёт в
   PUC `luaE_resetthread -> luaD_closeprotected`: closer вызывается,
@@ -71,7 +71,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   `syres_review_tbc_err.c` (PUC/proto binaries рядом). Требуется
   close/status/GC owner proof до implementation.
 
-- [ ] **SY-R4-pad (BLOCKER, FIX-NOW для A-full research): unarmed raw
+- [x] **SY-R4-pad (BLOCKER, FIX-NOW для A-full research): unarmed raw
   yield приходит на pad другого thread.** В вложенном C driver/coroutine
   raw yield третьей fresh co PUC переносит управление к main boundary;
   prototype с единым `c_error_jmp` возвращается во внутренний pcall и
@@ -208,7 +208,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   JSON не содержит заявленных SHA/source identity; численный результат
   предварителен до привязки финального исходника.
 
-- [ ] **SY-R4-fresh-close (BLOCKER, FIX-NOW для A-full research):
+- [x] **SY-R4-fresh-close (BLOCKER, FIX-NOW для A-full research):
   sycp-прототип теряет TBC mark при raw yield из C-вызова на ещё не
   resumed coroutine (review 2026-10-05 к `dab3760`/`aa28343`).**
   Независимый differential `/tmp/sycp_review_freshcallk.c`: `driver` на
@@ -281,6 +281,25 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   этого workload в syao-артефактах); прежние +2.02% ОТЗВАНЫ. Вердикт
   PRODUCTIZABLE; P1-P5 РАЗБЛОКИРОВАНЫ; pre-existing F1
   (api.zig:2003 YieldAbsorbed) и cold-CI-pool divergence — documented.
+  REVIEW 2026-10-05 к `677cafa`: **ACCEPT + RECORD** для research
+  correction. Независимый source audit подтвердил единый infraAlloc owner
+  на 5 registration и 3 deinit sites; повторная сборка ReleaseFast
+  побайтно совпала с измеренным B-бинарником. Ревьювер повторил fixture
+  Debug/RF (`load=0 ok call=0`), warmed v6 Zig/PUC и sticky OOM Zig/PUC
+  (byte-identical). Raw perf подтверждает приблизительно +0.1163% на
+  tbc_loop; формулировка «ровно +2 инструкции на регистрацию» чрезмерна:
+  raw min/median/max различаются, медианная разница 3,999,948 на 2M
+  итераций. MEDIUM evidence: сохранённые var_v6.{zig,puc}.out отражают
+  старый `call=4`, а текущий driver даёт `call=0`; edge_sweep N=23..25
+  имеет c1=2, поэтому raw не доказывает заявленную атрибуцию к reserve
+  с LUA_ERRMEM. Это не опровергает исправление owner: reserve предшествует
+  публикации mark, а текущие v6 twins совпадают. LOW: doc comment
+  reserveTbcChainMark ошибочно называет freeThreadRuntime вместо
+  destroyUnregisteredThread и преувеличивает буквальную стабильность
+  allocator identity при совместимой testC-обёртке. Исправить комментарий
+  при product-переносе. Закрыты research blockers SY-R4-close/pad/
+  fresh-close/oom-detach/allocator-owner; публичная parity-модель A-full
+  остаётся открытой до implementation P0/P0.5/P1 и следующих cuts.
 
 - [ ] **file mt `__tostring` не опубликован как функция (BLOCKER,
   pre-existing, ORDINARY-BACKLOG; найден scresv2 2026-10-04).** Единственный счётный

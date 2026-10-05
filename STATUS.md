@@ -136,6 +136,8 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   region-end floor на func_slot+1; pre-existence доказан на
   пред-коррекционном proto; мин-репро + полная батарея зелёные
   (перенести в product — cut P0.5). Cut P1-P5 из syres РАЗБЛОКИРОВАН
+  после включения closeprotected+main-pad в транспорт; обновлённый
+  порядок в отчёте §7.
   FRESH-CLOSE VERDICT (syfc, 2026-10-04, к `5421ad4`; отчёт
   /tmp/opencode/syfc_report.md, артефакты /tmp/opencode/syfc/):
   review-negative ЗАКРЫТ в прототипе — координатор верифицировал
@@ -155,8 +157,6 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   Итог: SY-R4 fresh-close CLOSED в proto; cuts P1-P5 РАЗБЛОКИРОВАНЫ с
   этим transport'ом в том же cut (fresh-close + прежние
   SY-R4-close/pad доказаны ВМЕСТЕ).
-  после включения closeprotected+main-pad в транспорт; обновлённый
-  порядок в отчёте §7.
   REVIEW 2026-10-05 к `72f7886`: **INCONCLUSIVE** для implementation
   handoff. R1–R8 равны на сохранённых пробах, но независимые
   SY-R4-close и SY-R4-pad выше опровергают полный close/boundary
@@ -186,6 +186,25 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   исправления и повторной проверки owner-контракта. Сохранённые
   close/pad batteries подтверждают только уже resumed формы; perf
   утверждение без финальных source/binary hashes остаётся предварительным.
+
+- [ ] **SY-R4-OOM-detach (BLOCKER, FIX-NOW для A-full owner research;
+  review 2026-10-05 к `f82a22f`).** На fresh `co` при cross-thread
+  `lua_callk` Lua-кадр содержит живой `<close>` mark; C callback
+  подготавливает ошибку `boom`, затем перед `lua_error` включает
+  устойчивый отказ allocator. PUC: closer вызывается, исходная ошибка
+  сохраняется (`st=2`, `closed=1`, `boom`); финальный syfc-прототип:
+  closer потерян, ошибка превращена в ERRMEM (`st=4`, `closed=0`,
+  `not enough memory`). Differential `/tmp/syfc_review_detachoom.c`,
+  оба бинарника рядом; Zig `ldd` указывает на sycp_proto liblua.so.
+  GDB `/tmp/syfc_review_detachoom_bt.txt` устанавливает первый запрос
+  памяти после `lua_error`: `detachLuaFrameTbcMarks ->
+  c_tbc_chain.ensureTotalCapacity` при `continueBytecodeErrorUnwind`.
+  На неудаче `try` прерывает semantic unwind; abort cleanup повторяет
+  detach с `catch {}` и затем pop'ает Lua-кадр, теряя обязанность close.
+  syfc: **CORRECT**, нормальный freshcallk parity подтверждён, полный
+  closeprotected/OOM owner contract и P1-P5 остаются открытыми.
+  Отчётный OOM-probe не достигает этого окна: sticky отказ происходит
+  до регистрации mark; D1#6-16 в Zig не инъецируют отказ.
 
 - [ ] **file mt `__tostring` не опубликован как функция (BLOCKER,
   pre-existing, ORDINARY-BACKLOG; найден scresv2 2026-10-04).** Единственный счётный

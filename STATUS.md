@@ -395,6 +395,19 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   верифицировал: suite 42 byte-identical PUC D+RF; 377/377 D+RF;
   smoke 93/93; matrix zig_fail=0; memerr rc=0; fmt/diff-check;
   cold-only (A/B не требуется).
+  REVIEW 2026-10-05 к `b64f913`/`b0e9c86`: **ACCEPT + RECORD**.
+  Независимый повтор прежнего poisoned `>L` репро больше не падает:
+  collector step=1, Closure остаётся в GC-chain на время чтения.
+  Focused unit Debug/RF (poison + OOM) зелёные; заново собранная suite
+  42 byte-identical PUC, `FAILS=0`. Source audit подтвердил root до
+  pop и restoreRoots на protected landing pad; fmt/diff-check clean.
+  MEDIUM evidence: fail_index 0..3 в OOM-тесте не атрибутированы
+  именно к reserve RootScope — после загрузки chunk вектор roots
+  может уже иметь свободную capacity (независимая проба: len=0,
+  cap=21). Тест доказывает ERRMEM/cleanup на достигнутых отказах,
+  а reserve failure обоснован структурно NoGC reserve-before-pop.
+  Product-дефекта в этом пробеле не обнаружено. Foundation P0/P0.5/P1
+  принят после correction; следующий утверждённый шаг — A-full P2.
 
 - [x] **scres architecture verification: target lua_State и OOM/GC
   (HIGH, research handoff завершён).**

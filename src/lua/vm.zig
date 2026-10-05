@@ -13575,10 +13575,14 @@ pub const Vm = struct {
         // operands follow) and produces PUC's exact error text for non-callable
         // values. The operand array is materialized here — cold path only.
         const args = [2]Value{ p1, p2 };
-        const resolved = try self.resolveCallable(metamethod, &args, .{
+        var resolved = try self.resolveCallable(metamethod, &args, .{
             .namewhat = "metamethod",
             .name = opname,
         });
+        // P2a: a known light pointer dispatches on the native Builtin lane
+        // (the sync arm below); the metamethod value's identity is not
+        // observable past the dispatch decision here.
+        resolved.callee = normalizeLightBuiltin(resolved.callee);
         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
 
         switch (resolved.callee) {
@@ -14481,10 +14485,14 @@ pub const Vm = struct {
             // (handles __call chains), then invoke — bytecode Closure as
             // continuation frame (yieldable), Builtin/C-closure synchronously.
             // No double resolution (Task 5).
-            const resolved = try self.resolveCallable(mmv, args[0..], .{
+            var resolved = try self.resolveCallable(mmv, args[0..], .{
                 .namewhat = "metamethod",
                 .name = "concat",
             });
+            // P2a: known light pointer → native Builtin lane (the sync arm
+            // below; tryPushResolvedContinuationCall only pushes bytecode
+            // Closures, so a normalized callee falls through to it).
+            resolved.callee = normalizeLightBuiltin(resolved.callee);
             defer if (resolved.owned_args) |owned| self.alloc.free(owned);
 
             const concat_state = try self.alloc.create(BytecodeConcatContinuation);
@@ -23433,6 +23441,10 @@ pub const Vm = struct {
         }
 
         const callee_val = ctx.regs[a + 4];
+        // P2a dispatch-entry normalization (see opCall): known light
+        // iterators (utf8.codes' product) take the native Builtin arm; the
+        // view C-frame at R[A+4] and the hook display keep the light value.
+        const dispatch_callee = normalizeLightBuiltin(callee_val);
 
         // Pre-grow stack so the rargs slice stays valid across pushBytecodeExecFrame.
         const child_frame_cap: u32 = switch (callee_val) {
@@ -23490,7 +23502,7 @@ pub const Vm = struct {
         }
 
         // Builtins and frozen IR closures remain synchronous.
-        const ret = switch (callee_val) {
+        const ret = switch (dispatch_callee) {
             .Builtin => |id| blk: {
                 const out_len = @max(self.builtinOutLen(id, rargs_builtin), @as(usize, nresults));
                 var outs_small: [8]Value = undefined;
@@ -23965,6 +23977,10 @@ pub const Vm = struct {
         }
 
         const callee_val = ctx.regs[a];
+        // P2a dispatch-entry normalization (see opCall): the dispatch value
+        // only — callee_val keeps the light identity for the view C-frame,
+        // pending calls, and hook display.
+        const dispatch_callee = normalizeLightBuiltin(callee_val);
         var call_args = ctx.regs[a + 1 .. a + 1 + effective_nargs];
 
         // Final bound after the __call chain (the entry publication above
@@ -24017,7 +24033,7 @@ pub const Vm = struct {
             // first instruction, with ci->func already swapped) — both hook
             // kinds share the reuse-site dispatch below.
             deferred_tail_hook = true;
-        } else switch (callee_val) {
+        } else switch (dispatch_callee) {
             .Builtin => |id| {
                 // P15.83r (PUC precallC via luaD_pretailcall): plain
                 // LUA_HOOKCALL on a FRESH C CallInfo. A chained activation
@@ -24105,9 +24121,10 @@ pub const Vm = struct {
         // Chain-resolved builtins keep the REAL C activation: the diverts
         // below (and the coroutine fast path further down) replace it with
         // frames that have no place to commit CIST_CCMT — divert only when
-        // no __call chain was traversed (see the OP_CALL site).
-        if (callee_val == .Builtin and
-            callee_val.Builtin == .pairs and
+        // no __call chain was traversed (see the OP_CALL site). P2a: the
+        // guards read the normalized dispatch value.
+        if (dispatch_callee == .Builtin and
+            dispatch_callee.Builtin == .pairs and
             chain_depth == 0 and
             try self.tryPushBytecodePairsMetamethod(
                 ctx.exec_frames,
@@ -24126,7 +24143,7 @@ pub const Vm = struct {
         // builtinPcall/builtinXpcall, the same real C/YPCALL frame and
         // recovery owner as every other entry (the bytecode protection fast
         // path no longer intercepts them).
-        if (callee_val == .Builtin and
+        if (dispatch_callee == .Builtin and
             self.bytecode_coroutine_trampoline_active and
             chain_depth == 0 and
             try self.tryRequestBytecodeCoroutineSwitch(
@@ -24134,7 +24151,7 @@ pub const Vm = struct {
                 ctx.frame_index,
                 a,
                 -1,
-                callee_val.Builtin,
+                dispatch_callee.Builtin,
                 call_args,
                 true,
                 ctx.boundary_depth,
@@ -24335,7 +24352,7 @@ pub const Vm = struct {
         }
 
         // Non-bytecode tail call: execute the callee and return its results.
-        const ret = switch (callee_val) {
+        const ret = switch (dispatch_callee) {
             .Builtin => |id| blk: {
                 // P16.5b: Fast path for coroutine.resume/yield — skip
                 // pushBuiltinCFrame/callBuiltin dispatch (same guards as
@@ -24815,6 +24832,12 @@ pub const Vm = struct {
         ctx.th.top = ctx.base + a + 1 + effective_nargs;
 
         const resolved_callee = ctx.regs[a];
+        // P2a dispatch-entry normalization: a known light pointer (trampoline
+        // registry hit) takes the native Builtin lane below — the dispatch
+        // DECISION only. callee_val (registers, the view C-frame's func slot,
+        // pending calls, hook callee display) keeps the light identity: PUC
+        // sees the C function.
+        const dispatch_callee = normalizeLightBuiltin(resolved_callee);
         const skip_call_hook = (self.dispatch_gate & DISPATCH_GATE_HOOKS != 0) and
             ctx.exec_frames.getPtr(ctx.frame_index).u.lua.skip_call_hook_pc == @as(u32, @intCast(ctx.pc));
         // PUC ordering (luaD_precall ldo.c:715 + luaG_tracecall ldebug.c:918):
@@ -24856,7 +24879,7 @@ pub const Vm = struct {
             ctx.exec_frames.getPtr(ctx.frame_index).u.lua.skip_call_hook_pc = INVALID_PC;
         } else if (!self.hooks_active_cached) {
             // No hooks active — skip both noinline hook-dispatch calls.
-        } else switch (resolved_callee) {
+        } else switch (dispatch_callee) {
             .Closure => |cl| {
                 if (cl.proto != null) {
                     // Bytecode callee: the CALL event fires on the callee's
@@ -24915,12 +24938,15 @@ pub const Vm = struct {
         }
 
         const callee_val = resolved_callee;
-        switch (callee_val) {
+        switch (dispatch_callee) {
             .Builtin => |id| {
                 // Chain-resolved builtins keep the REAL C activation (the
                 // continuation diverts below replace it with frames that
                 // have no place to commit CIST_CCMT) — divert only when no
-                // __call chain was traversed.
+                // __call chain was traversed. P2a: a normalized known light
+                // pointer enters this arm with the raw light callee_val —
+                // the view C-frame below lands on R[A] (the light value),
+                // exactly PUC's ci->func.
                 if (id == .pairs and chain_depth == 0 and try self.tryPushBytecodePairsMetamethod(
                     ctx.exec_frames,
                     ctx.frame_index,
@@ -27502,11 +27528,16 @@ pub const Vm = struct {
         // Minimal utf8 table used by upstream pattern tests.
         const utf8_tbl = try self.allocTableNoGc();
         try self.setField(utf8_tbl, "charpattern", .{ .String = try self.internStr("[\x00-\x7F\xC2-\xFD][\x80-\xBF]*") });
-        try self.setField(utf8_tbl, "char", .{ .Builtin = .utf8_char });
-        try self.setField(utf8_tbl, "codepoint", .{ .Builtin = .utf8_codepoint });
-        try self.setField(utf8_tbl, "len", .{ .Builtin = .utf8_len });
-        try self.setField(utf8_tbl, "offset", .{ .Builtin = .utf8_offset });
-        try self.setField(utf8_tbl, "codes", .{ .Builtin = .utf8_codes });
+        // P2a: utf8 is the light-publication pilot — every entry is a
+        // canonical LightCFunction value whose pointer is the trampoline
+        // registry's stable C ABI symbol (PUC lutf8lib.c funcs[]).
+        // VM-internal dispatch normalizes known pointers to the native
+        // Builtin lane (normalizeLightBuiltin); .Builtin stays internal.
+        try self.setField(utf8_tbl, "char", .{ .LightCFunction = &utf8LightChar });
+        try self.setField(utf8_tbl, "codepoint", .{ .LightCFunction = &utf8LightCodepoint });
+        try self.setField(utf8_tbl, "len", .{ .LightCFunction = &utf8LightLen });
+        try self.setField(utf8_tbl, "offset", .{ .LightCFunction = &utf8LightOffset });
+        try self.setField(utf8_tbl, "codes", .{ .LightCFunction = &utf8LightCodes });
         try self.setGlobal("utf8", .{ .Table = utf8_tbl });
 
         // io = { input/output/write over std streams, stderr = { write = builtin } }
@@ -28284,7 +28315,7 @@ pub const Vm = struct {
             }
         }.f;
 
-        const resolved = self.resolveCallable(callee, call_args, null) catch |e| switch (e) {
+        var resolved = self.resolveCallable(callee, call_args, null) catch |e| switch (e) {
             error.Yield => {
                 yield_exit = true;
                 return e;
@@ -28313,6 +28344,11 @@ pub const Vm = struct {
                 return try self.ownedPcallFail();
             },
         };
+        // P2a: a known light pointer (e.g. a light-published utf8 function
+        // as the pcall target) takes the native .Builtin arm — same
+        // dispatch as its .Builtin twin; the callee identity is not
+        // observable past this decision (no pending record carries it).
+        resolved.callee = normalizeLightBuiltin(resolved.callee);
         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
 
         switch (resolved.callee) {
@@ -28729,7 +28765,7 @@ pub const Vm = struct {
         // luaG_errormsg) and its result replaced the error object, so
         // protectedErrorValue() IS the handler-transformed object (or the
         // "error in error handling" object when the handler kept failing).
-        const resolved = self.resolveCallable(f, call_args, null) catch |e| switch (e) {
+        var resolved = self.resolveCallable(f, call_args, null) catch |e| switch (e) {
             error.Yield => {
                 yield_exit = true;
                 return e;
@@ -28757,6 +28793,8 @@ pub const Vm = struct {
                 return try self.ownedPcallFail();
             },
         };
+        // P2a: known light pointer → native .Builtin arm (see builtinPcall).
+        resolved.callee = normalizeLightBuiltin(resolved.callee);
         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
 
         switch (resolved.callee) {
@@ -41094,7 +41132,10 @@ pub const Vm = struct {
         const mm = self.getMetaFieldByObj(args[0], .pairs);
         if (mm) |mmv| {
             var mm_args = [_]Value{args[0]};
-            const resolved = try self.resolveCallable(mmv, mm_args[0..], .{ .namewhat = "metamethod", .name = "__pairs" });
+            var resolved = try self.resolveCallable(mmv, mm_args[0..], .{ .namewhat = "metamethod", .name = "__pairs" });
+            // P2a: known light pointer → native .Builtin arm (the 4-slot
+            // pairs contract below).
+            resolved.callee = normalizeLightBuiltin(resolved.callee);
             defer if (resolved.owned_args) |owned| self.alloc.free(owned);
             // PUC luaB_pairs calls __pairs via lua_callk(..., 4, pairscont):
             // the metamethod's results are ALWAYS adjusted to 4 (the callk's
@@ -46502,7 +46543,12 @@ pub const Vm = struct {
             _ = scope.protectValueAssumeCapacity(call_args[0]);
             arg_count = 1;
         }
-        const resolved = try self.resolveCallable(repl_fn, call_args[0..arg_count], null);
+        var resolved = try self.resolveCallable(repl_fn, call_args[0..arg_count], null);
+        // P2a: a known light replacement function (e.g. utf8.len as the
+        // gsub repl) dispatches on the native Builtin lane — PUC runs it
+        // as a real C activation, luazig's .Builtin arm is the established
+        // native twin for VM-internal calls.
+        resolved.callee = normalizeLightBuiltin(resolved.callee);
         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
         // P16.23 T6: PUC lstrlib gsub calls the replacement via lua_call →
         // luaD_callnoyield → ccall(nyci): EVERY nesting level consumes one
@@ -47226,7 +47272,12 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len == 0 or args[0] != .String) return self.fail("invalid UTF-8 code", .{});
         const nonstrict = if (args.len >= 2) isTruthy(args[1]) else false;
-        outs[0] = .{ .Builtin = if (nonstrict) .utf8_codes_iter_ns else .utf8_codes_iter };
+        // P2a: the iterator is published as the canonical light value (PUC
+        // iter_codes pushes iter_auxstrict/iter_auxlax via lua_pushcfunction
+        // — the same C symbol every call), so two utf8.codes calls yield
+        // rawequal iterators and the for-loop's OP_TFORCALL dispatch
+        // normalizes to the native lane.
+        outs[0] = .{ .LightCFunction = if (nonstrict) &utf8LightCodesIterNs else &utf8LightCodesIter };
         if (outs.len > 1) outs[1] = args[0];
         if (outs.len > 2) outs[2] = .{ .Int = 0 };
     }
@@ -47257,6 +47308,260 @@ pub const Vm = struct {
         const d = self.decodeUtf8At(s, next_pos, nonstrict) catch return self.fail("invalid UTF-8 code", .{});
         outs[0] = .{ .Int = @intCast(next_pos) };
         if (outs.len > 1) outs[1] = .{ .Int = d.cp };
+    }
+
+    // ------------------------------------------------------------------
+    // P2a (A-full cut P2a): light C function publication — trampoline
+    // registry + dispatch-entry normalization.
+    //
+    // PUC publishes every nup=0 stdlib function as a VLCF: ONE canonical
+    // value per function whose payload is the real C symbol address
+    // (lutf8lib.c's funcs[] entries, lua_pushcfunction in iter_codes).
+    // luazig's .Builtin values carry no pointer, so lua_tocfunction/
+    // topointer/rawequal-as-table-key see no stable identity. The pilot
+    // (utf8) republishes each function as a LightCFunction whose pointer
+    // is a comptime-generated trampoline: a real C-ABI function that runs
+    // the native builtin core when invoked through a real C activation
+    // (host lua_call/lua_pcall, lua_resume of a VLCF body, lua_load
+    // reader, debug hook lane — the lanes where PUC runs the C function
+    // for real). VM-INTERNAL dispatch (OP_CALL/OP_TAILCALL/OP_TFORCALL,
+    // metamethods, pcall/xpcall, pairs, gsub, sort, __index/__newindex)
+    // normalizes a known light pointer to its native BuiltinId BEFORE the
+    // C-window/result-marshalling (normalizeLightBuiltin below), so an
+    // ordinary stdlib call never pays the host C boundary. .Builtin stays
+    // the internal implementation lane (deleted in P2c), NOT the public
+    // identity.
+    // ------------------------------------------------------------------
+
+    /// One registry entry: the trampoline's C ABI pointer and the native
+    /// lane it fronts. Comptime-immutable — no runtime state, no second
+    /// mutable lookup (B1 candidate: linear scan over a handful of
+    /// entries; the scan runs only when a callee is already a
+    /// LightCFunction, so .Builtin/.Closure callees pay one tag compare).
+    const LightBuiltinEntry = struct {
+        ptr: *const fn (?*lua_State) callconv(.c) c_int,
+        id: BuiltinId,
+    };
+
+    /// The utf8 pilot's trampoline registry: every published utf8 entry
+    /// (char/codepoint/len/offset/codes) plus the codes iterator pair
+    /// produced by builtinUtf8Codes (strict/lax variants — PUC
+    /// iter_auxstrict/iter_auxlax). Pointers are static function
+    /// addresses: stable across states, table republishes, and repeated
+    /// luaopen_utf8 (PUC's C symbols have the same property).
+    const light_builtin_registry = [_]LightBuiltinEntry{
+        .{ .ptr = &utf8LightChar, .id = .utf8_char },
+        .{ .ptr = &utf8LightCodepoint, .id = .utf8_codepoint },
+        .{ .ptr = &utf8LightLen, .id = .utf8_len },
+        .{ .ptr = &utf8LightOffset, .id = .utf8_offset },
+        .{ .ptr = &utf8LightCodes, .id = .utf8_codes },
+        .{ .ptr = &utf8LightCodesIter, .id = .utf8_codes_iter },
+        .{ .ptr = &utf8LightCodesIterNs, .id = .utf8_codes_iter_ns },
+    };
+
+    /// Map a light C function pointer to its native Builtin lane, or null
+    /// for real host C functions (they keep the genuine C ABI lane).
+    fn lightBuiltinId(
+        p: ?*const fn (?*lua_State) callconv(.c) c_int,
+    ) ?BuiltinId {
+        for (light_builtin_registry) |e| {
+            if (e.ptr == p) return e.id;
+        }
+        return null;
+    }
+
+    /// P2a dispatch-entry normalization: a KNOWN light pointer (trampoline
+    /// registry hit) dispatches on the native Builtin lane; every other
+    /// value passes through unchanged (unknown light pointers are real
+    /// host C functions — genuine C ABI lane). Callers normalize the
+    /// DISPATCH DECISION ONLY: registers, pending-call records, C-frame
+    /// func slots, and hook callee display keep the original light value
+    /// (PUC sees the C function, not an internal lane tag).
+    fn normalizeLightBuiltin(callee: Value) Value {
+        if (callee == .LightCFunction) {
+            if (lightBuiltinId(callee.LightCFunction)) |id| {
+                return .{ .Builtin = id };
+            }
+        }
+        return callee;
+    }
+
+    /// Shared trampoline body (PUC `(*f)(L)` inside luaD_precallC — the
+    /// activation itself is callCFunction's: the C-frame is pushed, the
+    /// args staged at [fs+1..top], cur_handle set, and the CALL hook fired
+    /// BEFORE this body runs; it must not push or pop anything). Reads the
+    /// args from the C-frame window, runs the native core via
+    /// callBuiltinSwitch (NOT callBuiltin — that owns the C-frame push),
+    /// stages the results, and pushes them onto the window
+    /// (cWindowPushSlice — the epilogue reads the top nret slots, PUC
+    /// poscall shape). Yield/error/OOM transport follows the shim protocol
+    /// of callCFunctionWithBoundary (plain -1/-2/-3 returns; longjmp for
+    /// OOM/YieldAbsorbed/ThreadSwitch), mirroring packageShimReturn /
+    /// testcLightCFuncError: every longjmp arm frees the owned transport
+    /// slices explicitly BEFORE raising (defers don't run across
+    /// _longjmp), and an abandoned root scope is left open for the landing
+    /// pad's restoreRoots.
+    fn lightBuiltinTrampolineBody(id: BuiltinId, L: ?*lua_State) c_int {
+        const h = L orelse return 0;
+        const self = h.vm;
+        const th = handleThread(h);
+        if (th.call_frames.len() == 0 or
+            !th.call_frames.getConstPtr(th.call_frames.len() - 1).isC())
+        {
+            _ = self.failC("C function called without an activation frame", .{}) catch {};
+            return -1;
+        }
+        const fr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
+        const fs = fr.func_slot;
+        const args = th.stack[fs + 1 .. th.top];
+
+        // Result staging: builtinOutLen sizes the exact window (arg-derived
+        // for dynamic-count ids). The buffer is infraAlloc'd transport —
+        // PUC reserves the C callee's stack slots above L->top (no counted
+        // allocation; builtinPcall's staging precedent), so the countdown
+        // profile keeps only the builtin's own real allocations.
+        const nouts = self.builtinOutLen(id, args);
+        const outs: []Value = if (nouts == 0)
+            &[_]Value{}
+        else
+            self.infraAlloc().alloc(Value, nouts) catch {
+                // The transport alloc failed before anything was staged —
+                // raise the OOM through the armed boundary exactly like the
+                // push-failure arm below.
+                self.setOutOfMemoryError();
+                self.latchErrmemRaiseWindow(th);
+                self.c_error_value = self.errThread().err_obj;
+                self.c_error_status = 4; // LUA_ERRMEM
+                if (self.c_error_jmp) |jb| {
+                    _longjmp(@ptrCast(jb), 1);
+                }
+                std.process.abort();
+            };
+        if (nouts > 0) @memset(outs, .Nil);
+        self.last_builtin_out_count = nouts;
+        // active_builtin context mirrors callBuiltin (coroutine.yield's
+        // suspended_builtin, failTabArgerror's qualified-name attribution).
+        // Restored by plain statements, not a defer: the shim tail's
+        // longjmp arms bypass Zig defers.
+        const prev_active_builtin = self.active_builtin;
+        const prev_active_builtin_args = self.active_builtin_args;
+        self.active_builtin = id;
+        self.active_builtin_args = args;
+        const switch_res = self.callBuiltinSwitch(id, args, outs);
+        self.active_builtin = prev_active_builtin;
+        self.active_builtin_args = prev_active_builtin_args;
+        const owned = switch_res catch |e| {
+            self.infraAlloc().free(outs);
+            return self.lightCFuncShimError(e);
+        };
+        // Exact results: an owned slice (dynamic-count builtins) IS the
+        // transport (allocOwnedResult — infraAlloc'd; the staging window
+        // is released on adoption); a window builtin produced into outs —
+        // the produced count is last_builtin_out_count for dynamic ids
+        // (captured at the call boundary, before any further VM execution
+        // — callBuiltin's re-entrant-safety rule), the window length
+        // otherwise. `vals` may be a SUB-SLICE of outs — the full
+        // allocation is freed, never the view (allocator free contract).
+        var vals: []Value = undefined;
+        var transport: []Value = outs;
+        if (owned) |v| {
+            self.infraAlloc().free(outs);
+            transport = v;
+            vals = v;
+        } else {
+            const produced: usize = if (builtinHasDynamicOutCount(id))
+                @min(self.last_builtin_out_count, nouts)
+            else
+                nouts;
+            vals = outs[0..produced];
+        }
+        // Root the results across the window push (its growth allocation
+        // can run an emergency GC; until the values land on th.stack they
+        // are visible only to this Zig frame — the intern table is weak,
+        // fresh strings would be swept). openRootScope reserves the
+        // capacity up front so the protects below are infallible.
+        var scope = self.openRootScope(vals.len, 0) catch {
+            self.infraAlloc().free(transport);
+            return self.lightCFuncShimError(error.OutOfMemory);
+        };
+        defer scope.close();
+        for (vals) |v| _ = scope.protectValueAssumeCapacity(v);
+        self.cWindowPushSlice(th, vals) catch {
+            // Same ownership rule as the scope-open arm: free before the
+            // jump (a partial window copy is rolled back by the landing
+            // pad's stack restore, not by this slice); the open root scope
+            // is abandoned for the landing pad's restoreRoots.
+            self.infraAlloc().free(transport);
+            return self.lightCFuncShimError(error.OutOfMemory);
+        };
+        self.infraAlloc().free(transport);
+        return @intCast(vals.len);
+    }
+
+    /// Shared error tail of the light builtin trampolines: map the
+    /// dispatch error to the shim-return protocol (RuntimeError is
+    /// already installed in the VM error state; MainDestined relays;
+    /// Yield parks this C frame — the pilot's ids are non-yielding, the
+    /// -2 mapping is the structurally correct general sentinel) or raise
+    /// the OOM through the armed boundary. Same protocol as
+    /// testcLightCFuncError / packageShimReturn.
+    fn lightCFuncShimError(self: *Vm, e: DispatchError) c_int {
+        return switch (e) {
+            error.RuntimeError => -1,
+            error.MainDestined => -3,
+            error.Yield => -2,
+            error.YieldAbsorbed => {
+                if (self.c_error_jmp) |jb| {
+                    self.c_error_status = 1; // LUA_YIELD sentinel: the raw-yield absorption fact
+                    _longjmp(@ptrCast(jb), 1);
+                }
+                std.process.abort();
+            },
+            error.OutOfMemory => {
+                if (self.c_error_jmp) |jb| {
+                    self.setOutOfMemoryError();
+                    self.latchErrmemRaiseWindow(self.activeBytecodeThread());
+                    self.c_error_value = self.errThread().err_obj;
+                    self.c_error_status = 4; // LUA_ERRMEM
+                    _longjmp(@ptrCast(jb), 1);
+                }
+                std.process.abort();
+            },
+            error.ThreadSwitch => {
+                if (self.c_error_jmp) |jb| {
+                    _longjmp(@ptrCast(jb), 3);
+                }
+                std.process.abort();
+            },
+        };
+    }
+
+    fn utf8LightChar(L: ?*lua_State) callconv(.c) c_int {
+        return lightBuiltinTrampolineBody(.utf8_char, L);
+    }
+
+    fn utf8LightCodepoint(L: ?*lua_State) callconv(.c) c_int {
+        return lightBuiltinTrampolineBody(.utf8_codepoint, L);
+    }
+
+    fn utf8LightLen(L: ?*lua_State) callconv(.c) c_int {
+        return lightBuiltinTrampolineBody(.utf8_len, L);
+    }
+
+    fn utf8LightOffset(L: ?*lua_State) callconv(.c) c_int {
+        return lightBuiltinTrampolineBody(.utf8_offset, L);
+    }
+
+    fn utf8LightCodes(L: ?*lua_State) callconv(.c) c_int {
+        return lightBuiltinTrampolineBody(.utf8_codes, L);
+    }
+
+    fn utf8LightCodesIter(L: ?*lua_State) callconv(.c) c_int {
+        return lightBuiltinTrampolineBody(.utf8_codes_iter, L);
+    }
+
+    fn utf8LightCodesIterNs(L: ?*lua_State) callconv(.c) c_int {
+        return lightBuiltinTrampolineBody(.utf8_codes_iter_ns, L);
     }
 
     /// P16.50-review-7 BLOCKER 4: hybrid result contract. Plain tables and
@@ -47721,7 +48026,12 @@ pub const Vm = struct {
             try self.ccallEnter(th, .nonyieldable);
             defer th.ccallExit(.nonyieldable);
             var outv: Value = .Nil;
-            switch (cf) {
+            // P2a: a known light comparator (e.g. utf8.len as the sort
+            // function) dispatches on the native Builtin lane — the
+            // comparator value's identity is not observable past the
+            // decision (results only).
+            const dispatch_cf = normalizeLightBuiltin(cf);
+            switch (dispatch_cf) {
                 .Builtin => |id| {
                     var outs1 = [_]Value{.Nil};
                     const call_args = [_]Value{ a, b };
@@ -47745,7 +48055,9 @@ pub const Vm = struct {
                 },
                 else => {
                     var call_args = [_]Value{ a, b };
-                    const resolved = try self.resolveCallable(cf, call_args[0..], null);
+                    var resolved = try self.resolveCallable(cf, call_args[0..], null);
+                    // P2a: known light pointer → native .Builtin arm.
+                    resolved.callee = normalizeLightBuiltin(resolved.callee);
                     defer if (resolved.owned_args) |owned| self.alloc.free(owned);
                     switch (resolved.callee) {
                         .Builtin => |id| {
@@ -48464,7 +48776,9 @@ pub const Vm = struct {
             self.debug_namewhat_override = saved_nwo;
             self.debug_name_override = saved_no;
         }
-        return switch (mm) {
+        // P2a: a known light __index dispatches on the native Builtin lane.
+        const dispatch_mm = normalizeLightBuiltin(mm);
+        return switch (dispatch_mm) {
             .Table => |t| try self.tableGetValueDepth(t, key, depth + 1),
             .Builtin => |id| blk: {
                 var call_args = [_]Value{ .{ .Table = tbl }, key };
@@ -48538,7 +48852,9 @@ pub const Vm = struct {
             self.debug_namewhat_override = saved_nwo;
             self.debug_name_override = saved_no;
         }
-        return switch (mmv) {
+        // P2a: a known light __index dispatches on the native Builtin lane.
+        const dispatch_mm = normalizeLightBuiltin(mmv);
+        return switch (dispatch_mm) {
             .Table => |t| try self.tableGetValueDepth(t, key, depth + 1),
             .Builtin => |id| blk: {
                 var call_args = [_]Value{ object, key };
@@ -48580,7 +48896,10 @@ pub const Vm = struct {
             // PUC fasttm: check flags bit, cache-on-miss via fasttm.
             const mm = self.fastTm(tbl.metatable.?, .newindex) orelse
                 return self.tableSetValue(tbl, key, val);
-            switch (mm) {
+            // P2a: a known light __newindex dispatches on the native
+            // Builtin lane.
+            const dispatch_mm = normalizeLightBuiltin(mm);
+            switch (dispatch_mm) {
                 .Table => |t| return self.setIndexValueDepth(.{ .Table = t }, key, val, depth + 1),
                 .Builtin => |id| {
                     var call_args = [_]Value{ object, key, val };
@@ -48613,7 +48932,10 @@ pub const Vm = struct {
         if (mm == null) {
             return self.fail("attempt to index a {s} value", .{object.typeName()});
         }
-        switch (mm.?.*) {
+        // P2a: a known light __newindex dispatches on the native Builtin
+        // lane.
+        const dispatch_mm = normalizeLightBuiltin(mm.?.*);
+        switch (dispatch_mm) {
             .Table => |t| return self.setIndexValueDepth(.{ .Table = t }, key, val, depth + 1),
             .Builtin => |id| {
                 var call_args = [_]Value{ object, key, val };
@@ -48884,10 +49206,13 @@ pub const Vm = struct {
         // Stage 2: resolve through normal callable semantics (handles __call
         // chains), then invoke synchronously. resolveCallable produces PUC's
         // exact error text for non-callable values via the call_name parameter.
-        const resolved = try self.resolveCallable(mmv, args, .{
+        var resolved = try self.resolveCallable(mmv, args, .{
             .namewhat = "metamethod",
             .name = opname,
         });
+        // P2a: known light pointer → native .Builtin arm (covers __close,
+        // __tostring, __eq, and the index/newindex routing lanes).
+        resolved.callee = normalizeLightBuiltin(resolved.callee);
         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
 
         return switch (resolved.callee) {

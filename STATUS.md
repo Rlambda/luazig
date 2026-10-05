@@ -310,6 +310,19 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   pre-existing); perf current-* откачены (не публикуются). P2-P5 НЕ
   product parity — миграция stdlib callable после принятия
   foundation.
+  REVIEW 2026-10-05 к `7519c48`/`459c46d`/`b809c68`: **CORRECT**.
+  P0 `lua_getinfo(">L")` создаёт GC-UAF при единственной ссылке на
+  функцию: после pop на `c_api.zig:4067` локальная `Value` не является
+  GC-root; `getinfoCollectValidLines` вызывает `State.newtable`, чей
+  `Vm.allocTable` выполняет automatic GC до чтения `proto.lineinfo`.
+  Независимая Debug-проба `/tmp/afp0_getinfo_gc.zig` (генерационный GC,
+  due-step, 5000 строк Lua, poison-unmap allocator) падает с SIGSEGV
+  точно на `c_api.zig:4032`, после `before top=2 base=1 slot1=Closure`.
+  Suite 42 не содержит `>L` с sole-reference функцией при GC;
+  P0 foundation поэтому не принят. P1 static audit новых confirmed
+  BLOCKER/HIGH не нашёл; его частичные gates не заменяют correction.
+  Следующий ограниченный cut — root/lifetime функции во всех fallible
+  флагах `lua_getinfo('>')`, GC/OOM/longjmp и постоянный differential.
   REVIEW 2026-10-05 к `677cafa`: **ACCEPT + RECORD** для research
   correction. Независимый source audit подтвердил единый infraAlloc owner
   на 5 registration и 3 deinit sites; повторная сборка ReleaseFast
@@ -360,6 +373,15 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   resolver (light/CClosure/Lua + non-closure C-shape), точный stack
   effect; suite 42_getinfo_fn baseline 28 FAIL -> byte-identical PUC
   D+RF (координатор лично).
+
+- [ ] **A-full P0 `lua_getinfo(">L")` освобождает единственную функцию
+  при automatic GC (BLOCKER, FIX-NOW, внесён `7519c48`).** После pop
+  function value остаётся только в Zig local; GC сканирует стек до
+  `th.top`, а `State.newtable` может собрать Closure/Proto до
+  чтения `lineinfo`. Независимый poisoned Debug repro:
+  `/tmp/afp0_getinfo_gc.zig` → SIGSEGV `c_api.zig:4032`.
+  Требуется GC-root через весь resolver/flags/push-back, включая
+  OOM/longjmp cleanup, и focused sole-reference `>L` GC test.
 
 - [x] **scres architecture verification: target lua_State и OOM/GC
   (HIGH, research handoff завершён).**

@@ -29440,6 +29440,24 @@ pub const Vm = struct {
                 if (self.stats.enabled) self.stats.yield_allocs += 1; // P16.0b (heap spill only)
             }
             try th.yielded.setOwnedCopy(self.alloc, args);
+            // Frameless no-arg park (the direct fast path pushed no C
+            // frame, and yieldArgSpan parks nothing for an empty window):
+            // the dynamic window anchor would expose the suspended Lua
+            // frame's live register file. PUC's parked window is the
+            // yield's own C window at ci->func+1 — empty here. Anchor
+            // yield_window_base at the park top so lua_gettop reads 0;
+            // the resume entry's anchor discard then restores the same
+            // top (a no-op, exactly like PUC's missing frame). Hook and
+            // close-transport yields are excluded for the same reason
+            // the span arm excludes them: their PUC window IS the
+            // suspended frame's register file (lua_yieldk in a hook
+            // exposes maxstacksize slots; the <close> transport parks
+            // owned copies).
+            if (args.len == 0 and !in_debug_hook and self.testc_close_metamethod_depth == 0) {
+                const top_frame_is_c = th.call_frames.len() > 0 and
+                    th.call_frames.getConstPtr(th.call_frames.len() - 1).isC();
+                if (!top_frame_is_c) th.yield_window_base = th.top;
+            }
         }
         // P16.50-review-7 BLOCKER 4: no last_builtin_out_count transport —
         // yield never returns normally (error.Yield below); the parked

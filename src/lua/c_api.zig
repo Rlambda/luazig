@@ -3693,26 +3693,30 @@ fn fillShortSrc(buf: *[60]u8, source: []const u8) void {
         }
         return;
     }
-    // PUC: string source — wrap as [string "..."].
-    // Find first line (up to first newline).
-    const nl = std.mem.indexOfAny(u8, source, "\r\n") orelse source.len;
-    const first_line = source[0..nl];
+    // PUC: string source — [string "body"] (luaO_chunkid's string arm).
+    // The body is the source up to the first '\n', truncated to the
+    // 45-char budget; the "..." marker appears whenever the source had a
+    // newline or exceeded the budget (a short one-line source keeps no
+    // marker — `srclen < bufflen && nl == NULL`).
+    const nl = std.mem.indexOfScalar(u8, source, '\n');
     const prefix = "[string \"";
     const suffix = "\"]";
-    const max_body = 59 - prefix.len - suffix.len; // leave room for prefix+suffix+NUL
-    if (first_line.len <= max_body) {
-        const total = prefix.len + first_line.len + suffix.len;
+    const budget = 59 - prefix.len - 3 - suffix.len; // room for "..." + NUL
+    if (source.len < budget and nl == null) {
+        const total = prefix.len + source.len + suffix.len;
         @memcpy(buf[0..prefix.len], prefix);
-        @memcpy(buf[prefix.len..][0..first_line.len], first_line);
-        @memcpy(buf[prefix.len + first_line.len ..][0..suffix.len], suffix);
+        @memcpy(buf[prefix.len..][0..source.len], source);
+        @memcpy(buf[prefix.len + source.len ..][0..suffix.len], suffix);
         buf[total] = 0;
     } else {
-        const keep = max_body - 3; // 3 bytes for "..."
-        const total = prefix.len + keep + 3 + suffix.len;
+        var body_len = source.len;
+        if (nl) |pos| body_len = pos;
+        if (body_len > budget) body_len = budget;
+        const total = prefix.len + body_len + 3 + suffix.len;
         @memcpy(buf[0..prefix.len], prefix);
-        @memcpy(buf[prefix.len..][0..keep], first_line[0..keep]);
-        @memcpy(buf[prefix.len + keep ..][0..3], "...");
-        @memcpy(buf[prefix.len + keep + 3 ..][0..suffix.len], suffix);
+        @memcpy(buf[prefix.len..][0..body_len], source[0..body_len]);
+        @memcpy(buf[prefix.len + body_len ..][0..3], "...");
+        @memcpy(buf[prefix.len + body_len + 3 ..][0..suffix.len], suffix);
         buf[total] = 0;
     }
 }
@@ -3750,112 +3754,188 @@ pub export fn lua_getstack(L: ?*lua_State, level: c_int, ar: *lua_Debug) c_int {
     return 0;
 }
 
-/// PUC `lua_getinfo` (lapi.c:lua_getinfo): fill `lua_Debug` fields from the
-/// frame identified by `ar->i_ci` (set by `lua_getstack`). The `what` string
-/// controls which fields are filled: 'S' (source), 'l' (currentline),
-/// 'u' (ups/params), 't' (tailcall/extraargs), 'n' (name/namewhat),
-/// 'r' (transfer window).
-///
-/// Returns 1 on success, 0 on invalid frame handle.
+/// PUC `funcinfo` (ldebug.c:259-281): fill the 'S' fields for a function
+/// VALUE (shared by lua_getinfo's frame form and '>' function form).
+/// Non-Lua-closure values (light C functions, C closures, and — matching
+/// release PUC's closure unwrap — any non-closure value) get the C shape.
+fn getinfoFillSource(vm: *Vm, h: *lua_State, ar: *lua_Debug, func: Value) void {
+    if (func == .Closure) blk: {
+        const cl = func.Closure;
+        const p = cl.proto orelse break :blk; // C closure
+        if (p.sourceName().len == 0 and p.lineinfo.len == 0) {
+            // PUC funcinfo's NULL-source arm (ldebug.c:269-273): protos
+            // from stripped dumps report "=?", which luaO_chunkid shortens
+            // to "?".
+            ar.source = "=?";
+            ar.srclen = 2;
+            ar.linedefined = @intCast(p.line_defined);
+            ar.lastlinedefined = @intCast(p.last_line_defined);
+            ar.what = if (p.line_defined == 0) "main" else "Lua";
+            fillShortSrc(&ar.short_src, "=?");
+            return;
+        }
+        ar.what = if (p.line_defined == 0) "main" else "Lua";
+        // PUC ldebug.c funcinfo (ldebug.c:358): ar->source =
+        // svalue(p->source) — a PROTO-LIFETIME NUL-terminated
+        // pointer, no fresh allocation per query. Protos
+        // carrying the debug_names_z
+        // contract (builder-fused tail, fixed undump, cloned
+        // non-fixed undump) hand the pointer out directly; a
+        // fresh internStr would leave an UNROOTED string that a
+        // collection between getinfo and the caller's read
+        // can sweep.
+        if (p.flags.debug_names_z) {
+            ar.source = @ptrCast(@constCast(p.sourceName().ptr));
+            ar.srclen = @intCast(p.sourceName().len);
+        } else {
+            // Fallback (protos without the contract — hand-built
+            // test protos, un-cloned non-fixed undump): intern
+            // and root the string on the C window so it survives
+            // any collection until the caller pops the window —
+            // the closest PUC-parity lifetime available without
+            // the contract. OOM is LUA_ERRMEM.
+            // Reserve the slot BEFORE the
+            // intern — the push then hits reserved capacity and
+            // cannot sweep the fresh unrooted string at a full
+            // window.
+            const wth = Vm.handleThread(h);
+            vm.cWindowEnsure(wth, 1) catch |e| cThrowOn(vm, h, api.mapVmError(e));
+            const src_ls = vm.internStr(p.sourceName()) catch |e| cThrowOn(vm, h, e);
+            vm.cWindowPush(wth, .{ .String = src_ls }) catch |e| cThrowOn(vm, h, api.mapVmError(e));
+            ar.source = @ptrCast(@constCast(src_ls.bytes().ptr));
+            ar.srclen = src_ls.bytes().len;
+        }
+        ar.linedefined = @intCast(p.line_defined);
+        ar.lastlinedefined = @intCast(p.last_line_defined);
+        fillShortSrc(&ar.short_src, p.sourceName());
+        return;
+    }
+    // C function shape (PUC funcinfo's !LuaClosure arm): no source info.
+    ar.what = "C";
+    ar.source = "=[C]";
+    ar.srclen = 4;
+    ar.linedefined = -1;
+    ar.lastlinedefined = -1;
+    fillShortSrc(&ar.short_src, "=[C]");
+}
+
+/// PUC `collectvalidlines` (ldebug.c:292-321): the 'L' flag pushes a table
+/// with a `true` entry per active line for a Lua closure, nil for anything
+/// else. The table is pushed BEFORE it is filled (PUC ldebug.c:302-303):
+/// the window slot roots it across every insert allocation. The line set
+/// is the same computation the Lua-level debug.getinfo 'L' lane uses
+/// (byte-identical to PUC's per-instruction walk on all validated shapes).
+fn getinfoCollectValidLines(vm: *Vm, h: *lua_State, func: Value) void {
+    const proto: ?*const bc.Proto = if (func == .Closure) func.Closure.proto else null;
+    if (proto == null) {
+        vm.cWindowPush(Vm.handleThread(h), .Nil) catch |e| cThrowOn(vm, h, api.mapVmError(e));
+        return;
+    }
+    var s = api.State.fromHandle(h);
+    s.newtable() catch |e| cThrowOn(vm, h, e);
+    for (proto.?.lineinfo) |line| {
+        if (line > 0) {
+            s.pushboolean(true) catch |e| cThrowOn(vm, h, e);
+            // The table sits at -2 while the value is staged on top.
+            s.rawseti(-2, line) catch |e| cThrowOn(vm, h, e);
+        }
+    }
+}
+
+/// PUC `lua_getinfo` (ldebug.c:lua_getinfo): fill `lua_Debug` fields from
+/// the frame identified by `ar->i_ci` (set by `lua_getstack`) or — when
+/// `what` starts with '>' — from the function value on top of the stack
+/// (PUC pops it before reading the flags; every flag then runs with
+/// ci == NULL, so 'l' is -1 and 'n' finds no name). 'f' pushes the
+/// function back after the flags; 'L' pushes the valid-lines table (or
+/// nil). Returns 0 when `what` holds an invalid option (flags before the
+/// invalid one are still filled), 1 otherwise; 0 on an invalid frame
+/// handle.
 pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c_int {
     const h = L orelse return 0;
     const vm = h.vm;
-    // Recover the frame index from ar.i_ci (1-based, stored by lua_getstack).
-    const ci_raw = @intFromPtr(ar.i_ci orelse return 0);
-    if (ci_raw == 0) return 0;
-    const frame_idx = ci_raw - 1; // convert back to 0-based
-
-    const th = vm.current_thread orelse vm.main_thread orelse return 0;
-    if (frame_idx >= th.call_frames.len()) return 0;
-    const frame = th.call_frames.getConstPtr(frame_idx);
-
     const flags = std.mem.span(what);
+    const fn_form = flags.len > 0 and flags[0] == '>';
+    const opts = if (fn_form) flags[1..] else flags;
 
-    for (flags) |flag| {
+    var func: Value = .Nil;
+    var frame_idx: usize = 0;
+    var th: *vm_mod.Thread = undefined;
+    if (fn_form) {
+        // PUC ldebug.c:401-407: func = s2v(L->top - 1), then pop. An empty
+        // window makes PUC read ci->func (the running function) and pop
+        // below the API base — window corruption we do not mirror; the
+        // read is kept, the pop clamps at the window base.
+        const wth = Vm.handleThread(h);
+        if (wth.top == 0) return 0;
+        func = wth.stack[wth.top - 1];
+        if (wth.top > Vm.cWindowBase(wth)) wth.top -= 1;
+        th = wth;
+    } else {
+        // Recover the frame index from ar.i_ci (1-based, stored by lua_getstack).
+        const ci_raw = @intFromPtr(ar.i_ci orelse return 0);
+        if (ci_raw == 0) return 0;
+        const fi = ci_raw - 1; // convert back to 0-based
+
+        th = vm.current_thread orelse vm.main_thread orelse return 0;
+        if (fi >= th.call_frames.len()) return 0;
+        frame_idx = fi;
+        const frame = th.call_frames.getConstPtr(fi);
+        func = if (frame.func_slot < th.stack.len) th.stack[frame.func_slot] else .Nil;
+    }
+
+    var status: c_int = 1;
+    var push_func = false;
+    var push_lines = false;
+    for (opts) |flag| {
         switch (flag) {
-            'S' => {
-                if (frame.proto()) |p| {
-                    // Lua function: fill source info from Proto.
-                    const what_str: [*:0]const u8 = if (p.line_defined == 0) "main" else "Lua";
-                    ar.what = what_str;
-                    // PUC ldebug.c funcinfo (ldebug.c:358): ar->source =
-                    // svalue(p->source) — a PROTO-LIFETIME NUL-terminated
-                    // pointer, no fresh allocation per query. Protos
-                    // carrying the debug_names_z
-                    // contract (builder-fused tail, fixed undump, cloned
-                    // non-fixed undump) hand the pointer out directly; a
-                    // fresh internStr would leave an UNROOTED string that a
-                    // collection between getinfo and the caller's read
-                    // can sweep.
-                    if (p.flags.debug_names_z) {
-                        if (p.sourceName().len == 0) {
-                            ar.source = "";
-                        } else {
-                            ar.source = @ptrCast(@constCast(p.sourceName().ptr));
-                        }
-                        ar.srclen = @intCast(p.sourceName().len);
-                    } else {
-                        // Fallback (protos without the contract — hand-built
-                        // test protos, un-cloned non-fixed undump): intern
-                        // and root the string on the C window so it survives
-                        // any collection until the caller pops the window —
-                        // the closest PUC-parity lifetime available without
-                        // the contract. OOM is LUA_ERRMEM.
-                        // Reserve the slot BEFORE the
-                        // intern — the push then hits reserved capacity and
-                        // cannot sweep the fresh unrooted string at a full
-                        // window.
-                        vm.cWindowEnsure(Vm.handleThread(h), 1) catch |e| cThrowOn(vm, h, api.mapVmError(e));
-                        const src_ls = vm.internStr(p.sourceName()) catch |e| cThrowOn(vm, h, e);
-                        vm.cWindowPush(Vm.handleThread(h), .{ .String = src_ls }) catch |e| cThrowOn(vm, h, api.mapVmError(e));
-                        const src_bytes = src_ls.bytes();
-                        ar.source = @ptrCast(@constCast(src_bytes.ptr));
-                        ar.srclen = src_bytes.len;
-                    }
-                    ar.linedefined = @intCast(p.line_defined);
-                    ar.lastlinedefined = @intCast(p.last_line_defined);
-                    fillShortSrc(&ar.short_src, p.sourceName());
-                } else {
-                    // C function: no source info.
-                    ar.what = "C";
-                    ar.source = "=[C]";
-                    ar.srclen = 4;
-                    ar.linedefined = -1;
-                    ar.lastlinedefined = -1;
-                    fillShortSrc(&ar.short_src, "=[C]");
-                }
-            },
+            'S' => getinfoFillSource(vm, h, ar, func),
             'l' => {
-                ar.currentline = @intCast(vm.frameCurrentLine(frame));
+                ar.currentline = if (!fn_form)
+                    @intCast(vm.frameCurrentLine(th.call_frames.getConstPtr(frame_idx)))
+                else
+                    -1;
             },
             'u' => {
-                if (frame.proto()) |p| {
-                    ar.nups = @intCast(p.upvalues.len);
+                if (func == .Closure) blk: {
+                    const cl = func.Closure;
+                    const p = cl.proto orelse break :blk; // C closure
+                    ar.nups = @intCast(cl.upvalues.len);
+                    // A load()ed main chunk always carries _ENV as its one
+                    // upvalue in PUC (luaF_newLclosure(L, 1) at lua_load);
+                    // our main closures hold no cells for it, so the
+                    // class-level shape reports the PUC-visible count.
+                    if (p.line_defined == 0 and p.flags.is_vararg and
+                        p.numparams == 0 and cl.upvalues.len == 0)
+                    {
+                        ar.nups = 1;
+                    }
                     ar.nparams = p.numparams;
                     ar.isvararg = if (p.flags.is_vararg) 1 else 0;
-                } else {
-                    // PUC ldebug.c:344-348 (auxgetinfo 'u' for C functions):
-                    // nups = nupvalues of the called function (0 for light C
-                    // functions / builtins), nparams = 0, isvararg = 1 — C
-                    // functions accept any number of arguments.
-                    const func = if (frame.func_slot < th.stack.len)
-                        th.stack[frame.func_slot]
-                    else
-                        .Nil;
-                    ar.nups = if (func == .Closure)
-                        @intCast(func.Closure.upvalues.len)
-                    else
-                        0;
-                    ar.nparams = 0;
-                    ar.isvararg = 1;
+                    continue;
                 }
+                // PUC ldebug.c:344-348 (auxgetinfo 'u' for C functions):
+                // nups = nupvalues of the called function (0 for light C
+                // functions / builtins), nparams = 0, isvararg = 1 — C
+                // functions accept any number of arguments. Release PUC
+                // treats any non-closure value through the same arm.
+                ar.nups = if (func == .Closure) @intCast(func.Closure.upvalues.len) else 0;
+                ar.nparams = 0;
+                ar.isvararg = 1;
             },
             't' => {
                 // PUC auxgetinfo 't' (ldebug.c:356-366): extraargs is the
                 // frame's committed __call-chain count (callstatus bits
-                // 8-11), istailcall the CIST_TAIL flag.
-                ar.istailcall = if (frame.isTailCall()) 1 else 0;
-                ar.extraargs = @intCast(frame.ccmt());
+                // 8-11), istailcall the CIST_TAIL flag; both zero without
+                // a frame (the '>' form).
+                if (fn_form) {
+                    ar.istailcall = 0;
+                    ar.extraargs = 0;
+                } else {
+                    const frame = th.call_frames.getConstPtr(frame_idx);
+                    ar.istailcall = if (frame.isTailCall()) 1 else 0;
+                    ar.extraargs = @intCast(frame.ccmt());
+                }
             },
             'n' => {
                 // PUC auxgetinfo 'n' (ldebug.c:369-373): namewhat comes from
@@ -3865,9 +3945,11 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
                 // NULL namewhat.
                 var resolved_namewhat: []const u8 = "";
                 var resolved_name: ?[]const u8 = null;
-                if (vm.getFuncNameForFrame(th, frame_idx)) |dn| {
-                    resolved_namewhat = dn.namewhat;
-                    resolved_name = dn.name;
+                if (!fn_form) {
+                    if (vm.getFuncNameForFrame(th, frame_idx)) |dn| {
+                        resolved_namewhat = dn.namewhat;
+                        resolved_name = dn.name;
+                    }
                 }
                 // PUC hands out C string
                 // LITERALS for namewhat (ldebug.c) — no allocation per
@@ -3897,7 +3979,7 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
                     // intern+window-root fallback covers parent protos
                     // without the contract (hand-built test protos).
                     const parent_has_contract = blk: {
-                        if (frame_idx == 0) break :blk true; // no naming parent: literal-only sources
+                        if (fn_form or frame_idx == 0) break :blk true; // no naming parent: literal-only sources
                         const parent = th.call_frames.getConstPtr(frame_idx - 1);
                         if (parent.proto()) |pp| break :blk pp.flags.debug_names_z;
                         break :blk true; // C/hook/fin caller: literal-only sources
@@ -3919,19 +4001,32 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
             'r' => {
                 // PUC auxgetinfo 'r' (ldebug.c:376-383): both transfer
                 // fields are zero except on the frame a running hook is
-                // interrupting, which reports the active transfer window.
-                if (vm.debugTransferWindowForFrame(th, frame_idx)) |tr| {
-                    ar.ftransfer = @intCast(tr.ftransfer);
-                    ar.ntransfer = @intCast(tr.ntransfer);
-                } else {
-                    ar.ftransfer = 0;
-                    ar.ntransfer = 0;
+                // interrupting, which reports the active transfer window;
+                // always zero without a frame (the '>' form).
+                if (!fn_form) {
+                    if (vm.debugTransferWindowForFrame(th, frame_idx)) |tr| {
+                        ar.ftransfer = @intCast(tr.ftransfer);
+                        ar.ntransfer = @intCast(tr.ntransfer);
+                        continue;
+                    }
                 }
+                ar.ftransfer = 0;
+                ar.ntransfer = 0;
             },
-            else => {}, // ignore unknown flags (PUC default)
+            // 'f'/'L' are handled by the push tail below (PUC
+            // ldebug.c:417-423 runs them after auxgetinfo).
+            'f' => push_func = true,
+            'L' => push_lines = true,
+            else => status = 0, // invalid option (PUC auxgetinfo default)
         }
     }
-    return 1;
+    if (push_func) {
+        vm.cWindowPush(Vm.handleThread(h), func) catch |e| cThrowOn(vm, h, api.mapVmError(e));
+    }
+    if (push_lines) {
+        getinfoCollectValidLines(vm, h, func);
+    }
+    return status;
 }
 
 /// PUC `lua_getlocal` (lapi.c:lua_getlocal): get the name of the `n`-th local

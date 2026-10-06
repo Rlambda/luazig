@@ -13,6 +13,7 @@
  * (cross-pair); installing any other class into the slot is PUC UB
  * (lua_touserdata -> NULL -> deref) and is deliberately not reproduced. */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "lua.h"
 #include "lauxlib.h"
@@ -26,6 +27,47 @@ static void check(long cond, const char *label) {
 }
 
 static int ref_r1, ref_s1, ref_r2, ref_s2;
+
+/* 'A'-run payload for the __name length lanes (P5c): a single fixed buffer
+ * sliced by length, so every length exercises the same character class. */
+static char name_a[3000];
+static void push_mt_a(lua_State *L, int namelen) {
+    lua_newtable(L);
+    lua_newtable(L);
+    lua_pushlstring(L, name_a, namelen);
+    lua_setfield(L, -2, "__name");
+    lua_setmetatable(L, -2);
+}
+
+/* ---- countdown allocator for the formatting-OOM lane (P5d) ---- */
+static int countdown = -1;   /* -1: never fail; k: fail the k-th allocation */
+static int frozen = 0;       /* once the k-th allocation fails, keep failing
+                              * (defeats the emergency-GC retry) until cleared */
+static void *falloc(void *ud, void *ptr, size_t osize, size_t nsize) {
+    (void)ud; (void)osize;
+    if (nsize == 0) { free(ptr); return NULL; }
+    if (frozen) return NULL;
+    if (countdown > 0) {
+        countdown--;
+        if (countdown == 0) { frozen = 1; return NULL; }
+    }
+    if (ptr) return realloc(ptr, nsize);
+    return malloc(nsize);
+}
+
+/* the exact full tag-error message for the 3000-A __name (PUC-derived
+ * contract: luaL_argerror builds it with no length cap) */
+static char expect_full[64 + sizeof(name_a)];
+static void build_expect_full(void) {
+    size_t p = 0;
+    const char *pre = "bad argument #1 to 'math.random' (number expected, got ";
+    size_t plen = strlen(pre);
+    memcpy(expect_full, pre, plen);
+    memcpy(expect_full + plen, name_a, sizeof(name_a));
+    p = plen + sizeof(name_a);
+    expect_full[p] = ')';
+    expect_full[p + 1] = '\0';
+}
 
 static void seed_and_draw(lua_State *L, int ref_r, int ref_s, long long *out, int n) {
     lua_rawgeti(L, LUA_REGISTRYINDEX, ref_s);
@@ -392,7 +434,188 @@ int main(void) {
     lua_pushinteger(L, 100); lane(ref_r1, 1, 1, "P5b.seq.aftererr");
     lua_pushinteger(L, 100); lane(ref_r1, 1, 1, "P5b.seq.next");
 
+    /* --- P5c: tag-error type-name preservation at any __name length ---
+     * the "got <type>" clause must survive every length: the message is
+     * built by the common error formatter with no length cap (PUC
+     * luaL_typeerror -> luaO_pushfstring). The chosen lengths span the
+     * historical fixed-buffer boundaries (43/44 around a 64-byte total,
+     * 2000/3000 around a 2048-byte total). */
+    memset(name_a, 'A', sizeof(name_a));
+    push_mt_a(L, 43); lane(ref_r1, 1, 1, "P5c.name.43");
+    push_mt_a(L, 44); lane(ref_r1, 1, 1, "P5c.name.44");
+    push_mt_a(L, 100); lane(ref_r1, 1, 1, "P5c.name.100");
+    push_mt_a(L, 2000); lane(ref_r1, 1, 1, "P5c.name.2000");
+    push_mt_a(L, 3000); lane(ref_r1, 1, 1, "P5c.name.3000");
+    push_mt_a(L, 100); lane(ref_s1, 1, 2, "P5c.seed.name.100");
+    lua_pushinteger(L, 42); push_mt_a(L, 100);
+    lane(ref_s1, 2, 2, "P5c.seed.arg2.name.100");
+    /* other __name forms: userdata carrier, short name, non-string __name
+     * (PUC objtypename falls back to the type name), no metatable */
+    lua_newuserdata(L, 0);
+    lua_newtable(L);
+    lua_pushlstring(L, name_a, 100);
+    lua_setfield(L, -2, "__name");
+    lua_setmetatable(L, -2);
+    lane(ref_r1, 1, 1, "P5c.ud.name.100");
+    lua_newtable(L);
+    lua_newtable(L);
+    lua_pushliteral(L, "mytype");
+    lua_setfield(L, -2, "__name");
+    lua_setmetatable(L, -2);
+    lane(ref_r1, 1, 1, "P5c.name.short");
+    lua_newtable(L);
+    lua_newtable(L);
+    lua_pushinteger(L, 42);
+    lua_setfield(L, -2, "__name");
+    lua_setmetatable(L, -2);
+    lane(ref_r1, 1, 1, "P5c.name.nonstring");
+    lua_newtable(L);
+    lane(ref_r1, 1, 1, "P5c.table.plain");
+
     printf("fails:%d\n", fails);
     lua_close(L);
+
+    /* --- P5d: allocation failure during error-message formatting ---
+     * A warmup call with the same shape (valid argument) runs before the
+     * countdown is armed, so k can only hit allocations of the protected
+     * call and the raise itself, not one-time stack/frame growth. Verdict
+     * classes (normalized like the suite 49/50 OOM lanes — the per-runtime
+     * allocation structure is not a parity contract; every text inside a
+     * class is checked exactly):
+     *   clean-full       the freeze never hit the raise: ERRRUN with the
+     *                    exact full PUC message;
+     *   degraded-recovered  the freeze hit the protected call or the
+     *                    raise's message construction. Accepted shapes:
+     *                    LUA_ERRMEM with the fixed "not enough memory"
+     *                    string object (PUC luaM_error replaces the
+     *                    original error — never a degraded RuntimeError);
+     *                    LUA_ERRMEM from the call's own argument
+     *                    marshalling (luazig allocates there and fails
+     *                    before consuming anything — no error object, a
+     *                    known separate C-API item); or the oracle's
+     *                    staged-assembly artifact (PUC builds
+     *                    luaL_argerror through the stack —
+     *                    pushglobalfuncname pushes the resolved name,
+     *                    luaL_error concats the pieces — so a freeze
+     *                    hitting the final assembly surfaces the
+     *                    half-assembled context as an ERRRUN object).
+     *                    Every shape must fully recover: the retried call
+     *                    raises the exact full message and the VM stays
+     *                    usable. Aggregates (full-seen/errmem-seen) keep
+     *                    the matrix non-vacuous on both runtimes. */
+    build_expect_full();
+    int full_seen = 0, errmem_seen = 0;
+    for (int k = 1; k <= 8; k++) {
+        lua_State *L = lua_newstate(falloc, NULL, 0);
+        if (!L) { printf("P5d.k=%d: newstate-failed\n", k); fails++; continue; }
+        luaL_openlibs(L);
+        push_mt_a(L, 3000);
+        int mt = lua_gettop(L);
+        /* warmup: seed + draw with the same call shapes proves the stack
+         * and frame capacity, so the armed window contains no one-time
+         * growth allocations */
+        lua_getglobal(L, "math");
+        lua_getfield(L, -1, "randomseed");
+        lua_pushinteger(L, 42); lua_pushinteger(L, 7);
+        if (lua_pcall(L, 2, 0, 0) != LUA_OK) {
+            printf("P5d.k=%d: VIOLATION(warmup)\n", k);
+            fails++;
+            lua_close(L);
+            continue;
+        }
+        lua_getfield(L, -1, "random");
+        lua_pushinteger(L, 100);
+        if (lua_pcall(L, 1, 1, 0) != LUA_OK || lua_tointeger(L, -1) != 49) {
+            printf("P5d.k=%d: VIOLATION(warmup)\n", k);
+            fails++;
+            lua_close(L);
+            continue;
+        }
+        lua_pop(L, 1);
+        int pre_top = lua_gettop(L);
+        countdown = k; frozen = 0;
+        lua_getglobal(L, "math");
+        lua_getfield(L, -1, "random");
+        lua_pushvalue(L, mt);
+        int st = lua_pcall(L, 1, 1, 0);
+        countdown = -1; frozen = 0;
+        const char *verdict;
+        int need_recovery = 0;
+        if (st == LUA_OK) {
+            verdict = "VIOLATION(noerror)";
+            lua_pop(L, 1);
+        } else if (st == LUA_ERRRUN) {
+            const char *msg = lua_tostring(L, -1);
+            if (msg != NULL && strcmp(msg, expect_full) == 0) {
+                verdict = "clean-full";
+                full_seen = 1;
+            } else if (msg != NULL && msg[0] != '\0') {
+                /* the oracle's staged-assembly artifact (see above) */
+                verdict = "degraded-recovered";
+                need_recovery = 1;
+            } else {
+                verdict = "VIOLATION(msg)";
+            }
+            lua_pop(L, 1);
+        } else if (st == LUA_ERRMEM) {
+            if (lua_type(L, -1) == LUA_TSTRING) {
+                const char *m = lua_tostring(L, -1);
+                if (m == NULL || strcmp(m, "not enough memory") != 0) {
+                    verdict = "VIOLATION(errtype)";
+                } else {
+                    verdict = "degraded-recovered";
+                    errmem_seen = 1;
+                }
+                lua_pop(L, 1);
+            } else {
+                /* the argument-marshalling shape: the call consumed
+                 * nothing and pushed no object (see above) */
+                verdict = "degraded-recovered";
+                lua_settop(L, pre_top);   /* undo the unconsumed call setup */
+            }
+            need_recovery = 1;
+        } else {
+            verdict = "VIOLATION(status)";
+            lua_pop(L, 1);
+        }
+        if (need_recovery) {
+            lua_gc(L, LUA_GCCOLLECT, 0);
+            /* recovery + VM reuse after the failure: the same call must
+             * raise the full message, and the state must stay usable */
+            lua_getfield(L, -1, "random");
+            lua_pushvalue(L, mt);
+            int st2 = lua_pcall(L, 1, 1, 0);
+            if (st2 != LUA_ERRRUN) {
+                verdict = "VIOLATION(retry-status)";
+                lua_pop(L, 1);
+            } else {
+                const char *m2 = lua_tostring(L, -1);
+                if (m2 == NULL || strcmp(m2, expect_full) != 0)
+                    verdict = "VIOLATION(retry-msg)";
+                lua_pop(L, 1);
+            }
+            lua_getfield(L, -1, "randomseed");
+            lua_pushinteger(L, 42); lua_pushinteger(L, 7);
+            int st3 = lua_pcall(L, 2, 0, 0);
+            if (st3 != LUA_OK) {
+                verdict = "VIOLATION(reuse)";
+                lua_pop(L, 1);
+            } else {
+                lua_getfield(L, -1, "random");
+                lua_pushinteger(L, 100);
+                int st4 = lua_pcall(L, 1, 1, 0);
+                if (st4 != LUA_OK || lua_tointeger(L, -1) != 49)
+                    verdict = "VIOLATION(reuse)";
+                lua_pop(L, 1);
+            }
+        }
+        printf("P5d.k=%d: %s\n", k, verdict);
+        if (verdict[0] == 'V') fails++;
+        lua_close(L);
+    }
+    check(full_seen, "P5d.full.seen");
+    check(errmem_seen, "P5d.errmem.seen");
+
+    printf("fails:%d\n", fails);
     return fails ? 1 : 0;
 }

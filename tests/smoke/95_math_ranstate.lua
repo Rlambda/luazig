@@ -124,3 +124,47 @@ lane(math.randomseed, "42", "abc")
 math.randomseed(42, 7)
 lane(math.random, "abc")
 lane(math.random, 100)
+
+-- tag-error type-name preservation at any __name length: the "got <type>"
+-- clause is built by the common error formatter with no length cap (PUC
+-- luaL_typeerror -> pushfstring); the lengths span the historical
+-- fixed-buffer boundaries (43/44 around a 64-byte total, 2000/3000 around
+-- a 2048-byte total). pcall lanes keep the function name byte-identical.
+local function mtname(n) return setmetatable({}, {__name = string.rep("A", n)}) end
+math.randomseed(42, 7)
+lane(math.random, mtname(43))
+math.randomseed(42, 7)
+lane(math.random, mtname(44))
+math.randomseed(42, 7)
+lane(math.random, mtname(100))
+math.randomseed(42, 7)
+lane(math.random, mtname(2000))
+math.randomseed(42, 7)
+lane(math.random, mtname(3000))
+math.randomseed(42, 7)
+lane(math.random, setmetatable({}, {__name = "mytype"}))
+math.randomseed(42, 7)
+lane(math.random, {})
+math.randomseed(42, 7)
+lane(math.randomseed, mtname(100))
+math.randomseed(42, 7)
+lane(math.randomseed, 42, mtname(100))
+-- the full object survives a coroutine boundary (the re-throw shaping
+-- keeps the name resolution byte-identical across runtimes)
+math.randomseed(42, 7)
+local rf = math.random
+print(pcall(coroutine.wrap(function()
+  local ok, e = pcall(rf, mtname(100))
+  if not ok then error(e) end
+end)))
+math.randomseed(42, 7)
+print(pcall(coroutine.wrap(function()
+  local ok, e = pcall(rf, mtname(2000))
+  if not ok then error(e, 0) end
+end)))
+-- mutation-sensitive length check at a bound-spanning length
+math.randomseed(42, 7)
+print(#select(2, pcall(math.random, mtname(3000))))
+-- the VM stays fully usable after the long-message failures
+math.randomseed(42, 7)
+print(math.random(100))

@@ -87,17 +87,25 @@ static int file_exists_mode(const char *p, mode_t *mode_out) {
  * Lower the NOFILE soft limit to just above the current maximum
  * descriptor number and fill every hole below it with /dev/null
  * descriptors, so the next file create deterministically hits EMFILE.
- * Returns the filler count, or -1 if a probe create still succeeded
- * (exhaustion failed — the caller's checks then fail loudly). */
+ * On success returns the filler count and publishes the ORIGINAL limit
+ * through rl_old (the caller MUST restore_fds(rl_old, n) once the gated
+ * calls are done). On any failure returns -1 after fully undoing its own
+ * partial state: no filler left open and the process limit either never
+ * changed (getrlimit/max_fd/setrlimit failure) or was restored (the
+ * probe-exhaustion path), with rl_old left untouched — the caller must
+ * NOT run the gated calls (the environment was never exhausted) and must
+ * NOT call restore_fds (there is nothing to restore). */
 static int fillers[1200];
 static void restore_fds(const struct rlimit *rl_old, int n);
 static int exhaust_fds(struct rlimit *rl_old) {
-    if (getrlimit(RLIMIT_NOFILE, rl_old) != 0) return -1;
-    struct rlimit rl = *rl_old;
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0) return -1;
     int mx = max_fd();
     if (mx < 0) return -1;
-    rl.rlim_cur = (rlim_t)(mx + 1);
-    if (setrlimit(RLIMIT_NOFILE, &rl) != 0) return -1;
+    struct rlimit lowered = rl;
+    lowered.rlim_cur = (rlim_t)(mx + 1);
+    if (setrlimit(RLIMIT_NOFILE, &lowered) != 0) return -1;
+    *rl_old = rl;   /* publish the original only after the change took effect */
     int n = 0;
     while (n < 1200) {
         int fd = open("/dev/null", O_RDONLY);
@@ -259,28 +267,32 @@ int main(void) {
      * exhausted descriptor table the result-discarding call must still
      * attempt the exclusive create and raise the same catchable create
      * failure — an implementation that skips the create when no result
-     * is wanted would return LUA_OK here. */
+     * is wanted would return LUA_OK here. A preparation failure fails
+     * the gate explicitly and skips the exhausted window: the calls must
+     * not run in a false (non-exhausted) environment. */
     int fds_before_nr = count_fds();
     struct rlimit rl_nr;
     int nfill_nr = exhaust_fds(&rl_nr);
     check(nfill_nr >= 0, "noresult_fds_exhausted");
-    lua_getglobal(L, "os");
-    lua_getfield(L, -1, "tmpname");
-    lua_replace(L, -2);
-    int st_nr = lua_pcall(L, 0, 0, 0);          /* nresults = 0 */
-    int raised = (st_nr != LUA_OK);
-    const char *body_nr = NULL;
-    if (st_nr != LUA_OK) {
-        body_nr = lua_tostring(L, -1);
-        lua_pop(L, 1);
+    if (nfill_nr >= 0) {
+        lua_getglobal(L, "os");
+        lua_getfield(L, -1, "tmpname");
+        lua_replace(L, -2);
+        int st_nr = lua_pcall(L, 0, 0, 0);          /* nresults = 0 */
+        int raised = (st_nr != LUA_OK);
+        const char *body_nr = NULL;
+        if (st_nr != LUA_OK) {
+            body_nr = lua_tostring(L, -1);
+            lua_pop(L, 1);
+        }
+        restore_fds(&rl_nr, nfill_nr);
+        check(raised, "noresult_create_error_raised");
+        check(body_nr != NULL && strstr(body_nr, "unable to generate a unique filename") != NULL,
+              "noresult_error_body");
+        check(count_fds() == fds_before_nr, "noresult_fd_stable");
     }
-    restore_fds(&rl_nr, nfill_nr);
-    check(raised, "noresult_create_error_raised");
-    check(body_nr != NULL && strstr(body_nr, "unable to generate a unique filename") != NULL,
-          "noresult_error_body");
-    check(count_fds() == fds_before_nr, "noresult_fd_stable");
-    /* recovery: with the descriptors restored the call works again and
-     * returns its own removable name */
+    /* recovery: with the descriptors restored (or never lowered) the call
+     * works again and returns its own removable name */
     int st_nr2 = call_tmpname(L);
     check(st_nr2 == LUA_OK, "noresult_recovered");
     if (st_nr2 == LUA_OK) {
@@ -295,18 +307,20 @@ int main(void) {
     struct rlimit rl_nc;
     int nfill_nc = exhaust_fds(&rl_nc);
     check(nfill_nc >= 0, "noresult_chunk_fds_exhausted");
-    int st_nc = luaL_dostring(L, "os.tmpname()");
-    int raised_c = (st_nc != LUA_OK);
-    const char *body_c = NULL;
-    if (st_nc != LUA_OK) {
-        body_c = lua_tostring(L, -1);
-        lua_pop(L, 1);
+    if (nfill_nc >= 0) {
+        int st_nc = luaL_dostring(L, "os.tmpname()");
+        int raised_c = (st_nc != LUA_OK);
+        const char *body_c = NULL;
+        if (st_nc != LUA_OK) {
+            body_c = lua_tostring(L, -1);
+            lua_pop(L, 1);
+        }
+        restore_fds(&rl_nc, nfill_nc);
+        check(raised_c, "noresult_chunk_error_raised");
+        check(body_c != NULL && strstr(body_c, "unable to generate a unique filename") != NULL,
+              "noresult_chunk_error_body");
+        check(count_fds() == fds_before_nc, "noresult_chunk_fd_stable");
     }
-    restore_fds(&rl_nc, nfill_nc);
-    check(raised_c, "noresult_chunk_error_raised");
-    check(body_c != NULL && strstr(body_c, "unable to generate a unique filename") != NULL,
-          "noresult_chunk_error_body");
-    check(count_fds() == fds_before_nc, "noresult_chunk_fd_stable");
 
     /* math isolation: the sequence is not disturbed, the RanState upvalue
      * of math.random stays a userdata */
@@ -327,23 +341,27 @@ int main(void) {
 
     /* forced create failure with the result wanted: the call must raise
      * a catchable error carrying the PUC message body, leak no
-     * descriptor, and the state must recover once the limit is restored. */
+     * descriptor, and the state must recover once the limit is restored.
+     * A preparation failure fails the gate explicitly and skips the
+     * exhausted window. */
     int fds_before_hf = count_fds();
     struct rlimit rl_hf;
     int nfill_hf = exhaust_fds(&rl_hf);
     check(nfill_hf >= 0, "hardfail_fds_exhausted");
-    int st = call_tmpname(L);
-    int catchable = (st == LUA_ERRRUN);
-    const char *body = NULL;
-    if (st != LUA_OK) {
-        body = lua_tostring(L, -1);
-        lua_pop(L, 1);
+    if (nfill_hf >= 0) {
+        int st = call_tmpname(L);
+        int catchable = (st == LUA_ERRRUN);
+        const char *body = NULL;
+        if (st != LUA_OK) {
+            body = lua_tostring(L, -1);
+            lua_pop(L, 1);
+        }
+        restore_fds(&rl_hf, nfill_hf);
+        check(catchable, "hardfail_catchable");
+        check(body != NULL && strstr(body, "unable to generate a unique filename") != NULL,
+              "hardfail_msg_body");
+        check(count_fds() == fds_before_hf, "hardfail_fd_stable");
     }
-    restore_fds(&rl_hf, nfill_hf);
-    check(catchable, "hardfail_catchable");
-    check(body != NULL && strstr(body, "unable to generate a unique filename") != NULL,
-          "hardfail_msg_body");
-    check(count_fds() == fds_before_hf, "hardfail_fd_stable");
     int st2 = call_tmpname(L);
     check(st2 == LUA_OK, "hardfail_recovered");
     if (st2 == LUA_OK) { remove(lua_tostring(L, -1)); lua_pop(L, 1); }

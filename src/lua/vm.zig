@@ -9676,19 +9676,30 @@ pub const Vm = struct {
         // Fresh error: reset LUA_ERRERR signal before invokeErrfunc.
         self.errThread().err_is_errerr = false;
         self.errThread().err_is_oom = false;
-        // PUC Lua error messages can be long — e.g. `require`'s "module not
-        // found" message lists every searched path (path + cpath), which can
-        // exceed 512 bytes with the full default LUA_PATH_DEFAULT. Use a
-        // generous stack buffer to avoid truncating to the "runtime error"
-        // fallback (which loses the diagnostic entirely).
-        var tmp: [2048]u8 = undefined;
-        const msg = std.fmt.bufPrint(tmp[0..], fmt, args) catch "runtime error";
-        self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
+        // PUC luaG_runerror → luaO_pushvfstring: the message is heap-built
+        // with NO length cap — an __name type name, a require path list or a
+        // nested-wrap prefix chain can be arbitrarily long. A fixed buffer
+        // would truncate the diagnostic and a fallback literal would replace
+        // it (losing e.g. the "got <type>" clause entirely). OOM while
+        // building the message is ERRMEM (PUC luaM_error replaces the
+        // original error), never a degraded RuntimeError.
+        const msg = std.fmt.allocPrint(self.alloc, fmt, args) catch {
+            self.setOutOfMemoryError();
+            return error.OutOfMemory;
+        };
+        // Best-effort raw view (see `err`): prefix copy into the Vm scratch.
+        // The semantic identity of the error is err_obj below, which is exact
+        // at any length; the view only feeds diagnostics that read message
+        // prefixes, and the save/restore bundle already bounds it at 256.
+        const view_len = @min(msg.len, self.err_buf.len);
+        @memcpy(self.err_buf[0..view_len], msg[0..view_len]);
+        self.err = self.err_buf[0..view_len];
         // pos_frame picks the position source: fail() passes topLuaFrame()
         // (skips C-frames, which don't have u.lua fields — prevents union
         // field mismatch panic when callBuiltin pushes a C-frame and a
         // builtin calls fail()); failArgerror() passes the immediate caller
         // of the raiser's C-frame (luaL_where(1) semantics).
+        var full: []const u8 = msg;
         if (pos_frame) |fr| {
             // PUC luaG_runerror → luaG_addinfo reads ci->u.l.savedpc as-is:
             // the pc published by the LAST savestate (Protect/checkGC/
@@ -9710,40 +9721,51 @@ pub const Vm = struct {
             // "?:?: msg" (same condition as protectedErrorString below).
             const src = self.errThread().err_source.?;
             const null_source = (src.len == 0 or std.mem.eql(u8, src, "=?")) and self.errThread().err_line < 1;
-            const full = if (null_source)
-                std.fmt.allocPrint(self.alloc, "?:?: {s}", .{msg}) catch msg
+            full = if (null_source)
+                std.fmt.allocPrint(self.alloc, "?:?: {s}", .{msg}) catch {
+                    self.alloc.free(msg);
+                    self.setOutOfMemoryError();
+                    return error.OutOfMemory;
+                }
             else blk: {
                 var id_buf: [59]u8 = undefined;
                 const chunk = diag.chunkId(id_buf[0..], src);
                 const line = self.errThread().err_line;
                 break :blk if (line >= 1)
-                    std.fmt.allocPrint(self.alloc, "{s}:{d}: {s}", .{ chunk, line, msg }) catch msg
+                    std.fmt.allocPrint(self.alloc, "{s}:{d}: {s}", .{ chunk, line, msg }) catch {
+                        self.alloc.free(msg);
+                        self.setOutOfMemoryError();
+                        return error.OutOfMemory;
+                    }
                 else
-                    std.fmt.allocPrint(self.alloc, "{s}:?: {s}", .{ chunk, msg }) catch msg;
+                    std.fmt.allocPrint(self.alloc, "{s}:?: {s}", .{ chunk, msg }) catch {
+                        self.alloc.free(msg);
+                        self.setOutOfMemoryError();
+                        return error.OutOfMemory;
+                    };
             };
-            // PUC luaG_runerror → luaO_pushvfstring → (OOM) luaM_error: when
-            // error-message construction itself hits OOM (armed countdown /
-            // memlimit — memerr.lua testalloc loops hit every allocation,
-            // including this intern), the OOM error REPLACES the original —
-            // the message is lost, "not enough memory" is raised instead.
-            // setOutOfMemoryError is allocation-free (pre-interned literal,
-            // no traceback capture), so this degradation cannot fail again.
-            const full_str = self.internStr(full) catch {
-                self.setOutOfMemoryError();
-                return error.OutOfMemory;
-            };
-            self.errThread().err_obj = .{ .String = full_str };
-            self.errThread().err_has_obj = true;
         } else {
             self.errThread().err_source = null;
             self.errThread().err_line = -1;
-            const plain_str = self.internStr(self.err.?) catch {
-                self.setOutOfMemoryError();
-                return error.OutOfMemory;
-            };
-            self.errThread().err_obj = .{ .String = plain_str };
-            self.errThread().err_has_obj = true;
         }
+        // msg is the formatter-owned raw message; full is either msg itself
+        // or a separately allocated "position: msg" copy — free exactly the
+        // allocations made here (raiseAuxwrapError's ptr-compare pattern).
+        defer if (full.ptr != msg.ptr) self.alloc.free(full);
+        defer self.alloc.free(msg);
+        // PUC luaG_runerror → luaO_pushvfstring → (OOM) luaM_error: when
+        // error-message construction itself hits OOM (armed countdown /
+        // memlimit — memerr.lua testalloc loops hit every allocation,
+        // including this intern), the OOM error REPLACES the original —
+        // the message is lost, "not enough memory" is raised instead.
+        // setOutOfMemoryError is allocation-free (pre-interned literal,
+        // no traceback capture), so this degradation cannot fail again.
+        const full_str = self.internStr(full) catch {
+            self.setOutOfMemoryError();
+            return error.OutOfMemory;
+        };
+        self.errThread().err_obj = .{ .String = full_str };
+        self.errThread().err_has_obj = true;
         self.captureErrorTraceback();
         try self.invokeErrfunc();
         return error.RuntimeError;
@@ -43133,9 +43155,13 @@ pub const Vm = struct {
     /// PUC luaL_argerror (lauxlib.c:169-192) for the math shims: the function
     /// name is derived from the raising C-frame (PUC getfuncname via the
     /// caller) with the globals/loaded-table walk fallback (PUC
-    /// pushglobalfuncname) — no hardcoded name. 'extra' is the full
-    /// parenthesized message (interror text or tag_error's "expected, got").
-    fn mathArgError(self: *Vm, arg_no: usize, extra: []const u8) Error {
+    /// pushglobalfuncname) — no hardcoded name. The parenthesized message
+    /// (interror text or tag_error's "expected, got ...") is formatted by the
+    /// final raise itself: extra_fmt/extra_args flow into failArgerror as
+    /// format arguments, so no intermediate bounded buffer can truncate or
+    /// replace the message (PUC luaL_argerror builds the whole message in
+    /// luaO_pushfstring, which has no length cap).
+    fn mathArgError(self: *Vm, arg_no: usize, comptime extra_fmt: []const u8, extra_args: anytype) Error {
         const th = self.activeBytecodeThread();
         var nm: []const u8 = "?";
         if (th.call_frames.len() >= 2) {
@@ -43147,15 +43173,15 @@ pub const Vm = struct {
                 }
             }
         }
-        return self.failArgerror("bad argument #{d} to '{s}' ({s})", .{ arg_no, nm, extra });
+        return self.failArgerror("bad argument #{d} to '{s}' (" ++ extra_fmt ++ ")", .{ arg_no, nm } ++ extra_args);
     }
 
     /// PUC tag_error (lauxlib.c:211) via luaL_typeerror for the math shims:
-    /// the "got" type name is __name-aware (valueTypeName).
+    /// the "got" type name is __name-aware (valueTypeName) and flows into the
+    /// final raise as a format argument — the full message is built by the
+    /// common error-formatting path, unbounded like PUC's pushfstring.
     fn mathTagError(self: *Vm, arg_no: usize, v: Value) Error {
-        var buf: [64]u8 = undefined;
-        const extra = std.fmt.bufPrint(buf[0..], "number expected, got {s}", .{self.valueTypeName(v)}) catch "number expected";
-        return self.mathArgError(arg_no, extra);
+        return self.mathArgError(arg_no, "number expected, got {s}", .{self.valueTypeName(v)});
     }
 
     /// PUC math_random (lmathlib.c:582-614) over an explicit RanState.
@@ -43229,7 +43255,7 @@ pub const Vm = struct {
                 // in the same interror.
                 const t = @floor(f);
                 if (f != t or t < -9223372036854775808.0 or t >= 9223372036854775808.0)
-                    return self.mathArgError(arg_no, "number has no integer representation");
+                    return self.mathArgError(arg_no, "number has no integer representation", .{});
                 break :blk @intFromFloat(t);
             },
             else => unreachable,

@@ -45,7 +45,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
-- [x] **P3(math.random) implementation ready: RanState CClosure-миграция.**
+- [ ] **P3(math.random) implementation review correction: RanState CClosure-миграция.**
   Утверждённый A-full target: свежий RanState userdata как общий upvalue
   двух CClosure(1) на каждое `luaopen_math`; удалить `Vm.rng_state` и
   `BuiltinId.math_random*`, включить 1-arg `project()` rejection-путь.
@@ -97,6 +97,49 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   (--suite-release-gate не append, testes_matrix_safe.sh --no-build
   сломан, api580 harness) — severity/fate в p3i_report. Пункт
   закрывается; P3 READY FOR REVIEW.
+  REVIEW 2026-10-06: **CORRECT** (`2e9813b`/`65f221c`/`2b52437`).
+  Главный RanState/CClosure owner и T1 normal path подтверждены
+  независимыми focused прогонами; no-result ранний return не является
+  дефектом: вызывающий слой даёт builtin окно результата и отбрасывает
+  его позже. Но новая suite 50 при проверке no-result делает snapshot
+  ВСЕХ `/tmp/lua_*` и `clean_new()` удаляет каждый появившийся файл,
+  включая чужой. Параллельный запуск двух оракулов дал ложный
+  `noresult_side_effect:0`; раздельные прогоны прошли. Первая неверная
+  операция — `remove(path)` для файла, которым тест не владеет:
+  BLOCKER/FIX-NOW (потеря данных и недостоверный обязательный gate).
+  Заменить эту пробу безопасным PUC differential, например
+  no-result вызовом при исчерпанных fd: ошибка доказывает попытку
+  создать файл без сканирования и удаления `/tmp`.
+  Дополнительно PUC `luaL_checkinteger` принимает числовую строку:
+  `math.randomseed(42,7); math.random("10")` даёт 1 и
+  `math.randomseed("42","7"); math.random(100)` даёт 49; текущий
+  math shim отвергает строку. Разрыв существовал до P3, но новый
+  `mathCheckInt` закрепил неверный input contract в мигрированном
+  пути. BLOCKER по семантике валидной программы, FIX-NOW в P3
+  CORRECTION CLOSED (`1225b5b`, 2026-10-06): (1) suite 50 —
+  snapshot/clean_new и всё /tmp-перечисление УДАЛЕНЫ (только
+  /proc/self/fd; каждый remove() нацелен на имя СВОЕГО вызова;
+  snap_b bounds исправлены); no-result side effect доказан БЕЗ
+  inventory детерминированным fd-исчерпанием на ОБОИХ dispatch-путях
+  (C-API lua_pcall(nresults=0) catchable create-ошибка — ранний
+  return был бы успехом; bytecode luaL_dostring("os.tmpname()"));
+  параллельная устойчивость: 3 одновременных прогона (2 zig + 1 PUC
+  POSIX) fails:0 побайтово. (2) mathCheckInt — числовые строки через
+  ОБЩИЙ luaO_str2num/strTonum path: точные PUC interror/tag_error
+  тексты (без got-суффикса на no-integer-representation; __name
+  awareness), F2Ieq (NaN/inf -> interror), luaL_optinteger nil-default
+  (randomseed arg2); починены промежутки общего механизма (\x0b/\x0c
+  trim, '_' rejection, parseInt base 10) и дедуплицирована baseless
+  builtinTonumber ветвь. Координатор верифицировал лично: проба
+  `true 1`/`true 49` = PUC обе стороны; suites 48 IDENTICAL и 50
+  IDENTICAL vs POSIX PUC oracle D+RF; 377/377 D; smoke 95/95;
+  matrix zig_fail=0; fmt; snapshot/clean_new refs = 0. Perf: no-arg/
+  1-arg без изменений, 2-arg <= ~3% около шума (раскрыто; baseline
+  не обновлён). Findings вне scope (ORDINARY-BACKLOG): tonumber(s,
+  base) trim/'_' остатки; luaStrToNum float в for-loop preparation.
+  P3 verdict: READY FOR REVIEW.
+  correction; не расширять в другие math functions. Предыдущее
+  IMPLEMENTED/closed заявление выше историческое, не финальный вердикт.
 - [ ] **debug.setupvalue(f, n, g()) multret-tail: zig устанавливает
   args[2] вместо top-of-stack (BLOCKER-класс, pre-existing; найден
   p3res 2026-10-05).** Ортогонален P3; нужен отдельный PUC-дифференциал

@@ -2035,6 +2035,27 @@ pub const Codegen = struct {
                     }
                     // Non-string or long-string key: discharge upvalue to
                     // a register and use GETI (int key) or GETTABLE.
+                    //
+                    // PUC yindex (lparser.c:898-904) runs luaK_exp2val on the
+                    // key BEFORE luaK_indexed discharges the upvalue table to
+                    // a register (lcode.c:1364-1365): the key's variable chain
+                    // (e.g. math.floor -> GETTABUP temp + GETFIELD) is emitted
+                    // as a relocatable instruction with its temps freed FIRST,
+                    // so the object's GETUPVAL reuses the freed temp and the
+                    // key's final register is patched in AFTER the object.
+                    // Discharging the object while the key's lazy chain still
+                    // holds a temp buries that temp (freeReg only frees the
+                    // top), leaks a register, and shifts the expression result
+                    // one slot above the caller's base — every consumer that
+                    // assumes the result lands at freereg (local declarations,
+                    // return, argument lists) then reads the stale buried
+                    // register (P2b Y9: t[math.floor] inside a closure
+                    // returned the math table).
+                    if (key_ed.val == .jump or key_ed.t_list != 0 or key_ed.f_list != 0) {
+                        _ = try self.exp2anyreg(&key_ed);
+                    } else {
+                        try self.dischargeVars(&key_ed);
+                    }
                     const obj_reg = try self.exp2anyreg(&obj_ed);
                     switch (key_ed.val) {
                         .k_int => |ival| {

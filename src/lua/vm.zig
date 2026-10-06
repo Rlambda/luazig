@@ -1,5 +1,6 @@
 const std = @import("std");
 
+/// TEMPORARY debug gate for the P2b crash diagnosis; removed before handoff.
 const LuaSource = @import("source.zig").Source;
 const LuaLexer = @import("lexer.zig").Lexer;
 const LuaParser = @import("parser.zig").Parser;
@@ -226,6 +227,7 @@ pub const BuiltinId = enum(u8) {
     file_lines,
     file_setvbuf,
     file_gc,
+    file_tostring,
     os_execute,
     os_exit,
     os_clock,
@@ -415,6 +417,7 @@ pub const BuiltinId = enum(u8) {
             .file_lines => "FILE*:lines",
             .file_setvbuf => "FILE*:setvbuf",
             .file_gc => "__gc",
+            .file_tostring => "FILE*:__tostring",
             .os_execute => "os.execute",
             .os_exit => "os.exit",
             .os_clock => "os.clock",
@@ -26841,6 +26844,7 @@ pub const Vm = struct {
             .file_lines => try self.builtinFileLines(args, outs),
             .file_setvbuf => try self.builtinFileSetvbuf(args, outs),
             .file_gc => try self.builtinFileGc(args, outs),
+            .file_tostring => try self.builtinFileTostring(args, outs),
             .os_execute => try self.builtinOsExecute(args, outs),
             .os_exit => try self.builtinOsExit(args, outs),
             .os_clock => try self.builtinOsClock(args, outs),
@@ -27351,33 +27355,34 @@ pub const Vm = struct {
         try self.setGlobal("_G", self.registryGlobalsValue());
         try self.setGlobal("_VERSION", .{ .String = try self.internStr("Lua 5.5") });
 
-        // Base builtins.
-        try self.setGlobal("print", .{ .Builtin = .print });
-        try self.setGlobal("warn", .{ .Builtin = .warn });
-        try self.setGlobal("tostring", .{ .Builtin = .tostring });
-        try self.setGlobal("tonumber", .{ .Builtin = .tonumber });
-        try self.setGlobal("error", .{ .Builtin = .@"error" });
-        try self.setGlobal("assert", .{ .Builtin = .assert });
-        try self.setGlobal("select", .{ .Builtin = .select });
-        try self.setGlobal("rawlen", .{ .Builtin = .rawlen });
-        try self.setGlobal("rawequal", .{ .Builtin = .rawequal });
-        try self.setGlobal("type", .{ .Builtin = .type });
-        try self.setGlobal("collectgarbage", .{ .Builtin = .collectgarbage });
-        try self.setGlobal("pcall", .{ .Builtin = .pcall });
-        try self.setGlobal("xpcall", .{ .Builtin = .xpcall });
-        try self.setGlobal("next", .{ .Builtin = .next });
-        try self.setGlobal("dofile", .{ .Builtin = .dofile });
-        try self.setGlobal("loadfile", .{ .Builtin = .loadfile });
-        try self.setGlobal("load", .{ .Builtin = .load });
+        // Base builtins — canonical light values (PUC lbaselib.c base_funcs,
+        // luaL_setfuncs nup=0).
+        try self.setGlobal("print", lightBuiltinValue(.print));
+        try self.setGlobal("warn", lightBuiltinValue(.warn));
+        try self.setGlobal("tostring", lightBuiltinValue(.tostring));
+        try self.setGlobal("tonumber", lightBuiltinValue(.tonumber));
+        try self.setGlobal("error", lightBuiltinValue(.@"error"));
+        try self.setGlobal("assert", lightBuiltinValue(.assert));
+        try self.setGlobal("select", lightBuiltinValue(.select));
+        try self.setGlobal("rawlen", lightBuiltinValue(.rawlen));
+        try self.setGlobal("rawequal", lightBuiltinValue(.rawequal));
+        try self.setGlobal("type", lightBuiltinValue(.type));
+        try self.setGlobal("collectgarbage", lightBuiltinValue(.collectgarbage));
+        try self.setGlobal("pcall", lightBuiltinValue(.pcall));
+        try self.setGlobal("xpcall", lightBuiltinValue(.xpcall));
+        try self.setGlobal("next", lightBuiltinValue(.next));
+        try self.setGlobal("dofile", lightBuiltinValue(.dofile));
+        try self.setGlobal("loadfile", lightBuiltinValue(.loadfile));
+        try self.setGlobal("load", lightBuiltinValue(.load));
         // `require` is no longer a Builtin global: openPackageLibrary below
         // publishes the PUC require C closure (upvalue 1: the package table)
         // into _G.require.
-        try self.setGlobal("setmetatable", .{ .Builtin = .setmetatable });
-        try self.setGlobal("getmetatable", .{ .Builtin = .getmetatable });
-        try self.setGlobal("pairs", .{ .Builtin = .pairs });
-        try self.setGlobal("ipairs", .{ .Builtin = .ipairs });
-        try self.setGlobal("rawget", .{ .Builtin = .rawget });
-        try self.setGlobal("rawset", .{ .Builtin = .rawset });
+        try self.setGlobal("setmetatable", lightBuiltinValue(.setmetatable));
+        try self.setGlobal("getmetatable", lightBuiltinValue(.getmetatable));
+        try self.setGlobal("pairs", lightBuiltinValue(.pairs));
+        try self.setGlobal("ipairs", lightBuiltinValue(.ipairs));
+        try self.setGlobal("rawget", lightBuiltinValue(.rawget));
+        try self.setGlobal("rawset", lightBuiltinValue(.rawset));
 
         // PUC luaopen_package (loadlib.c:724-747): build the package table —
         // path/cpath (setpath), config, searchpath/loadlib, loaded/preload
@@ -27408,48 +27413,52 @@ pub const Vm = struct {
         // global functions (setmetatable, error, ...) to their names.
         try self.setField(loaded_tbl, "_G", self.registryGlobalsValue());
 
-        // os = core process/filesystem helpers
+        // os = core process/filesystem helpers — canonical light values
+        // (PUC loslib.c syslib, nup=0).
         const os_tbl = try self.allocTableNoGc();
-        try self.setField(os_tbl, "execute", .{ .Builtin = .os_execute });
-        try self.setField(os_tbl, "exit", .{ .Builtin = .os_exit });
-        try self.setField(os_tbl, "clock", .{ .Builtin = .os_clock });
-        try self.setField(os_tbl, "date", .{ .Builtin = .os_date });
-        try self.setField(os_tbl, "time", .{ .Builtin = .os_time });
-        try self.setField(os_tbl, "difftime", .{ .Builtin = .os_difftime });
-        try self.setField(os_tbl, "getenv", .{ .Builtin = .os_getenv });
-        try self.setField(os_tbl, "tmpname", .{ .Builtin = .os_tmpname });
-        try self.setField(os_tbl, "remove", .{ .Builtin = .os_remove });
-        try self.setField(os_tbl, "rename", .{ .Builtin = .os_rename });
-        try self.setField(os_tbl, "setlocale", .{ .Builtin = .os_setlocale });
+        try self.setField(os_tbl, "execute", lightBuiltinValue(.os_execute));
+        try self.setField(os_tbl, "exit", lightBuiltinValue(.os_exit));
+        try self.setField(os_tbl, "clock", lightBuiltinValue(.os_clock));
+        try self.setField(os_tbl, "date", lightBuiltinValue(.os_date));
+        try self.setField(os_tbl, "time", lightBuiltinValue(.os_time));
+        try self.setField(os_tbl, "difftime", lightBuiltinValue(.os_difftime));
+        try self.setField(os_tbl, "getenv", lightBuiltinValue(.os_getenv));
+        try self.setField(os_tbl, "tmpname", lightBuiltinValue(.os_tmpname));
+        try self.setField(os_tbl, "remove", lightBuiltinValue(.os_remove));
+        try self.setField(os_tbl, "rename", lightBuiltinValue(.os_rename));
+        try self.setField(os_tbl, "setlocale", lightBuiltinValue(.os_setlocale));
         try self.setGlobal("os", .{ .Table = os_tbl });
 
-        // math subset
+        // math subset — canonical light values for the nup=0 entries (PUC
+        // lmathlib.c math_funcs). random/randomseed stay .Builtin: PUC
+        // publishes them as CClosure(1) carrying the RanState userdata
+        // upvalue (a separate parity cut).
         const math_tbl = try self.allocTableNoGc();
         try self.setField(math_tbl, "random", .{ .Builtin = .math_random });
         try self.setField(math_tbl, "randomseed", .{ .Builtin = .math_randomseed });
-        try self.setField(math_tbl, "tointeger", .{ .Builtin = .math_tointeger });
-        try self.setField(math_tbl, "sin", .{ .Builtin = .math_sin });
-        try self.setField(math_tbl, "cos", .{ .Builtin = .math_cos });
-        try self.setField(math_tbl, "tan", .{ .Builtin = .math_tan });
-        try self.setField(math_tbl, "asin", .{ .Builtin = .math_asin });
-        try self.setField(math_tbl, "acos", .{ .Builtin = .math_acos });
-        try self.setField(math_tbl, "atan", .{ .Builtin = .math_atan });
-        try self.setField(math_tbl, "deg", .{ .Builtin = .math_deg });
-        try self.setField(math_tbl, "rad", .{ .Builtin = .math_rad });
-        try self.setField(math_tbl, "abs", .{ .Builtin = .math_abs });
-        try self.setField(math_tbl, "sqrt", .{ .Builtin = .math_sqrt });
-        try self.setField(math_tbl, "exp", .{ .Builtin = .math_exp });
-        try self.setField(math_tbl, "ldexp", .{ .Builtin = .math_ldexp });
-        try self.setField(math_tbl, "frexp", .{ .Builtin = .math_frexp });
-        try self.setField(math_tbl, "ceil", .{ .Builtin = .math_ceil });
-        try self.setField(math_tbl, "ult", .{ .Builtin = .math_ult });
-        try self.setField(math_tbl, "modf", .{ .Builtin = .math_modf });
-        try self.setField(math_tbl, "log", .{ .Builtin = .math_log });
-        try self.setField(math_tbl, "fmod", .{ .Builtin = .math_fmod });
-        try self.setField(math_tbl, "floor", .{ .Builtin = .math_floor });
-        try self.setField(math_tbl, "type", .{ .Builtin = .math_type });
-        try self.setField(math_tbl, "min", .{ .Builtin = .math_min });
-        try self.setField(math_tbl, "max", .{ .Builtin = .math_max });
+        try self.setField(math_tbl, "tointeger", lightBuiltinValue(.math_tointeger));
+        try self.setField(math_tbl, "sin", lightBuiltinValue(.math_sin));
+        try self.setField(math_tbl, "cos", lightBuiltinValue(.math_cos));
+        try self.setField(math_tbl, "tan", lightBuiltinValue(.math_tan));
+        try self.setField(math_tbl, "asin", lightBuiltinValue(.math_asin));
+        try self.setField(math_tbl, "acos", lightBuiltinValue(.math_acos));
+        try self.setField(math_tbl, "atan", lightBuiltinValue(.math_atan));
+        try self.setField(math_tbl, "deg", lightBuiltinValue(.math_deg));
+        try self.setField(math_tbl, "rad", lightBuiltinValue(.math_rad));
+        try self.setField(math_tbl, "abs", lightBuiltinValue(.math_abs));
+        try self.setField(math_tbl, "sqrt", lightBuiltinValue(.math_sqrt));
+        try self.setField(math_tbl, "exp", lightBuiltinValue(.math_exp));
+        try self.setField(math_tbl, "ldexp", lightBuiltinValue(.math_ldexp));
+        try self.setField(math_tbl, "frexp", lightBuiltinValue(.math_frexp));
+        try self.setField(math_tbl, "ceil", lightBuiltinValue(.math_ceil));
+        try self.setField(math_tbl, "ult", lightBuiltinValue(.math_ult));
+        try self.setField(math_tbl, "modf", lightBuiltinValue(.math_modf));
+        try self.setField(math_tbl, "log", lightBuiltinValue(.math_log));
+        try self.setField(math_tbl, "fmod", lightBuiltinValue(.math_fmod));
+        try self.setField(math_tbl, "floor", lightBuiltinValue(.math_floor));
+        try self.setField(math_tbl, "type", lightBuiltinValue(.math_type));
+        try self.setField(math_tbl, "min", lightBuiltinValue(.math_min));
+        try self.setField(math_tbl, "max", lightBuiltinValue(.math_max));
         try self.setField(math_tbl, "huge", .{ .Num = std.math.inf(f64) });
         try self.setField(math_tbl, "pi", .{ .Num = std.math.pi });
         try self.setField(math_tbl, "maxinteger", .{ .Int = std.math.maxInt(i64) });
@@ -27464,25 +27473,26 @@ pub const Vm = struct {
             self.randomSetSeed(seed, 0);
         }
 
-        // string = { format = builtin }
+        // string = { format = builtin } — canonical light values (PUC
+        // lstrlib.c string_funcs, nup=0).
         const string_tbl = try self.allocTableNoGc();
-        try self.setField(string_tbl, "format", .{ .Builtin = .string_format });
-        try self.setField(string_tbl, "pack", .{ .Builtin = .string_pack });
-        try self.setField(string_tbl, "packsize", .{ .Builtin = .string_packsize });
-        try self.setField(string_tbl, "unpack", .{ .Builtin = .string_unpack });
-        try self.setField(string_tbl, "dump", .{ .Builtin = .string_dump });
-        try self.setField(string_tbl, "len", .{ .Builtin = .string_len });
-        try self.setField(string_tbl, "byte", .{ .Builtin = .string_byte });
-        try self.setField(string_tbl, "char", .{ .Builtin = .string_char });
-        try self.setField(string_tbl, "upper", .{ .Builtin = .string_upper });
-        try self.setField(string_tbl, "lower", .{ .Builtin = .string_lower });
-        try self.setField(string_tbl, "reverse", .{ .Builtin = .string_reverse });
-        try self.setField(string_tbl, "sub", .{ .Builtin = .string_sub });
-        try self.setField(string_tbl, "find", .{ .Builtin = .string_find });
-        try self.setField(string_tbl, "match", .{ .Builtin = .string_match });
-        try self.setField(string_tbl, "gmatch", .{ .Builtin = .string_gmatch });
-        try self.setField(string_tbl, "gsub", .{ .Builtin = .string_gsub });
-        try self.setField(string_tbl, "rep", .{ .Builtin = .string_rep });
+        try self.setField(string_tbl, "format", lightBuiltinValue(.string_format));
+        try self.setField(string_tbl, "pack", lightBuiltinValue(.string_pack));
+        try self.setField(string_tbl, "packsize", lightBuiltinValue(.string_packsize));
+        try self.setField(string_tbl, "unpack", lightBuiltinValue(.string_unpack));
+        try self.setField(string_tbl, "dump", lightBuiltinValue(.string_dump));
+        try self.setField(string_tbl, "len", lightBuiltinValue(.string_len));
+        try self.setField(string_tbl, "byte", lightBuiltinValue(.string_byte));
+        try self.setField(string_tbl, "char", lightBuiltinValue(.string_char));
+        try self.setField(string_tbl, "upper", lightBuiltinValue(.string_upper));
+        try self.setField(string_tbl, "lower", lightBuiltinValue(.string_lower));
+        try self.setField(string_tbl, "reverse", lightBuiltinValue(.string_reverse));
+        try self.setField(string_tbl, "sub", lightBuiltinValue(.string_sub));
+        try self.setField(string_tbl, "find", lightBuiltinValue(.string_find));
+        try self.setField(string_tbl, "match", lightBuiltinValue(.string_match));
+        try self.setField(string_tbl, "gmatch", lightBuiltinValue(.string_gmatch));
+        try self.setField(string_tbl, "gsub", lightBuiltinValue(.string_gsub));
+        try self.setField(string_tbl, "rep", lightBuiltinValue(.string_rep));
         try self.setGlobal("string", .{ .Table = string_tbl });
         try self.setField(self.string_metatable.?, "__index", .{ .Table = string_tbl });
 
@@ -27492,72 +27502,79 @@ pub const Vm = struct {
         // helper: tonum both operands → lua_arith; else trymt two-operand
         // error. Bitwise metamethods are NOT registered (PUC does not register
         // them), so "x" & 1 falls through to luaG_opinterror.
-        try self.setField(self.string_metatable.?, "__add", .{ .Builtin = .str_arith_add });
-        try self.setField(self.string_metatable.?, "__sub", .{ .Builtin = .str_arith_sub });
-        try self.setField(self.string_metatable.?, "__mul", .{ .Builtin = .str_arith_mul });
-        try self.setField(self.string_metatable.?, "__mod", .{ .Builtin = .str_arith_mod });
-        try self.setField(self.string_metatable.?, "__pow", .{ .Builtin = .str_arith_pow });
-        try self.setField(self.string_metatable.?, "__div", .{ .Builtin = .str_arith_div });
-        try self.setField(self.string_metatable.?, "__idiv", .{ .Builtin = .str_arith_idiv });
-        try self.setField(self.string_metatable.?, "__unm", .{ .Builtin = .str_arith_unm });
+        try self.setField(self.string_metatable.?, "__add", lightBuiltinValue(.str_arith_add));
+        try self.setField(self.string_metatable.?, "__sub", lightBuiltinValue(.str_arith_sub));
+        try self.setField(self.string_metatable.?, "__mul", lightBuiltinValue(.str_arith_mul));
+        try self.setField(self.string_metatable.?, "__mod", lightBuiltinValue(.str_arith_mod));
+        try self.setField(self.string_metatable.?, "__pow", lightBuiltinValue(.str_arith_pow));
+        try self.setField(self.string_metatable.?, "__div", lightBuiltinValue(.str_arith_div));
+        try self.setField(self.string_metatable.?, "__idiv", lightBuiltinValue(.str_arith_idiv));
+        try self.setField(self.string_metatable.?, "__unm", lightBuiltinValue(.str_arith_unm));
 
-        // table = { unpack = builtin }
+        // table = { unpack = builtin } — canonical light values (PUC
+        // ltablib.c tab_funcs, nup=0).
         const table_tbl = try self.allocTableNoGc();
-        try self.setField(table_tbl, "pack", .{ .Builtin = .table_pack });
-        try self.setField(table_tbl, "create", .{ .Builtin = .table_create });
-        try self.setField(table_tbl, "move", .{ .Builtin = .table_move });
-        try self.setField(table_tbl, "concat", .{ .Builtin = .table_concat });
-        try self.setField(table_tbl, "insert", .{ .Builtin = .table_insert });
-        try self.setField(table_tbl, "unpack", .{ .Builtin = .table_unpack });
-        try self.setField(table_tbl, "remove", .{ .Builtin = .table_remove });
-        try self.setField(table_tbl, "sort", .{ .Builtin = .table_sort });
+        try self.setField(table_tbl, "pack", lightBuiltinValue(.table_pack));
+        try self.setField(table_tbl, "create", lightBuiltinValue(.table_create));
+        try self.setField(table_tbl, "move", lightBuiltinValue(.table_move));
+        try self.setField(table_tbl, "concat", lightBuiltinValue(.table_concat));
+        try self.setField(table_tbl, "insert", lightBuiltinValue(.table_insert));
+        try self.setField(table_tbl, "unpack", lightBuiltinValue(.table_unpack));
+        try self.setField(table_tbl, "remove", lightBuiltinValue(.table_remove));
+        try self.setField(table_tbl, "sort", lightBuiltinValue(.table_sort));
         try self.setGlobal("table", .{ .Table = table_tbl });
 
-        // coroutine = { create, resume, yield, status, running }
+        // coroutine = { create, resume, yield, status, running } — canonical
+        // light values (PUC lcorolib.c co_funcs, nup=0).
         const coro_tbl = try self.allocTableNoGc();
-        try self.setField(coro_tbl, "create", .{ .Builtin = .coroutine_create });
-        try self.setField(coro_tbl, "wrap", .{ .Builtin = .coroutine_wrap });
-        try self.setField(coro_tbl, "resume", .{ .Builtin = .coroutine_resume });
-        try self.setField(coro_tbl, "yield", .{ .Builtin = .coroutine_yield });
-        try self.setField(coro_tbl, "status", .{ .Builtin = .coroutine_status });
-        try self.setField(coro_tbl, "running", .{ .Builtin = .coroutine_running });
-        try self.setField(coro_tbl, "isyieldable", .{ .Builtin = .coroutine_isyieldable });
-        try self.setField(coro_tbl, "close", .{ .Builtin = .coroutine_close });
+        try self.setField(coro_tbl, "create", lightBuiltinValue(.coroutine_create));
+        try self.setField(coro_tbl, "wrap", lightBuiltinValue(.coroutine_wrap));
+        try self.setField(coro_tbl, "resume", lightBuiltinValue(.coroutine_resume));
+        try self.setField(coro_tbl, "yield", lightBuiltinValue(.coroutine_yield));
+        try self.setField(coro_tbl, "status", lightBuiltinValue(.coroutine_status));
+        try self.setField(coro_tbl, "running", lightBuiltinValue(.coroutine_running));
+        try self.setField(coro_tbl, "isyieldable", lightBuiltinValue(.coroutine_isyieldable));
+        try self.setField(coro_tbl, "close", lightBuiltinValue(.coroutine_close));
         try self.setGlobal("coroutine", .{ .Table = coro_tbl });
 
         // Minimal utf8 table used by upstream pattern tests.
         const utf8_tbl = try self.allocTableNoGc();
         try self.setField(utf8_tbl, "charpattern", .{ .String = try self.internStr("[\x00-\x7F\xC2-\xFD][\x80-\xBF]*") });
-        // P2a: utf8 is the light-publication pilot — every entry is a
-        // canonical LightCFunction value whose pointer is the trampoline
-        // registry's stable C ABI symbol (PUC lutf8lib.c funcs[]).
-        // VM-internal dispatch normalizes known pointers to the native
-        // Builtin lane (normalizeLightBuiltin); .Builtin stays internal.
-        try self.setField(utf8_tbl, "char", .{ .LightCFunction = &utf8LightChar });
-        try self.setField(utf8_tbl, "codepoint", .{ .LightCFunction = &utf8LightCodepoint });
-        try self.setField(utf8_tbl, "len", .{ .LightCFunction = &utf8LightLen });
-        try self.setField(utf8_tbl, "offset", .{ .LightCFunction = &utf8LightOffset });
-        try self.setField(utf8_tbl, "codes", .{ .LightCFunction = &utf8LightCodes });
+        // Every entry is a canonical LightCFunction value whose pointer is
+        // the trampoline registry's stable C ABI symbol (PUC lutf8lib.c
+        // funcs[]). VM-internal dispatch normalizes known pointers to the
+        // native Builtin lane (normalizeLightBuiltin); .Builtin stays
+        // internal.
+        try self.setField(utf8_tbl, "char", lightBuiltinValue(.utf8_char));
+        try self.setField(utf8_tbl, "codepoint", lightBuiltinValue(.utf8_codepoint));
+        try self.setField(utf8_tbl, "len", lightBuiltinValue(.utf8_len));
+        try self.setField(utf8_tbl, "offset", lightBuiltinValue(.utf8_offset));
+        try self.setField(utf8_tbl, "codes", lightBuiltinValue(.utf8_codes));
         try self.setGlobal("utf8", .{ .Table = utf8_tbl });
 
         // io = { input/output/write over std streams, stderr = { write = builtin } }
+        // Canonical light values (PUC liolib.c io_funcs, nup=0).
         const io_tbl = try self.allocTableNoGc();
-        try self.setField(io_tbl, "write", .{ .Builtin = .io_write });
-        try self.setField(io_tbl, "open", .{ .Builtin = .io_open });
-        try self.setField(io_tbl, "popen", .{ .Builtin = .io_popen });
-        try self.setField(io_tbl, "tmpfile", .{ .Builtin = .io_tmpfile });
-        try self.setField(io_tbl, "read", .{ .Builtin = .io_read });
-        try self.setField(io_tbl, "lines", .{ .Builtin = .io_lines });
-        try self.setField(io_tbl, "flush", .{ .Builtin = .io_flush });
-        try self.setField(io_tbl, "input", .{ .Builtin = .io_input });
-        try self.setField(io_tbl, "output", .{ .Builtin = .io_output });
-        try self.setField(io_tbl, "close", .{ .Builtin = .io_close });
-        try self.setField(io_tbl, "type", .{ .Builtin = .io_type });
+        try self.setField(io_tbl, "write", lightBuiltinValue(.io_write));
+        try self.setField(io_tbl, "open", lightBuiltinValue(.io_open));
+        try self.setField(io_tbl, "popen", lightBuiltinValue(.io_popen));
+        try self.setField(io_tbl, "tmpfile", lightBuiltinValue(.io_tmpfile));
+        try self.setField(io_tbl, "read", lightBuiltinValue(.io_read));
+        try self.setField(io_tbl, "lines", lightBuiltinValue(.io_lines));
+        try self.setField(io_tbl, "flush", lightBuiltinValue(.io_flush));
+        try self.setField(io_tbl, "input", lightBuiltinValue(.io_input));
+        try self.setField(io_tbl, "output", lightBuiltinValue(.io_output));
+        try self.setField(io_tbl, "close", lightBuiltinValue(.io_close));
+        try self.setField(io_tbl, "type", lightBuiltinValue(.io_type));
 
         const file_mt = try self.allocTableNoGc();
         try self.setField(file_mt, "__name", .{ .String = try self.internStr("FILE*") });
-        try self.setField(file_mt, "__gc", .{ .Builtin = .file_gc });
-        try self.setField(file_mt, "__close", .{ .Builtin = .file_meta_close });
+        // PUC liolib.c metameth[]: __index is the method table (set on the
+        // file objects below), __gc/__close/__tostring are light C functions
+        // (nup=0) — canonical light values.
+        try self.setField(file_mt, "__gc", lightBuiltinValue(.file_gc));
+        try self.setField(file_mt, "__close", lightBuiltinValue(.file_meta_close));
+        try self.setField(file_mt, "__tostring", lightBuiltinValue(.file_tostring));
         self.file_metatable = file_mt;
 
         // PUC Lua registers stdin/stdout/stderr as proper FILE* handles in
@@ -27616,25 +27633,25 @@ pub const Vm = struct {
         // Provide a growing subset of the standard debug library. The table is
         // intentionally built in one place so `_G.debug` and `require("debug")`
         // cannot diverge.
-        try self.setField(mod, "getinfo", .{ .Builtin = .debug_getinfo });
-        try self.setField(mod, "getlocal", .{ .Builtin = .debug_getlocal });
-        try self.setField(mod, "setlocal", .{ .Builtin = .debug_setlocal });
-        try self.setField(mod, "getupvalue", .{ .Builtin = .debug_getupvalue });
-        try self.setField(mod, "setupvalue", .{ .Builtin = .debug_setupvalue });
-        try self.setField(mod, "upvalueid", .{ .Builtin = .debug_upvalueid });
-        try self.setField(mod, "upvaluejoin", .{ .Builtin = .debug_upvaluejoin });
-        try self.setField(mod, "gethook", .{ .Builtin = .debug_gethook });
-        try self.setField(mod, "sethook", .{ .Builtin = .debug_sethook });
-        try self.setField(mod, "getregistry", .{ .Builtin = .debug_getregistry });
-        try self.setField(mod, "traceback", .{ .Builtin = .debug_traceback });
-        try self.setField(mod, "getuservalue", .{ .Builtin = .debug_getuservalue });
-        try self.setField(mod, "setmetatable", .{ .Builtin = .debug_setmetatable });
+        try self.setField(mod, "getinfo", lightBuiltinValue(.debug_getinfo));
+        try self.setField(mod, "getlocal", lightBuiltinValue(.debug_getlocal));
+        try self.setField(mod, "setlocal", lightBuiltinValue(.debug_setlocal));
+        try self.setField(mod, "getupvalue", lightBuiltinValue(.debug_getupvalue));
+        try self.setField(mod, "setupvalue", lightBuiltinValue(.debug_setupvalue));
+        try self.setField(mod, "upvalueid", lightBuiltinValue(.debug_upvalueid));
+        try self.setField(mod, "upvaluejoin", lightBuiltinValue(.debug_upvaluejoin));
+        try self.setField(mod, "gethook", lightBuiltinValue(.debug_gethook));
+        try self.setField(mod, "sethook", lightBuiltinValue(.debug_sethook));
+        try self.setField(mod, "getregistry", lightBuiltinValue(.debug_getregistry));
+        try self.setField(mod, "traceback", lightBuiltinValue(.debug_traceback));
+        try self.setField(mod, "getuservalue", lightBuiltinValue(.debug_getuservalue));
+        try self.setField(mod, "setmetatable", lightBuiltinValue(.debug_setmetatable));
         // PUC dblib.c:48-54 db_getmetatable is a RAW lua_getmetatable —
         // unlike the global getmetatable (lbaselib.c:134) it does NOT
         // honor the __metatable protection field.
-        try self.setField(mod, "getmetatable", .{ .Builtin = .debug_getmetatable });
-        try self.setField(mod, "setuservalue", .{ .Builtin = .debug_setuservalue });
-        try self.setField(mod, "debug", .{ .Builtin = .debug_debug });
+        try self.setField(mod, "getmetatable", lightBuiltinValue(.debug_getmetatable));
+        try self.setField(mod, "setuservalue", lightBuiltinValue(.debug_setuservalue));
+        try self.setField(mod, "debug", lightBuiltinValue(.debug_debug));
     }
 
     fn createDebugTableNoGc(self: *Vm) DispatchError!*Table {
@@ -35740,8 +35757,9 @@ pub const Vm = struct {
                     // never followed as a live reference.
                     if (node.key_tt == .empty or node.key_tt == .dead) continue;
                     if (node.value == .Nil) continue; // logically deleted
-                    // Safety: verify key_tt is valid
-                    if (@intFromEnum(node.key_tt) > @intFromEnum(@TypeOf(node.key_tt).userdata)) {
+                    // Safety: verify key_tt is valid (light_cfunc is the
+                    // last live-key tag; empty/dead were skipped above).
+                    if (@intFromEnum(node.key_tt) > @intFromEnum(@TypeOf(node.key_tt).light_cfunc)) {
                         return error.RuntimeError;
                     }
                     // Mark string keys even in weak-key tables — hash nodes
@@ -37714,8 +37732,8 @@ pub const Vm = struct {
         _ = scope.protectValueAssumeCapacity(.{ .String = cpath_val });
         try self.setField(pkg, "cpath", .{ .String = cpath_val });
         try self.setField(pkg, "config", .{ .String = try self.internStr("/\n;\n?\n!\n-\n") });
-        try self.setField(pkg, "searchpath", .{ .Builtin = .package_searchpath });
-        try self.setField(pkg, "loadlib", .{ .Builtin = .package_loadlib });
+        try self.setField(pkg, "searchpath", lightBuiltinValue(.package_searchpath));
+        try self.setField(pkg, "loadlib", lightBuiltinValue(.package_loadlib));
         try self.setField(pkg, "loaded", .{ .Table = loaded_tbl });
         try self.setField(pkg, "preload", .{ .Table = preload_tbl });
 
@@ -38507,6 +38525,20 @@ pub const Vm = struct {
                 if (std.mem.lastIndexOfScalar(u8, full, '.')) |dot| break :blk full[dot + 1 ..];
                 break :blk full;
             },
+            // Bytecode-origin builtin calls push a VIEW C-frame at the
+            // caller's callee register (pushBuiltinCFrameAt), so the func
+            // slot holds the PUBLISHED trampoline (.LightCFunction), not
+            // the normalized .Builtin form. A registry trampoline IS the
+            // builtin: resolve it through the comptime scan
+            // (normalizeLightBuiltin's inverse) and use the builtin's
+            // name. Genuine host C functions (no registry hit) stay
+            // unnamed, exactly like before.
+            .LightCFunction => |f| blk: {
+                const id = lightBuiltinId(f) orelse break :blk null;
+                const full = id.name();
+                if (std.mem.lastIndexOfScalar(u8, full, '.')) |dot| break :blk full[dot + 1 ..];
+                break :blk full;
+            },
             .Closure => |cl| blk: {
                 const name = if (cl.proto) |proto| proto.name() else "";
                 if (name.len == 0 or std.mem.eql(u8, name, "<anon>") or std.mem.eql(u8, name, "<bytecode>")) break :blk null;
@@ -38524,10 +38556,25 @@ pub const Vm = struct {
     fn debugFrameCalleeMatches(self: *Vm, candidate: Value, target: Frame) bool {
         const target_callee = self.activeBytecodeThread().stack[target.func_slot];
         return switch (target_callee) {
-            .Builtin => |target_id| candidate == .Builtin and candidate.Builtin == target_id,
+            // The frame's func slot holds the NORMALIZED .Builtin form
+            // (callBuiltin stages callee_val = .Builtin(id)) while the
+            // call-site register holds the published trampoline
+            // (.LightCFunction): resolve the trampoline through the
+            // comptime registry (the same scan normalizeLightBuiltin
+            // uses) and compare registry ids — the luazig equivalent of
+            // PUC's single raw C-pointer identity.
+            .Builtin => |target_id| switch (candidate) {
+                .Builtin => |c| c == target_id,
+                .LightCFunction => |f| lightBuiltinId(f) == target_id,
+                else => false,
+            },
             .Closure => |target_cl| candidate == .Closure and candidate.Closure == target_cl,
             // PUC: a VLCF frame's callee matches by raw fn-pointer equality.
-            .LightCFunction => |target_f| candidate == .LightCFunction and candidate.LightCFunction == target_f,
+            .LightCFunction => |target_f| switch (candidate) {
+                .LightCFunction => |f| f == target_f,
+                .Builtin => |b| lightBuiltinId(target_f) == b,
+                else => false,
+            },
             else => false,
         };
     }
@@ -40857,10 +40904,24 @@ pub const Vm = struct {
             // once matched 'print' through a garbage .Builtin tag read).
             const matches = switch (node.value) {
                 .Closure => |cl| callee == .Closure and cl == callee.Closure,
-                .Builtin => |b| callee == .Builtin and b == callee.Builtin,
                 // PUC pushglobalfuncname: raw equality — a VLCF global
-                // matches by fn-pointer identity (lvm.c:641).
-                .LightCFunction => |f| callee == .LightCFunction and f == callee.LightCFunction,
+                // matches by fn-pointer identity (lvm.c:641). The frame's
+                // func slot holds the NORMALIZED .Builtin form (callBuiltin
+                // stages callee_val = .Builtin(id)), while the global holds
+                // the published trampoline: resolve the trampoline through
+                // the comptime registry (the same scan normalizeLightBuiltin
+                // uses) and compare registry ids — the luazig equivalent of
+                // PUC's single raw C-pointer identity.
+                .Builtin => |b| switch (callee) {
+                    .Builtin => |cb| b == cb,
+                    .LightCFunction => |cf| lightBuiltinId(cf) == b,
+                    else => false,
+                },
+                .LightCFunction => |f| switch (callee) {
+                    .LightCFunction => |cf| f == cf,
+                    .Builtin => |cb| lightBuiltinId(f) == cb,
+                    else => false,
+                },
                 else => false,
             };
             if (matches) {
@@ -41188,7 +41249,9 @@ pub const Vm = struct {
             return;
         }
         if (outs.len == 0) return;
-        outs[0] = .{ .Builtin = .next };
+        // PUC luaB_pairs (lbaselib.c): lua_pushcfunction(L, luaB_next) —
+        // the canonical light value for the native next lane.
+        outs[0] = lightBuiltinValue(.next);
         if (outs.len > 1) outs[1] = args[0];
         if (outs.len > 2) outs[2] = .Nil;
     }
@@ -41197,7 +41260,11 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'ipairs' (value expected)", .{});
         if (args[0] != .Table) return self.fail("bad argument #1 to 'ipairs' (table expected, got {s})", .{self.valueTypeName(args[0])});
-        outs[0] = .{ .Builtin = .ipairs_iter };
+        // PUC luaB_ipairs (lbaselib.c): lua_pushcfunction(L, ipairsaux) —
+        // the internal-only iterator product, published as a canonical
+        // light value (never table-published; ipairs_iter is not in any
+        // stdlib table).
+        outs[0] = lightBuiltinValue(.ipairs_iter);
         if (outs.len > 1) outs[1] = args[0];
         if (outs.len > 2) outs[2] = .{ .Int = 0 };
     }
@@ -42078,13 +42145,13 @@ pub const Vm = struct {
         var scope = try self.openRootScope(1, 0);
         defer scope.close();
         _ = scope.protectValueAssumeCapacity(.{ .Table = tbl });
-        try self.setField(tbl, "close", .{ .Builtin = .file_close });
-        try self.setField(tbl, "write", .{ .Builtin = .file_write });
-        try self.setField(tbl, "read", .{ .Builtin = .file_read });
-        try self.setField(tbl, "seek", .{ .Builtin = .file_seek });
-        try self.setField(tbl, "flush", .{ .Builtin = .file_flush });
-        try self.setField(tbl, "lines", .{ .Builtin = .file_lines });
-        try self.setField(tbl, "setvbuf", .{ .Builtin = .file_setvbuf });
+        try self.setField(tbl, "close", lightBuiltinValue(.file_close));
+        try self.setField(tbl, "write", lightBuiltinValue(.file_write));
+        try self.setField(tbl, "read", lightBuiltinValue(.file_read));
+        try self.setField(tbl, "seek", lightBuiltinValue(.file_seek));
+        try self.setField(tbl, "flush", lightBuiltinValue(.file_flush));
+        try self.setField(tbl, "lines", lightBuiltinValue(.file_lines));
+        try self.setField(tbl, "setvbuf", lightBuiltinValue(.file_setvbuf));
 
         const id = self.next_file_id;
         self.next_file_id += 1;
@@ -43050,6 +43117,26 @@ pub const Vm = struct {
         }
         _ = self.closeManagedFile(file_tbl);
         _ = self.setField(file_tbl, "__closed", .{ .Bool = true }) catch {};
+    }
+
+    /// PUC f_tostring (liolib.c): tolstream is luaL_checkudata — a non-file
+    /// argument raises "bad argument #1 to '__tostring'"; a closed file
+    /// renders "file (closed)", an open one "file (%p)" (the same
+    /// pointer-rendering shape as valueToStringAlloc's file branch).
+    fn builtinFileTostring(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("bad argument #1 to '__tostring' (FILE* expected, got no value)", .{});
+        const file_tbl = asFileTable(self, args[0]) orelse
+            return self.fail("bad argument #1 to '__tostring' (FILE* expected, got {s})", .{self.valueTypeName(args[0])});
+        if (self.getFieldOpt(file_tbl, "__closed")) |cv| {
+            if (cv == .Bool and cv.Bool) {
+                outs[0] = .{ .String = try self.internStr("file (closed)") };
+                return;
+            }
+        }
+        const s = try std.fmt.allocPrint(self.alloc, "file (0x{x})", .{@intFromPtr(file_tbl)});
+        defer self.alloc.free(s);
+        outs[0] = .{ .String = try self.internStr(s) };
     }
 
     fn mathArgToInt(self: *Vm, v: Value, what: []const u8) DispatchError!i64 {
@@ -45881,6 +45968,10 @@ pub const Vm = struct {
         } else 1;
         const plain = if (args.len >= 4) isTruthy(args[3]) else false;
 
+        // PUC str_find: exactly 1 result (nil) on no-match, 2+captures on
+        // match — the window is sized to the capture ESTIMATE, so every
+        // exit must report its true count (last_builtin_out_count).
+        self.last_builtin_out_count = 1;
         const len: i64 = @intCast(s.len);
         var start1 = if (init0 >= 0) init0 else len + init0 + 1;
         if (start1 < 1) start1 = 1;
@@ -45893,6 +45984,7 @@ pub const Vm = struct {
         if (pat.len == 0) {
             if (outs.len > 0) outs[0] = .{ .Int = @intCast(start + 1) };
             if (outs.len > 1) outs[1] = .{ .Int = @intCast(start) };
+            self.last_builtin_out_count = 2;
             return;
         }
 
@@ -45900,6 +45992,7 @@ pub const Vm = struct {
             if (std.mem.indexOfPos(u8, s, start, pat)) |idx| {
                 if (outs.len > 0) outs[0] = .{ .Int = @intCast(idx + 1) };
                 if (outs.len > 1) outs[1] = .{ .Int = @intCast(idx + pat.len) };
+                self.last_builtin_out_count = 2;
             } else if (outs.len > 0) {
                 outs[0] = .Nil;
             }
@@ -45913,6 +46006,7 @@ pub const Vm = struct {
             }
             if (outs.len > 0) outs[0] = .{ .Int = 1 };
             if (outs.len > 1) outs[1] = .{ .Int = @intCast(s.len) };
+            self.last_builtin_out_count = 2;
             return;
         }
 
@@ -45944,8 +46038,8 @@ pub const Vm = struct {
                 }
                 if (outs.len > 0) outs[0] = .{ .Int = @intCast(start + 1) };
                 if (outs.len > 1) outs[1] = .{ .Int = @intCast(e) };
+                var out_i: usize = 2;
                 if (outs.len > 2) {
-                    var out_i: usize = 2;
                     var cap_i: usize = 1;
                     while (cap_i < caps.len and out_i < outs.len) : (cap_i += 1) {
                         if (!caps[cap_i].set) continue;
@@ -45958,6 +46052,7 @@ pub const Vm = struct {
                         out_i += 1;
                     }
                 }
+                self.last_builtin_out_count = out_i;
                 return;
             }
         }
@@ -45980,6 +46075,11 @@ pub const Vm = struct {
             else => return self.fail("string.match expects integer init", .{}),
         } else 1;
 
+        // PUC str_match: exactly 1 result (nil, the whole match, or the
+        // special-pattern extracts) unless the pattern captures — the
+        // window is sized to the capture ESTIMATE, so every exit must
+        // report its true count (last_builtin_out_count).
+        self.last_builtin_out_count = 1;
         const len: i64 = @intCast(s.len);
         var start1 = if (init0 >= 0) init0 else len + init0 + 1;
         if (start1 < 1) start1 = 1;
@@ -46132,6 +46232,7 @@ pub const Vm = struct {
                 }
                 out_i += 1;
             }
+            self.last_builtin_out_count = out_i;
             while (out_i < outs.len) : (out_i += 1) outs[out_i] = .Nil;
             return;
         }
@@ -47272,12 +47373,12 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len == 0 or args[0] != .String) return self.fail("invalid UTF-8 code", .{});
         const nonstrict = if (args.len >= 2) isTruthy(args[1]) else false;
-        // P2a: the iterator is published as the canonical light value (PUC
+        // The iterator is published as the canonical light value (PUC
         // iter_codes pushes iter_auxstrict/iter_auxlax via lua_pushcfunction
         // — the same C symbol every call), so two utf8.codes calls yield
         // rawequal iterators and the for-loop's OP_TFORCALL dispatch
         // normalizes to the native lane.
-        outs[0] = .{ .LightCFunction = if (nonstrict) &utf8LightCodesIterNs else &utf8LightCodesIter };
+        outs[0] = if (nonstrict) lightBuiltinValue(.utf8_codes_iter_ns) else lightBuiltinValue(.utf8_codes_iter);
         if (outs.len > 1) outs[1] = args[0];
         if (outs.len > 2) outs[2] = .{ .Int = 0 };
     }
@@ -47311,15 +47412,15 @@ pub const Vm = struct {
     }
 
     // ------------------------------------------------------------------
-    // P2a (A-full cut P2a): light C function publication — trampoline
-    // registry + dispatch-entry normalization.
+    // Light C function publication — trampoline registry + dispatch-entry
+    // normalization.
     //
     // PUC publishes every nup=0 stdlib function as a VLCF: ONE canonical
     // value per function whose payload is the real C symbol address
-    // (lutf8lib.c's funcs[] entries, lua_pushcfunction in iter_codes).
+    // (luaL_setfuncs tables, lua_pushcfunction products like ipairsaux).
     // luazig's .Builtin values carry no pointer, so lua_tocfunction/
-    // topointer/rawequal-as-table-key see no stable identity. The pilot
-    // (utf8) republishes each function as a LightCFunction whose pointer
+    // topointer/rawequal-as-table-key see no stable identity. Each
+    // published builtin is republished as a LightCFunction whose pointer
     // is a comptime-generated trampoline: a real C-ABI function that runs
     // the native builtin core when invoked through a real C activation
     // (host lua_call/lua_pcall, lua_resume of a VLCF body, lua_load
@@ -47329,44 +47430,195 @@ pub const Vm = struct {
     // normalizes a known light pointer to its native BuiltinId BEFORE the
     // C-window/result-marshalling (normalizeLightBuiltin below), so an
     // ordinary stdlib call never pays the host C boundary. .Builtin stays
-    // the internal implementation lane (deleted in P2c), NOT the public
-    // identity.
+    // the internal implementation lane, NOT the public identity.
     // ------------------------------------------------------------------
 
     /// One registry entry: the trampoline's C ABI pointer and the native
     /// lane it fronts. Comptime-immutable — no runtime state, no second
-    /// mutable lookup (B1 candidate: linear scan over a handful of
-    /// entries; the scan runs only when a callee is already a
-    /// LightCFunction, so .Builtin/.Closure callees pay one tag compare).
+    /// mutable lookup.
     const LightBuiltinEntry = struct {
         ptr: *const fn (?*lua_State) callconv(.c) c_int,
         id: BuiltinId,
     };
 
-    /// The utf8 pilot's trampoline registry: every published utf8 entry
-    /// (char/codepoint/len/offset/codes) plus the codes iterator pair
-    /// produced by builtinUtf8Codes (strict/lax variants — PUC
-    /// iter_auxstrict/iter_auxlax). Pointers are static function
-    /// addresses: stable across states, table republishes, and repeated
-    /// luaopen_utf8 (PUC's C symbols have the same property).
-    const light_builtin_registry = [_]LightBuiltinEntry{
-        .{ .ptr = &utf8LightChar, .id = .utf8_char },
-        .{ .ptr = &utf8LightCodepoint, .id = .utf8_codepoint },
-        .{ .ptr = &utf8LightLen, .id = .utf8_len },
-        .{ .ptr = &utf8LightOffset, .id = .utf8_offset },
-        .{ .ptr = &utf8LightCodes, .id = .utf8_codes },
-        .{ .ptr = &utf8LightCodesIter, .id = .utf8_codes_iter },
-        .{ .ptr = &utf8LightCodesIterNs, .id = .utf8_codes_iter_ns },
+    /// The full light publication set: every PUC 5.5 stdlib entry published
+    /// through luaL_setfuncs/luaL_newlib with nup=0 (base, string + string
+    /// metatable arithmetic, table, math minus random/randomseed, utf8, io,
+    /// file methods + file metatable, os, debug, coroutine, package
+    /// searchpath/loadlib), plus the internal-only iterator products PUC
+    /// hands out via lua_pushcfunction (ipairs' ipairsaux, utf8.codes'
+    /// strict/lax iterators). Excluded by PUC class: require and the four
+    /// searchers (CClosure(1)), math.random/randomseed (CClosure(1),
+    /// RanState upvalue), and the stateful per-iterator generators
+    /// (string.gmatch's gmatch_aux CClosure(3), io.lines' io_readline
+    /// CClosure(3+n)) — those stay on their existing lanes.
+    const light_builtin_ids = [_]BuiltinId{
+        // base (lbaselib.c base_funcs, nup=0)
+        .print,              .warn,               .tostring,
+        .tonumber,           .@"error",           .assert,
+        .select,             .rawlen,             .rawequal,
+        .type,               .collectgarbage,     .pcall,
+        .xpcall,             .next,               .dofile,
+        .loadfile,           .load,               .setmetatable,
+        .getmetatable,       .pairs,              .ipairs,
+        .rawget,             .rawset,
+        // string (lstrlib.c string_funcs, nup=0)
+                    .string_format,
+        .string_pack,        .string_packsize,    .string_unpack,
+        .string_dump,        .string_len,         .string_byte,
+        .string_char,        .string_upper,       .string_lower,
+        .string_reverse,     .string_sub,         .string_find,
+        .string_match,       .string_gmatch,      .string_gsub,
+        .string_rep,
+        // string metatable arithmetic (lstrlib.c stringmetamethods, nup=0)
+                .str_arith_add,      .str_arith_sub,
+        .str_arith_mul,      .str_arith_mod,      .str_arith_pow,
+        .str_arith_div,      .str_arith_idiv,     .str_arith_unm,
+        // table (ltablib.c tab_funcs, nup=0)
+        .table_pack,         .table_create,       .table_move,
+        .table_concat,       .table_insert,       .table_unpack,
+        .table_remove,       .table_sort,
+        // math minus random/randomseed (lmathlib.c math_funcs, nup=0)
+                .math_tointeger,
+        .math_sin,           .math_cos,           .math_tan,
+        .math_asin,          .math_acos,          .math_atan,
+        .math_deg,           .math_rad,           .math_abs,
+        .math_sqrt,          .math_exp,           .math_ldexp,
+        .math_frexp,         .math_ceil,          .math_ult,
+        .math_modf,          .math_log,           .math_fmod,
+        .math_floor,         .math_type,          .math_min,
+        .math_max,
+        // utf8 (lutf8lib.c funcs, nup=0) + the codes iterator products
+                  .utf8_char,          .utf8_codepoint,
+        .utf8_len,           .utf8_offset,        .utf8_codes,
+        .utf8_codes_iter,    .utf8_codes_iter_ns,
+        // io (liolib.c io_funcs, nup=0)
+        .io_write,
+        .io_open,            .io_popen,           .io_tmpfile,
+        .io_read,            .io_lines,           .io_flush,
+        .io_input,           .io_output,          .io_close,
+        .io_type,
+        // file methods (liolib.c meth, published via the file metatable)
+                   .file_close,         .file_write,
+        .file_read,          .file_seek,          .file_flush,
+        .file_lines,         .file_setvbuf,
+        // file metatable metamethods (liolib.c metameth, nup=0)
+              .file_gc,
+        .file_meta_close,    .file_tostring,
+        // os (loslib.c syslib, nup=0)
+             .os_execute,
+        .os_exit,            .os_clock,           .os_date,
+        .os_time,            .os_difftime,        .os_getenv,
+        .os_tmpname,         .os_remove,          .os_rename,
+        .os_setlocale,
+        // debug (ldblib.c db_lib, nup=0)
+              .debug_getinfo,      .debug_getlocal,
+        .debug_setlocal,     .debug_getupvalue,   .debug_setupvalue,
+        .debug_upvalueid,    .debug_upvaluejoin,  .debug_gethook,
+        .debug_sethook,      .debug_getregistry,  .debug_traceback,
+        .debug_getmetatable, .debug_setmetatable, .debug_getuservalue,
+        .debug_setuservalue, .debug_debug,
+        // coroutine (lcorolib.c co_funcs, nup=0)
+               .coroutine_create,
+        .coroutine_wrap,     .coroutine_resume,   .coroutine_yield,
+        .coroutine_status,   .coroutine_running,  .coroutine_isyieldable,
+        .coroutine_close,
+        // package (loadlib.c ll_funcs' light entries, nup=0)
+           .package_searchpath, .package_loadlib,
+        // internal-only iterator products (never table-published)
+        .ipairs_iter,
+    };
+
+    /// Distinct C-ABI trampoline per id: one generic instantiation, so every
+    /// published entry has its own stable process-global function address
+    /// (PUC's C symbols have the same property — stable across states,
+    /// table republishes, and repeated luaopen_*).
+    fn LightBuiltinTrampoline(comptime id: BuiltinId) type {
+        return struct {
+            fn tramp(L: ?*lua_State) callconv(.c) c_int {
+                return lightBuiltinTrampolineBody(id, L);
+            }
+        };
+    }
+
+    /// The canonical light value for a published builtin: the trampoline's
+    /// C ABI pointer. Comptime-parameterized, so every call site of the same
+    /// id yields the same pointer (generic instantiations are memoized).
+    fn lightBuiltinPtr(comptime id: BuiltinId) *const fn (?*lua_State) callconv(.c) c_int {
+        return &LightBuiltinTrampoline(id).tramp;
+    }
+
+    fn lightBuiltinValue(comptime id: BuiltinId) Value {
+        return .{ .LightCFunction = lightBuiltinPtr(id) };
+    }
+
+    const light_builtin_registry = blk: {
+        var entries: [light_builtin_ids.len]LightBuiltinEntry = undefined;
+        for (light_builtin_ids, 0..) |id, i| {
+            entries[i] = .{ .ptr = lightBuiltinPtr(id), .id = id };
+        }
+        break :blk entries;
     };
 
     /// Map a light C function pointer to its native Builtin lane, or null
     /// for real host C functions (they keep the genuine C ABI lane).
+    /// Branchless accumulate: no early return, so the compiler lowers the
+    /// scan to vectorized compares without branch mispredictions (the
+    /// registry is ~150 entries; a comptime-sorted binary-search table is
+    /// unrepresentable because Zig cannot order function pointers at
+    /// comptime — function addresses are link-time values).
+    /// Pointer-only view of the registry: contiguous 8-byte entries, so
+    /// the vectorized scan below loads one @Vector(8, usize) per
+    /// iteration from rodata instead of gathering strided struct fields.
+    const light_builtin_ptr_table = blk: {
+        const F = ?*const fn (?*lua_State) callconv(.c) c_int;
+        var t: [light_builtin_registry.len]F = undefined;
+        for (light_builtin_registry, 0..) |e, i| {
+            t[i] = e.ptr;
+        }
+        break :blk t;
+    };
+
     fn lightBuiltinId(
         p: ?*const fn (?*lua_State) callconv(.c) c_int,
     ) ?BuiltinId {
-        for (light_builtin_registry) |e| {
-            if (e.ptr == p) return e.id;
+        // 8-wide vectorized scan over the comptime registry (same design
+        // as the P2a branchless linear scan — comptime array, no runtime
+        // state — widened to keep the 145-entry registry's per-dispatch
+        // cost bounded: one vector compare per 8 entries instead of one
+        // scalar compare per entry). Comptime pointer ORDERING (sorted
+        // array + binary search) and comptime pointer HASHING (perfect
+        // hash) are impossible in Zig 0.16 — @intFromPtr on a function
+        // pointer is not comptime-evaluable (re-verified: ctptr2.zig) —
+        // so the scan stays O(n) with a constant-factor vector win.
+        const tab = light_builtin_ptr_table;
+        const n = tab.len;
+        const W = 8;
+        const V = @Vector(W, usize);
+        const target: V = @splat(@intFromPtr(p));
+        var hit: ?usize = null;
+        var base: usize = 0;
+        while (base + W <= n) : (base += W) {
+            var ptrs: V = undefined;
+            inline for (0..W) |j| {
+                ptrs[j] = @intFromPtr(tab[base + j]);
+            }
+            const m = ptrs == target;
+            const bits: u8 = @bitCast(m);
+            if (bits != 0) {
+                hit = base + @ctz(bits);
+                break;
+            }
         }
+        if (hit == null) {
+            while (base < n) : (base += 1) {
+                if (tab[base] == p) {
+                    hit = base;
+                    break;
+                }
+            }
+        }
+        if (hit) |i| return light_builtin_registry[i].id;
         return null;
     }
 
@@ -47392,15 +47644,22 @@ pub const Vm = struct {
     /// BEFORE this body runs; it must not push or pop anything). Reads the
     /// args from the C-frame window, runs the native core via
     /// callBuiltinSwitch (NOT callBuiltin — that owns the C-frame push),
-    /// stages the results, and pushes them onto the window
-    /// (cWindowPushSlice — the epilogue reads the top nret slots, PUC
-    /// poscall shape). Yield/error/OOM transport follows the shim protocol
-    /// of callCFunctionWithBoundary (plain -1/-2/-3 returns; longjmp for
-    /// OOM/YieldAbsorbed/ThreadSwitch), mirroring packageShimReturn /
-    /// testcLightCFuncError: every longjmp arm frees the owned transport
-    /// slices explicitly BEFORE raising (defers don't run across
-    /// _longjmp), and an abandoned root scope is left open for the landing
-    /// pad's restoreRoots.
+    /// and stages the results in the thread's stack window above the call
+    /// region — PUC reserves the callee's result slots on L->stack inside
+    /// the activation's pre-reserved space (no counted allocation; a frozen
+    /// allocator with sufficient stack capacity sees no allocation at all).
+    /// The window is raised over th.top for the call's duration so the GC
+    /// covers progressively-written results (callBuiltin's call_region_top
+    /// analogue), registered in the builtin_outs refresh fields for
+    /// re-entrant cores, and trimmed to the produced count on return (the
+    /// epilogue reads the top nret slots — PUC poscall shape). Owned-slice
+    /// cores (pcall/xpcall/dofile/resume — out count 0) stage no window;
+    /// their exact slice is pushed through the rooted cWindowPushSlice
+    /// tail. Yield/error/OOM transport follows the shim protocol of
+    /// callCFunctionWithBoundary (plain -1/-2/-3 returns; longjmp for
+    /// OOM/YieldAbsorbed/ThreadSwitch): every longjmp arm leaves the
+    /// registration and top to the landing pads (the same staleness class
+    /// as callBuiltin's defer-bypassing throws).
     fn lightBuiltinTrampolineBody(id: BuiltinId, L: ?*lua_State) c_int {
         const h = L orelse return 0;
         const self = h.vm;
@@ -47415,34 +47674,58 @@ pub const Vm = struct {
         const fs = fr.func_slot;
         const args = th.stack[fs + 1 .. th.top];
 
-        // Result staging: builtinOutLen sizes the exact window (arg-derived
-        // for dynamic-count ids). The buffer is infraAlloc'd transport —
-        // PUC reserves the C callee's stack slots above L->top (no counted
-        // allocation; builtinPcall's staging precedent), so the countdown
-        // profile keeps only the builtin's own real allocations.
+        // Result window sizing (arg-derived for dynamic-count ids). The
+        // capacity check grows the stack only when the window exceeds the
+        // activation's reserved tail — the same lazy-growth class as PUC's
+        // luaD_checkstack at the callee's own pushes.
         const nouts = self.builtinOutLen(id, args);
+        if (nouts > 0) {
+            self.cWindowEnsure(th, nouts) catch |e| switch (e) {
+                error.OutOfMemory => {
+                    self.setOutOfMemoryError();
+                    self.latchErrmemRaiseWindow(th);
+                    self.c_error_value = self.errThread().err_obj;
+                    self.c_error_status = 4; // LUA_ERRMEM
+                    if (self.c_error_jmp) |jb| {
+                        _longjmp(@ptrCast(jb), 1);
+                    }
+                    std.process.abort();
+                },
+                // "stack overflow" (or any other installed error): the
+                // object is already in the VM error state — plain -1.
+                else => return -1,
+            };
+        }
+        const outs_base = th.top;
         const outs: []Value = if (nouts == 0)
             &[_]Value{}
         else
-            self.infraAlloc().alloc(Value, nouts) catch {
-                // The transport alloc failed before anything was staged —
-                // raise the OOM through the armed boundary exactly like the
-                // push-failure arm below.
-                self.setOutOfMemoryError();
-                self.latchErrmemRaiseWindow(th);
-                self.c_error_value = self.errThread().err_obj;
-                self.c_error_status = 4; // LUA_ERRMEM
-                if (self.c_error_jmp) |jb| {
-                    _longjmp(@ptrCast(jb), 1);
-                }
-                std.process.abort();
-            };
-        if (nouts > 0) @memset(outs, .Nil);
+            th.stack[outs_base .. outs_base + nouts];
+        if (nouts > 0) {
+            @memset(outs, .Nil);
+            th.top = outs_base + nouts;
+        }
         self.last_builtin_out_count = nouts;
+        // Register the window for refreshBuiltinOuts exactly like
+        // callBuiltin: re-entrant cores (builtinMayRefreshOuts) re-derive
+        // their outs slice by index after nested execution grows the stack.
+        // The registration must also supersede any outer registration for
+        // these ids (an empty window is the correct refresh answer for a
+        // core whose caller staged none). Restored by plain statements, not
+        // a defer: the shim tail's longjmp arms bypass Zig defers.
+        var saved_outs_reg: ?struct { on_bc: bool, base: usize, len: usize } = null;
+        if (builtinMayRefreshOuts(id)) {
+            saved_outs_reg = .{
+                .on_bc = self.builtin_outs_on_stack,
+                .base = self.builtin_outs_base,
+                .len = self.builtin_outs_len,
+            };
+            self.builtin_outs_on_stack = nouts > 0;
+            self.builtin_outs_base = outs_base;
+            self.builtin_outs_len = nouts;
+        }
         // active_builtin context mirrors callBuiltin (coroutine.yield's
         // suspended_builtin, failTabArgerror's qualified-name attribution).
-        // Restored by plain statements, not a defer: the shim tail's
-        // longjmp arms bypass Zig defers.
         const prev_active_builtin = self.active_builtin;
         const prev_active_builtin_args = self.active_builtin_args;
         self.active_builtin = id;
@@ -47450,52 +47733,67 @@ pub const Vm = struct {
         const switch_res = self.callBuiltinSwitch(id, args, outs);
         self.active_builtin = prev_active_builtin;
         self.active_builtin_args = prev_active_builtin_args;
+        if (saved_outs_reg) |s| {
+            self.builtin_outs_on_stack = s.on_bc;
+            self.builtin_outs_base = s.base;
+            self.builtin_outs_len = s.len;
+        }
         const owned = switch_res catch |e| {
-            self.infraAlloc().free(outs);
+            // Suspension-shaped errors (yield, thread switch, and the raw
+            // transports) leave th.top to the parking/transport machinery —
+            // the parked window anchor owns the shape from the yield point
+            // on. Plain errors kill the window: restore the call-region top
+            // before the shim tail (the OOM latch inside the shim then sees
+            // the same window shape as an error raised before any staging).
+            if (e != error.Yield and e != error.ThreadSwitch and
+                e != error.YieldAbsorbed and e != error.MainDestined)
+            {
+                th.top = outs_base;
+            }
             return self.lightCFuncShimError(e);
         };
-        // Exact results: an owned slice (dynamic-count builtins) IS the
-        // transport (allocOwnedResult — infraAlloc'd; the staging window
-        // is released on adoption); a window builtin produced into outs —
-        // the produced count is last_builtin_out_count for dynamic ids
+        if (owned) |v| {
+            // Exact results: an owned slice (dynamic-count builtins) IS the
+            // transport (allocOwnedResult — infraAlloc'd). The staging
+            // window (if any was sized) is dead — restore the call-region
+            // top so the push lands at the window base.
+            th.top = outs_base;
+            // Root the results across the window push (its growth
+            // allocation can run an emergency GC; until the values land on
+            // th.stack they are visible only to this Zig frame — the intern
+            // table is weak, fresh strings would be swept). openRootScope
+            // reserves the capacity up front so the protects below are
+            // infallible.
+            var scope = self.openRootScope(v.len, 0) catch {
+                self.infraAlloc().free(v);
+                return self.lightCFuncShimError(error.OutOfMemory);
+            };
+            defer scope.close();
+            for (v) |val| _ = scope.protectValueAssumeCapacity(val);
+            self.cWindowPushSlice(th, v) catch {
+                // Same ownership rule as the scope-open arm: free before the
+                // jump (a partial window copy is rolled back by the landing
+                // pad's stack restore, not by this slice); the open root
+                // scope is abandoned for the landing pad's restoreRoots.
+                self.infraAlloc().free(v);
+                return self.lightCFuncShimError(error.OutOfMemory);
+            };
+            self.infraAlloc().free(v);
+            return @intCast(v.len);
+        }
+        // Window results: already staged in th.stack at
+        // [outs_base..outs_base+produced) — no push, no transport copy. The
+        // produced count is last_builtin_out_count for dynamic ids
         // (captured at the call boundary, before any further VM execution
         // — callBuiltin's re-entrant-safety rule), the window length
-        // otherwise. `vals` may be a SUB-SLICE of outs — the full
-        // allocation is freed, never the view (allocator free contract).
-        var vals: []Value = undefined;
-        var transport: []Value = outs;
-        if (owned) |v| {
-            self.infraAlloc().free(outs);
-            transport = v;
-            vals = v;
-        } else {
-            const produced: usize = if (builtinHasDynamicOutCount(id))
-                @min(self.last_builtin_out_count, nouts)
-            else
-                nouts;
-            vals = outs[0..produced];
-        }
-        // Root the results across the window push (its growth allocation
-        // can run an emergency GC; until the values land on th.stack they
-        // are visible only to this Zig frame — the intern table is weak,
-        // fresh strings would be swept). openRootScope reserves the
-        // capacity up front so the protects below are infallible.
-        var scope = self.openRootScope(vals.len, 0) catch {
-            self.infraAlloc().free(transport);
-            return self.lightCFuncShimError(error.OutOfMemory);
-        };
-        defer scope.close();
-        for (vals) |v| _ = scope.protectValueAssumeCapacity(v);
-        self.cWindowPushSlice(th, vals) catch {
-            // Same ownership rule as the scope-open arm: free before the
-            // jump (a partial window copy is rolled back by the landing
-            // pad's stack restore, not by this slice); the open root scope
-            // is abandoned for the landing pad's restoreRoots.
-            self.infraAlloc().free(transport);
-            return self.lightCFuncShimError(error.OutOfMemory);
-        };
-        self.infraAlloc().free(transport);
-        return @intCast(vals.len);
+        // otherwise. Trim th.top to the produced bound (fixed nresults
+        // semantics: stale slots above the results end are dead).
+        const produced: usize = if (builtinHasDynamicOutCount(id))
+            @min(self.last_builtin_out_count, nouts)
+        else
+            nouts;
+        th.top = outs_base + produced;
+        return @intCast(produced);
     }
 
     /// Shared error tail of the light builtin trampolines: map the
@@ -47534,34 +47832,6 @@ pub const Vm = struct {
                 std.process.abort();
             },
         };
-    }
-
-    fn utf8LightChar(L: ?*lua_State) callconv(.c) c_int {
-        return lightBuiltinTrampolineBody(.utf8_char, L);
-    }
-
-    fn utf8LightCodepoint(L: ?*lua_State) callconv(.c) c_int {
-        return lightBuiltinTrampolineBody(.utf8_codepoint, L);
-    }
-
-    fn utf8LightLen(L: ?*lua_State) callconv(.c) c_int {
-        return lightBuiltinTrampolineBody(.utf8_len, L);
-    }
-
-    fn utf8LightOffset(L: ?*lua_State) callconv(.c) c_int {
-        return lightBuiltinTrampolineBody(.utf8_offset, L);
-    }
-
-    fn utf8LightCodes(L: ?*lua_State) callconv(.c) c_int {
-        return lightBuiltinTrampolineBody(.utf8_codes, L);
-    }
-
-    fn utf8LightCodesIter(L: ?*lua_State) callconv(.c) c_int {
-        return lightBuiltinTrampolineBody(.utf8_codes_iter, L);
-    }
-
-    fn utf8LightCodesIterNs(L: ?*lua_State) callconv(.c) c_int {
-        return lightBuiltinTrampolineBody(.utf8_codes_iter_ns, L);
     }
 
     /// P16.50-review-7 BLOCKER 4: hybrid result contract. Plain tables and
@@ -55900,8 +56170,24 @@ pub const Vm = struct {
                 // ReleaseFast — see debugFindGlobalFuncName).
                 const matches = switch (field_node.value) {
                     .Closure => |cl| func == .Closure and cl == func.Closure,
-                    .Builtin => |b| func == .Builtin and b == func.Builtin,
-                    .LightCFunction => |f| func == .LightCFunction and f == func.LightCFunction,
+                    // PUC findfield matches with lua_rawequal — one C
+                    // pointer identity. luazig publishes stdlib entries as
+                    // trampolines (.LightCFunction) while error paths hold
+                    // the normalized .Builtin form (failTabArgerror passes
+                    // .{ .Builtin = id }): resolve the trampoline through
+                    // the comptime registry (the same scan
+                    // normalizeLightBuiltin uses) and compare registry ids
+                    // in both directions.
+                    .Builtin => |b| switch (func) {
+                        .Builtin => |fb| b == fb,
+                        .LightCFunction => |ff| lightBuiltinId(ff) == b,
+                        else => false,
+                    },
+                    .LightCFunction => |f| switch (func) {
+                        .LightCFunction => |ff| f == ff,
+                        .Builtin => |fb| lightBuiltinId(f) == fb,
+                        else => false,
+                    },
                     else => false,
                 };
                 if (!matches) continue;
@@ -56057,9 +56343,10 @@ pub const Vm = struct {
         const table = comptime blk: {
             var t = [_]bool{false} ** 256;
             for ([_]BuiltinId{
-                .coroutine_close, .utf8_codepoint, .io_lines_iter, .io_read,
-                .file_read,       .file_close,     .io_close,      .io_popen,
-                .os_execute,      .io_lines,       .file_lines,    .debug_getupvalue,
+                .coroutine_close, .utf8_codepoint, .io_lines_iter,   .io_read,
+                .file_read,       .file_close,     .io_close,        .io_popen,
+                .os_execute,      .io_lines,       .file_lines,      .debug_getupvalue,
+                .string_find,     .string_match,   .package_loadlib,
             }) |d| t[@intFromEnum(d)] = true;
             break :blk t;
         };
@@ -56162,9 +56449,10 @@ pub const Vm = struct {
         var t = [_]?u16{1} ** @typeInfo(BuiltinId).@"enum".fields.len;
         // Argument-dependent (dynamic) out-counts — builtinOutLenDynamic.
         for ([_]BuiltinId{
-            .io_lines,      .io_lines_iter, .assert,       .select,
-            .string_byte,   .string_find,   .string_match, .utf8_codepoint,
-            .string_unpack, .table_unpack,  .io_read,      .file_read,
+            .io_lines,        .io_lines_iter, .assert,       .select,
+            .string_byte,     .string_find,   .string_match, .utf8_codepoint,
+            .string_unpack,   .table_unpack,  .io_read,      .file_read,
+            .package_loadlib,
         }) |dyn_id| t[@intFromEnum(dyn_id)] = null;
         // Fixed out-counts (moved verbatim from the old switch).
         t[@intFromEnum(BuiltinId.print)] = 0;
@@ -56183,6 +56471,8 @@ pub const Vm = struct {
         t[@intFromEnum(BuiltinId.io_flush)] = 1;
         t[@intFromEnum(BuiltinId.file_flush)] = 1;
         t[@intFromEnum(BuiltinId.file_setvbuf)] = 1;
+        // PUC f_gc (liolib.c) returns 0 — no results.
+        t[@intFromEnum(BuiltinId.file_gc)] = 0;
         t[@intFromEnum(BuiltinId.file_seek)] = 3;
         t[@intFromEnum(BuiltinId.file_write)] = 4;
         t[@intFromEnum(BuiltinId.os_remove)] = 3;
@@ -56295,6 +56585,10 @@ pub const Vm = struct {
                 if (call_args.len > 0 and call_args[0] == .String) break :blk 4;
                 break :blk 3;
             },
+            // PUC ll_loadlib: 1 result on success, the (nil, msg, what)
+            // triple on failure — the core reports the produced count via
+            // last_builtin_out_count; the window covers the triple.
+            .package_loadlib => 3,
             // P16.50-review-7 BLOCKER 4: io_read/file_read windows are
             // argument-derivable — one result per format (PUC io_read:
             // one result per format, fewer on EOF/failure, reported via

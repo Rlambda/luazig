@@ -27782,39 +27782,9 @@ pub const Vm = struct {
             return;
         }
 
-        switch (args[0]) {
-            .Int, .Num => outs[0] = args[0],
-            .String => |s0| {
-                const s = std.mem.trim(u8, s0.bytes(), " \t\r\n");
-                if (s.len == 0) {
-                    outs[0] = .Nil;
-                    return;
-                }
-                if (parseHexStringIntWrap(s)) |iv| {
-                    outs[0] = .{ .Int = iv };
-                    return;
-                }
-                if (std.fmt.parseInt(i64, s, 0)) |iv| {
-                    outs[0] = .{ .Int = iv };
-                    return;
-                } else |_| {}
-                const s_no_sign = if (s.len > 0 and (s[0] == '+' or s[0] == '-')) s[1..] else s;
-                if (std.ascii.eqlIgnoreCase(s_no_sign, "inf") or std.ascii.eqlIgnoreCase(s_no_sign, "infinity") or std.ascii.eqlIgnoreCase(s_no_sign, "nan")) {
-                    outs[0] = .Nil;
-                    return;
-                }
-                if (parseHexFloatFastPath(s)) |hv| {
-                    outs[0] = .{ .Num = hv };
-                    return;
-                }
-                if (std.fmt.parseFloat(f64, s)) |nv| {
-                    outs[0] = .{ .Num = nv };
-                    return;
-                } else |_| {}
-                outs[0] = .Nil;
-            },
-            else => outs[0] = .Nil,
-        }
+        // No-base conversion: the shared luaO_str2num mechanism (strTonum),
+        // the same path string arithmetic and luaL_checkinteger use.
+        outs[0] = strTonum(args[0]) orelse .Nil;
     }
 
     fn gcStep(self: *Vm, requested_kb: i64) DispatchError!bool {
@@ -43160,11 +43130,12 @@ pub const Vm = struct {
         return @alignCast(std.mem.bytesAsValue([4]u64, ud.payload));
     }
 
-    /// PUC luaL_checkinteger argerror for the math shims: the function
+    /// PUC luaL_argerror (lauxlib.c:169-192) for the math shims: the function
     /// name is derived from the raising C-frame (PUC getfuncname via the
     /// caller) with the globals/loaded-table walk fallback (PUC
-    /// pushglobalfuncname) — no hardcoded name.
-    fn mathArgError(self: *Vm, arg_no: usize, extra: []const u8, got: []const u8) Error {
+    /// pushglobalfuncname) — no hardcoded name. 'extra' is the full
+    /// parenthesized message (interror text or tag_error's "expected, got").
+    fn mathArgError(self: *Vm, arg_no: usize, extra: []const u8) Error {
         const th = self.activeBytecodeThread();
         var nm: []const u8 = "?";
         if (th.call_frames.len() >= 2) {
@@ -43176,7 +43147,15 @@ pub const Vm = struct {
                 }
             }
         }
-        return self.failArgerror("bad argument #{d} to '{s}' ({s}, got {s})", .{ arg_no, nm, extra, got });
+        return self.failArgerror("bad argument #{d} to '{s}' ({s})", .{ arg_no, nm, extra });
+    }
+
+    /// PUC tag_error (lauxlib.c:211) via luaL_typeerror for the math shims:
+    /// the "got" type name is __name-aware (valueTypeName).
+    fn mathTagError(self: *Vm, arg_no: usize, v: Value) Error {
+        var buf: [64]u8 = undefined;
+        const extra = std.fmt.bufPrint(buf[0..], "number expected, got {s}", .{self.valueTypeName(v)}) catch "number expected";
+        return self.mathArgError(arg_no, extra);
     }
 
     /// PUC math_random (lmathlib.c:582-614) over an explicit RanState.
@@ -43219,7 +43198,8 @@ pub const Vm = struct {
             n2 = ranNext(s);
         } else {
             const a1 = try self.mathCheckInt(args[0], 1);
-            const a2: i64 = if (args.len >= 2) try self.mathCheckInt(args[1], 2) else 0;
+            // PUC luaL_optinteger for arg 2: absent or nil -> 0.
+            const a2: i64 = if (args.len >= 2 and args[1] != .Nil) try self.mathCheckInt(args[1], 2) else 0;
             n1 = @bitCast(a1);
             n2 = @bitCast(a2);
         }
@@ -43228,19 +43208,31 @@ pub const Vm = struct {
         if (outs.len > 1) outs[1] = .{ .Int = @bitCast(n2) };
     }
 
-    /// luaL_checkinteger shape for the math shims (interror texts).
+    /// PUC luaL_checkinteger (lauxlib.c:448 + interror 440 + luaV_tointeger
+    /// lvm.c:157, F2Ieq): strings convert through the shared luaO_str2num
+    /// mechanism (strTonum), floats must be integral and inside the
+    /// lua_Integer range. A value that IS a number (or a numeric string)
+    /// without an integer representation raises interror (no "got"
+    /// clause); anything else raises tag_error.
     fn mathCheckInt(self: *Vm, v: Value, arg_no: usize) DispatchError!i64 {
-        return switch (v) {
+        const cvt: ?Value = switch (v) {
+            .Int, .Num => v,
+            .String => strTonum(v),
+            else => null,
+        };
+        const n = cvt orelse return self.mathTagError(arg_no, v);
+        return switch (n) {
             .Int => |i| i,
-            .Num => |n| blk: {
-                if (!std.math.isFinite(n))
-                    return self.mathArgError(arg_no, "number expected", self.valueTypeName(v));
-                const t = std.math.trunc(n);
-                if (t != n or t < -9223372036854775808.0 or t >= 9223372036854775808.0)
-                    return self.mathArgError(arg_no, "number has no integer representation", self.valueTypeName(v));
+            .Num => |f| blk: {
+                // PUC luaV_flttointeger(F2Ieq) + lua_numbertointeger range:
+                // NaN (n != floor(n)) and out-of-range infinities both land
+                // in the same interror.
+                const t = @floor(f);
+                if (f != t or t < -9223372036854775808.0 or t >= 9223372036854775808.0)
+                    return self.mathArgError(arg_no, "number has no integer representation");
                 break :blk @intFromFloat(t);
             },
-            else => self.mathArgError(arg_no, "number expected", self.valueTypeName(v)),
+            else => unreachable,
         };
     }
 
@@ -51500,14 +51492,20 @@ pub const Vm = struct {
         return switch (v) {
             .Int, .Num => v,
             .String => |s0| blk: {
-                const s = std.mem.trim(u8, s0.bytes(), " \t\r\n");
+                // PUC l_str2int/l_str2d skip leading/trailing lisspace
+                // (space, \t, \n, \v, \f, \r).
+                const s = std.mem.trim(u8, s0.bytes(), " \t\n\x0b\x0c\r");
                 if (s.len == 0) break :blk null;
+                // PUC numerals never contain '_'; Zig's parseInt/parseFloat
+                // would accept it as a digit separator.
+                if (std.mem.indexOfScalar(u8, s, '_') != null) break :blk null;
                 // PUC luaO_str2num: try integer first (handles hex 0x... and
                 // decimal, with leading/trailing space skipping).
                 if (parseHexStringIntWrap(s)) |iv| {
                     break :blk Value{ .Int = iv };
                 }
-                if (std.fmt.parseInt(i64, s, 0)) |iv| {
+                // Base 10, not 0: PUC has no 0b/0o prefixes.
+                if (std.fmt.parseInt(i64, s, 10)) |iv| {
                     break :blk Value{ .Int = iv };
                 } else |_| {}
                 // Reject inf/nan (PUC l_str2d rejects them).

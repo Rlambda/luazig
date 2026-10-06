@@ -297,6 +297,101 @@ int main(void) {
     if (st != LUA_ERRRUN) fails++;
     lua_pop(L, 1);
 
+    /* --- P5b: luaL_checkinteger conversion parity (numeric strings incl.
+     * boundary forms, integral floats, PUC rejection classes) --- */
+    /* call the registry-ref'd fn with nargs args already on the stack;
+     * print a uniform verdict: ok + integer results, or the error line */
+    void lane(int ref, int nargs, int nres, const char *label) {
+        lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
+        lua_insert(L, -(nargs + 1));
+        int lst = lua_pcall(L, nargs, nres, 0);
+        if (lst == LUA_OK) {
+            printf("%s: ok", label);
+            for (int i = 0; i < nres; i++)
+                printf(" %lld", (long long)lua_tointeger(L, i - nres));
+            printf("\n");
+            lua_pop(L, nres);
+        } else {
+            printf("%s: st=%d type=%s msg=%s\n", label, lst,
+                   lua_typename(L, lua_type(L, -1)),
+                   lua_tostring(L, -1) ? lua_tostring(L, -1) : "(null)");
+            lua_pop(L, 1);
+            if (lst != LUA_ERRRUN) fails++;
+        }
+    }
+    /* deterministic value lanes: reseed, then convert */
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ref_s1);
+    lua_pushinteger(L, 42); lua_pushinteger(L, 7);
+    lua_call(L, 2, 0);
+    lua_pushliteral(L, "10"); lane(ref_r1, 1, 1, "P5b.str.decimal");
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ref_s1);
+    lua_pushinteger(L, 42); lua_pushinteger(L, 7);
+    lua_call(L, 2, 0);
+    lua_pushliteral(L, " 0x10 "); lane(ref_r1, 1, 1, "P5b.str.hexspace");
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ref_s1);
+    lua_pushinteger(L, 42); lua_pushinteger(L, 7);
+    lua_call(L, 2, 0);
+    lua_pushliteral(L, "1e2"); lane(ref_r1, 1, 1, "P5b.str.exp");
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ref_s1);
+    lua_pushinteger(L, 42); lua_pushinteger(L, 7);
+    lua_call(L, 2, 0);
+    lua_pushliteral(L, " +10 "); lane(ref_r1, 1, 1, "P5b.str.signspace");
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ref_s1);
+    lua_pushinteger(L, 42); lua_pushinteger(L, 7);
+    lua_call(L, 2, 0);
+    lua_pushnumber(L, 2.0); lua_pushliteral(L, "5");
+    lane(ref_r1, 2, 1, "P5b.mixed.floatstr");
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ref_s1);
+    lua_pushinteger(L, 42); lua_pushinteger(L, 7);
+    lua_call(L, 2, 0);
+    lua_pushnumber(L, 1.0); lua_pushnumber(L, 5.0);
+    lane(ref_r1, 2, 1, "P5b.floats.integral");
+    /* rejection lanes: fractional / non-numeric / out-of-range / Zig-only
+     * numeral forms PUC's luaO_str2num rejects */
+    lua_pushnumber(L, 2.5); lane(ref_r1, 1, 1, "P5b.float.frac");
+    lua_pushliteral(L, "3.5"); lane(ref_r1, 1, 1, "P5b.str.frac");
+    lua_pushliteral(L, "1e999"); lane(ref_r1, 1, 1, "P5b.str.overflow");
+    lua_pushliteral(L, "9223372036854775808"); lane(ref_r1, 1, 1, "P5b.str.maxp1");
+    lua_pushliteral(L, "-9223372036854775808"); lane(ref_r1, 1, 1, "P5b.str.minint");
+    lua_pushliteral(L, "abc"); lane(ref_r1, 1, 1, "P5b.str.nonnum");
+    lua_pushliteral(L, "inf"); lane(ref_r1, 1, 1, "P5b.str.inf");
+    lua_pushliteral(L, "nan"); lane(ref_r1, 1, 1, "P5b.str.nan");
+    lua_pushlstring(L, "10\0", 3); lane(ref_r1, 1, 1, "P5b.str.embeddednul");
+    lua_pushliteral(L, "0b101"); lane(ref_r1, 1, 1, "P5b.str.zigbinary");
+    lua_pushliteral(L, "1_000"); lane(ref_r1, 1, 1, "P5b.str.underscore");
+    lua_pushliteral(L, "2^62"); lane(ref_r1, 1, 1, "P5b.str.trailing");
+    lua_pushboolean(L, 1); lane(ref_r1, 1, 1, "P5b.bool");
+    lua_pushnil(L); lane(ref_r1, 1, 1, "P5b.nil");
+    /* __name-aware tag_error type name */
+    lua_newtable(L);
+    lua_newtable(L);
+    lua_pushliteral(L, "mytype");
+    lua_setfield(L, -2, "__name");
+    lua_setmetatable(L, -2);
+    lane(ref_r1, 1, 1, "P5b.name.meta");
+    /* randomseed string forms + luaL_optinteger nil default */
+    lua_pushliteral(L, "42"); lua_pushliteral(L, "7");
+    lane(ref_s1, 2, 2, "P5b.seed.strpair");
+    lua_pushliteral(L, "42"); lane(ref_s1, 1, 2, "P5b.seed.stronly");
+    lua_pushinteger(L, 42); lua_pushnil(L);
+    lane(ref_s1, 2, 2, "P5b.seed.optnil");
+    lua_pushliteral(L, " 42 "); lane(ref_s1, 1, 2, "P5b.seed.strspace");
+    lua_pushliteral(L, "0x2A"); lane(ref_s1, 1, 2, "P5b.seed.strhex");
+    lua_pushliteral(L, "42.5"); lane(ref_s1, 1, 2, "P5b.seed.frac");
+    lua_pushliteral(L, "abc"); lane(ref_s1, 1, 2, "P5b.seed.nonnum");
+    lua_pushliteral(L, "42"); lua_pushliteral(L, "abc");
+    lane(ref_s1, 2, 2, "P5b.seed.arg2nonnum");
+    lua_pushliteral(L, "42"); lua_pushliteral(L, "7.5");
+    lane(ref_s1, 2, 2, "P5b.seed.arg2frac");
+    /* sequence after a failed call: the draw happens before the arg check
+     * on both runtimes, so the next value must agree */
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ref_s1);
+    lua_pushinteger(L, 42); lua_pushinteger(L, 7);
+    lua_call(L, 2, 0);
+    lua_pushliteral(L, "abc"); lane(ref_r1, 1, 1, "P5b.seq.errcall");
+    lua_pushinteger(L, 100); lane(ref_r1, 1, 1, "P5b.seq.aftererr");
+    lua_pushinteger(L, 100); lane(ref_r1, 1, 1, "P5b.seq.next");
+
     printf("fails:%d\n", fails);
     lua_close(L);
     return fails ? 1 : 0;

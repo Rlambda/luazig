@@ -8,18 +8,30 @@
  * LUA_USE_POSIX, where os.tmpname maps to tmpnam() and creates no file —
  * not the contract under test.
  *
+ * The suite never enumerates /tmp and never removes a name it did not
+ * obtain from its own os.tmpname() call, so parallel runs of any number
+ * of suites (zig or PUC) cannot interfere through shared /tmp state.
+ * Files whose name is lost before an error surfaces (the ERRMEM edge:
+ * the create succeeded, the failing allocation dropped the name) are
+ * left behind exactly like PUC leaves them.
+ *
  * Checked properties: name shape (/tmp/lua_ + 6 alphanumerics), file
  * created with mode 0600 and removable, distinct names within a state,
- * across two states in one process, after VM reuse and after full GC; the
- * side effect survives result discarding (nresults=0); math.random's
- * sequence and RanState upvalue are untouched; descriptor count is stable
- * across every call variant (the fd is closed on all paths); a forced
- * create failure (exhausted descriptor table) raises a catchable error
- * carrying the PUC message and the state recovers; allocation-failure
- * edges (frozen countdown allocator) fail with LUA_ERRMEM + string error object,
- * recover, retry, and leave no descriptors behind. The per-runtime
- * allocation structure is not a parity contract, so OOM trials print a
- * normalized verdict, not the raw k-matrix. */
+ * across two states in one process, after VM reuse and after full GC;
+ * the create side effect survives result discarding (nresults=0) —
+ * proven WITHOUT /tmp inventory: under a deterministically exhausted
+ * descriptor table a result-discarding call must still attempt the
+ * exclusive create and raise the same catchable create failure (an
+ * implementation that skips the create when no result is wanted would
+ * return LUA_OK); math.random's sequence and RanState upvalue are
+ * untouched; descriptor count is stable across every call variant (the
+ * fd is closed on all paths); a forced create failure (exhausted
+ * descriptor table) raises a catchable error carrying the PUC message
+ * and the state recovers; allocation-failure edges (frozen countdown
+ * allocator) fail with LUA_ERRMEM + string error object, recover,
+ * retry, and leave no descriptors behind. The per-runtime allocation
+ * structure is not a parity contract, so OOM trials print a normalized
+ * verdict, not the raw k-matrix. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,57 +51,7 @@ static void check(long cond, const char *label) {
     if (!cond) fails++;
 }
 
-/* ---- /tmp/lua_* name inventory (snapshot + diff) ---- */
-
-#define MAX_NAMES 4096
-static char snap_a[MAX_NAMES][256];
-static char snap_b[MAX_NAMES][256];
-static int snap_n;
-
-static int name_interesting(const char *n) {
-    return strncmp(n, "lua_", 4) == 0;
-}
-
-static void snapshot(void) {
-    snap_n = 0;
-    DIR *d = opendir("/tmp");
-    if (!d) return;
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL && snap_n < MAX_NAMES) {
-        if (name_interesting(e->d_name)) {
-            snprintf(snap_a[snap_n], sizeof(snap_a[0]), "%s", e->d_name);
-            snap_n++;
-        }
-    }
-    closedir(d);
-}
-
-/* remove every interesting name that appeared since snapshot(); returns
- * the number of new names found (and cleaned) */
-static int clean_new(void) {
-    int fresh = 0;
-    DIR *d = opendir("/tmp");
-    if (!d) return -1;
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
-        if (!name_interesting(e->d_name)) continue;
-        int known = 0;
-        for (int i = 0; i < snap_n; i++) {
-            if (strcmp(snap_a[i], e->d_name) == 0) { known = 1; break; }
-        }
-        if (!known) {
-            snprintf(snap_b[fresh], sizeof(snap_b[0]), "%s", e->d_name);
-            fresh++;
-        }
-    }
-    closedir(d);
-    for (int i = 0; i < fresh; i++) {
-        char path[320];
-        snprintf(path, sizeof(path), "/tmp/%s", snap_b[i]);
-        remove(path);
-    }
-    return fresh;
-}
+/* ---- own-process descriptor inventory (no /tmp access) ---- */
 
 static int count_fds(void) {
     DIR *d = opendir("/proc/self/fd");
@@ -119,6 +81,42 @@ static int file_exists_mode(const char *p, mode_t *mode_out) {
     if (stat(p, &st) != 0) return 0;
     if (mode_out) *mode_out = st.st_mode & 0777;
     return 1;
+}
+
+/* ---- deterministic descriptor exhaustion ----
+ * Lower the NOFILE soft limit to just above the current maximum
+ * descriptor number and fill every hole below it with /dev/null
+ * descriptors, so the next file create deterministically hits EMFILE.
+ * Returns the filler count, or -1 if a probe create still succeeded
+ * (exhaustion failed — the caller's checks then fail loudly). */
+static int fillers[1200];
+static void restore_fds(const struct rlimit *rl_old, int n);
+static int exhaust_fds(struct rlimit *rl_old) {
+    if (getrlimit(RLIMIT_NOFILE, rl_old) != 0) return -1;
+    struct rlimit rl = *rl_old;
+    int mx = max_fd();
+    if (mx < 0) return -1;
+    rl.rlim_cur = (rlim_t)(mx + 1);
+    if (setrlimit(RLIMIT_NOFILE, &rl) != 0) return -1;
+    int n = 0;
+    while (n < 1200) {
+        int fd = open("/dev/null", O_RDONLY);
+        if (fd < 0) break;
+        fillers[n++] = fd;
+    }
+    int probe = open("/dev/null", O_RDONLY);
+    if (probe >= 0) {
+        /* exhaustion failed: undo everything before reporting */
+        close(probe);
+        restore_fds(rl_old, n);
+        return -1;
+    }
+    return n;
+}
+
+static void restore_fds(const struct rlimit *rl_old, int n) {
+    for (int i = 0; i < n; i++) close(fillers[i]);
+    setrlimit(RLIMIT_NOFILE, rl_old);
 }
 
 /* one os.tmpname call under pcall; leaves the result (or error) on top */
@@ -162,7 +160,6 @@ static void oom_trial(int k) {
     lua_State *L = lua_newstate(falloc, NULL, 0);
     if (!L) { printf("oom.k=%d: newstate-failed\n", k); fails++; return; }
     luaL_openlibs(L);
-    snapshot();
     int fds_before = count_fds();
     countdown = k; frozen = 0;
     int st = call_tmpname(L);
@@ -183,7 +180,9 @@ static void oom_trial(int k) {
         lua_pop(L, 1);
         lua_gc(L, LUA_GCCOLLECT, 0);
         /* VM reuse after the failure: retry must succeed with a valid,
-         * created, removable file */
+         * created, removable file. A file created by the failed attempt
+         * before its allocation failed is unknowable (the name was lost
+         * with the error) and is left behind, exactly like PUC. */
         int st2 = call_tmpname(L);
         if (st2 != LUA_OK) { verdict = "VIOLATION(retry)"; lua_pop(L, 1); }
         else {
@@ -201,9 +200,6 @@ static void oom_trial(int k) {
     /* the descriptor must be closed on every path (incl. the failed
      * attempt's exclusive create before the failing allocation) */
     if (count_fds() != fds_before) verdict = "VIOLATION(fd-leak)";
-    /* clean any file the failed attempt created before its allocation
-     * failed (the name is lost to the program; PUC leaves it too) */
-    clean_new();
     printf("oom.k=%d: %s\n", k, verdict);
     if (verdict[0] == 'V') fails++;
     lua_close(L);
@@ -215,7 +211,6 @@ int main(void) {
 
     /* distinct across two states in one process; files created */
     char n1[64] = "", n2[64] = "", n3[64] = "";
-    snapshot();
     if (call_tmpname(L) == LUA_OK) { snprintf(n1, sizeof(n1), "%s", lua_tostring(L, -1)); lua_pop(L, 1); }
     if (call_tmpname(L2) == LUA_OK) { snprintf(n2, sizeof(n2), "%s", lua_tostring(L2, -1)); lua_pop(L2, 1); }
     check(n1[0] && n2[0], "two_states_names");
@@ -259,15 +254,59 @@ int main(void) {
     check(file_exists_mode(n3, &m3) && m3 == 0600, "post_gc_file_mode0600");
     check(remove(n3) == 0, "post_gc_removed");
 
-    /* the side effect survives result discarding (nresults=0): the file
-     * must appear even when the name is dropped */
-    snapshot();
+    /* the create side effect survives result discarding (nresults=0),
+     * proven without any /tmp inventory: under a deterministically
+     * exhausted descriptor table the result-discarding call must still
+     * attempt the exclusive create and raise the same catchable create
+     * failure — an implementation that skips the create when no result
+     * is wanted would return LUA_OK here. */
+    int fds_before_nr = count_fds();
+    struct rlimit rl_nr;
+    int nfill_nr = exhaust_fds(&rl_nr);
+    check(nfill_nr >= 0, "noresult_fds_exhausted");
     lua_getglobal(L, "os");
     lua_getfield(L, -1, "tmpname");
     lua_replace(L, -2);
-    lua_call(L, 0, 0);
-    int fresh = clean_new();
-    check(fresh == 1, "noresult_side_effect");
+    int st_nr = lua_pcall(L, 0, 0, 0);          /* nresults = 0 */
+    int raised = (st_nr != LUA_OK);
+    const char *body_nr = NULL;
+    if (st_nr != LUA_OK) {
+        body_nr = lua_tostring(L, -1);
+        lua_pop(L, 1);
+    }
+    restore_fds(&rl_nr, nfill_nr);
+    check(raised, "noresult_create_error_raised");
+    check(body_nr != NULL && strstr(body_nr, "unable to generate a unique filename") != NULL,
+          "noresult_error_body");
+    check(count_fds() == fds_before_nr, "noresult_fd_stable");
+    /* recovery: with the descriptors restored the call works again and
+     * returns its own removable name */
+    int st_nr2 = call_tmpname(L);
+    check(st_nr2 == LUA_OK, "noresult_recovered");
+    if (st_nr2 == LUA_OK) {
+        check(remove(lua_tostring(L, -1)) == 0, "noresult_own_name_removed");
+        lua_pop(L, 1);
+    }
+    /* the same side effect through the BYTECODE path: a chunk whose
+     * statement discards the result (OP_CALL nresults=0) must still
+     * attempt the create — under the exhausted descriptor table the
+     * chunk raises the same catchable error instead of succeeding. */
+    int fds_before_nc = count_fds();
+    struct rlimit rl_nc;
+    int nfill_nc = exhaust_fds(&rl_nc);
+    check(nfill_nc >= 0, "noresult_chunk_fds_exhausted");
+    int st_nc = luaL_dostring(L, "os.tmpname()");
+    int raised_c = (st_nc != LUA_OK);
+    const char *body_c = NULL;
+    if (st_nc != LUA_OK) {
+        body_c = lua_tostring(L, -1);
+        lua_pop(L, 1);
+    }
+    restore_fds(&rl_nc, nfill_nc);
+    check(raised_c, "noresult_chunk_error_raised");
+    check(body_c != NULL && strstr(body_c, "unable to generate a unique filename") != NULL,
+          "noresult_chunk_error_body");
+    check(count_fds() == fds_before_nc, "noresult_chunk_fd_stable");
 
     /* math isolation: the sequence is not disturbed, the RanState upvalue
      * of math.random stays a userdata */
@@ -286,27 +325,13 @@ int main(void) {
     check(un != NULL && lua_type(L, -1) == LUA_TUSERDATA, "math_ranstate_intact");
     lua_settop(L, 0);
 
-    /* forced create failure: lower the descriptor soft limit to just above
-     * the current maximum descriptor number and fill every hole below it,
-     * so the exclusive create deterministically hits EMFILE. The call must
-     * raise a catchable error carrying the PUC message body, leak no
+    /* forced create failure with the result wanted: the call must raise
+     * a catchable error carrying the PUC message body, leak no
      * descriptor, and the state must recover once the limit is restored. */
     int fds_before_hf = count_fds();
-    struct rlimit rl_old;
-    getrlimit(RLIMIT_NOFILE, &rl_old);
-    struct rlimit rl = rl_old;
-    rl.rlim_cur = (rlim_t)(max_fd() + 1);
-    setrlimit(RLIMIT_NOFILE, &rl);
-    int fillers[1200];
-    int nfill = 0;
-    while (nfill < 1200) {
-        int fd = open("/dev/null", O_RDONLY);
-        if (fd < 0) break;
-        fillers[nfill++] = fd;
-    }
-    int probe = open("/dev/null", O_RDONLY);
-    check(probe < 0, "hardfail_fds_exhausted");
-    if (probe >= 0) close(probe);
+    struct rlimit rl_hf;
+    int nfill_hf = exhaust_fds(&rl_hf);
+    check(nfill_hf >= 0, "hardfail_fds_exhausted");
     int st = call_tmpname(L);
     int catchable = (st == LUA_ERRRUN);
     const char *body = NULL;
@@ -314,11 +339,10 @@ int main(void) {
         body = lua_tostring(L, -1);
         lua_pop(L, 1);
     }
+    restore_fds(&rl_hf, nfill_hf);
     check(catchable, "hardfail_catchable");
     check(body != NULL && strstr(body, "unable to generate a unique filename") != NULL,
           "hardfail_msg_body");
-    for (int i = 0; i < nfill; i++) close(fillers[i]);
-    setrlimit(RLIMIT_NOFILE, &rl_old);
     check(count_fds() == fds_before_hf, "hardfail_fd_stable");
     int st2 = call_tmpname(L);
     check(st2 == LUA_OK, "hardfail_recovered");

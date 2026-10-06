@@ -273,7 +273,6 @@ pub const BuiltinId = enum(u8) {
     string_find,
     string_match,
     string_gmatch,
-    string_gmatch_iter,
     string_gsub,
     string_rep,
     // String metatable arithmetic metamethods (PUC lstrlib.c:299-329).
@@ -458,7 +457,6 @@ pub const BuiltinId = enum(u8) {
             .string_find => "string.find",
             .string_match => "string.match",
             .string_gmatch => "string.gmatch",
-            .string_gmatch_iter => "string.gmatch_iter",
             .string_gsub => "string.gsub",
             .string_rep => "string.rep",
             .str_arith_add => "__add",
@@ -4961,6 +4959,11 @@ const TestcAllocAdapter = struct {
 pub const Vm = struct {
     const Frame = CallFrame;
 
+    /// The gmatch iterator's per-call state (PUC GMatchState): the payload
+    /// of the iterator closure's userdata upvalue. s/p are raw pointers
+    /// kept alive by the closure's upvalue cells 1/2 for the payload's
+    /// whole lifetime; pos/disallow_empty_at are the only mutable cursor
+    /// (PUC src/lastmatch).
     const GmatchState = struct {
         s: *LuaString,
         p: *LuaString,
@@ -5754,7 +5757,6 @@ pub const Vm = struct {
     last_close_status: i32 = 0,
     active_builtin: ?BuiltinId = null,
     active_builtin_args: ?[]const Value = null,
-    gmatch_state: ?GmatchState = null,
     main_thread: ?*Thread = null,
     forced_close_thread: ?*Thread = null,
     forced_close_had_error: bool = false,
@@ -26908,7 +26910,6 @@ pub const Vm = struct {
             .string_find => try self.builtinStringFind(args, outs),
             .string_match => try self.builtinStringMatch(args, outs),
             .string_gmatch => try self.builtinStringGmatch(args, outs),
-            .string_gmatch_iter => try self.builtinStringGmatchIter(args, outs),
             .string_gsub => try self.builtinStringGsub(args, outs),
             .string_rep => try self.builtinStringRep(args, outs),
             .str_arith_add => try self.strArithMetamethod(.add, args, outs),
@@ -32951,10 +32952,6 @@ pub const Vm = struct {
             try self.gcMarkValue(.{ .Thread = request.target });
             for (request.args) |value| try self.gcMarkValue(value);
         }
-        if (self.gmatch_state) |state| {
-            try self.gcMarkValue(.{ .String = state.s });
-            try self.gcMarkValue(.{ .String = state.p });
-        }
     }
 
     /// Run at most `budget` collector work units. A propagation unit scans one
@@ -35466,19 +35463,6 @@ pub const Vm = struct {
             try self.gcMarkValue(.{ .Thread = request.target });
             for (request.args) |value| {
                 try self.gcMarkValue(value);
-            }
-        }
-
-        // gmatch iterator state: holds *LuaString pointers for the subject string
-        // and pattern, kept alive between iterator calls.
-        if (self.gmatch_state) |gs| {
-            if (gcIsWhite(gs.s.marked)) {
-                gcSetBlack(&gs.s.marked);
-                self.gc_mark_epoch += 1;
-            }
-            if (gcIsWhite(gs.p.marked)) {
-                gcSetBlack(&gs.p.marked);
-                self.gc_mark_epoch += 1;
             }
         }
     }
@@ -38897,7 +38881,7 @@ pub const Vm = struct {
 
     fn debugFillInfoFromFunction(self: *Vm, t: *Table, fnv: Value, what: []const u8) DispatchError!void {
         switch (fnv) {
-            .Builtin => |id| {
+            .Builtin => {
                 const has_s = what.len == 0 or debugInfoHasOpt(what, 'S');
                 const has_f = what.len == 0 or debugInfoHasOpt(what, 'f');
                 const has_u = what.len == 0 or debugInfoHasOpt(what, 'u');
@@ -38909,8 +38893,7 @@ pub const Vm = struct {
                     try self.setField(t, "lastlinedefined", .{ .Int = -1 });
                 }
                 if (has_u) {
-                    const nups: i64 = if (id == .string_match or id == .string_gmatch_iter) 1 else 0;
-                    try self.setField(t, "nups", .{ .Int = nups });
+                    try self.setField(t, "nups", .{ .Int = 0 });
                     try self.setField(t, "nparams", .{ .Int = 0 });
                     try self.setField(t, "isvararg", .{ .Bool = true });
                 }
@@ -39973,7 +39956,7 @@ pub const Vm = struct {
             },
             // Owner: the only .Builtin values reachable from Lua are the
             // stateful/upvalue classes not yet migrated to light
-            // publications (the gmatch/io.lines iterator products, testc_*).
+            // publications (the io.lines iterator product, testc_*).
             // Their PUC classes are C closures with real upvalues; parity
             // for this arm lands with those cuts.
             .Builtin => {
@@ -46448,6 +46431,13 @@ pub const Vm = struct {
         outs[0] = .Nil;
     }
 
+    /// PUC str_gmatch (lstrlib.c:857-871): the producer itself is a plain
+    /// C function (light lane); every call returns a FRESH CClosure(3)
+    /// iterator over [subject string, pattern string, GMatchState
+    /// userdata] (PUC lua_pushcclosure(L, gmatch_aux, 3)). Upvalues 1/2
+    /// exist only to keep the strings alive for the raw pointers inside
+    /// the userdata payload (PUC: strings are kept on the closure to
+    /// avoid being collected); the only mutable state is the payload.
     fn builtinStringGmatch(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("string.gmatch expects (s, pattern)", .{});
@@ -46467,37 +46457,52 @@ pub const Vm = struct {
         const len: i64 = @intCast(s.len);
         var start1 = if (init0 >= 0) init0 else len + init0 + 1;
         if (start1 < 1) start1 = 1;
-        if (start1 > len + 1) {
-            self.gmatch_state = .{ .s = sls, .p = pls, .pos = s.len + 1 };
-            outs[0] = .{ .Builtin = .string_gmatch_iter };
-            return;
-        }
-        self.gmatch_state = .{ .s = sls, .p = pls, .pos = @intCast(start1 - 1) };
-        outs[0] = .{ .Builtin = .string_gmatch_iter };
+        const pos: usize = if (start1 > len + 1) s.len + 1 else @intCast(start1 - 1);
+        // PUC arms s/p/gm on L->stack for the whole construction; here the
+        // args are the caller's stack slots and the staging window over
+        // outs is already raised (light trampoline / callBuiltin call
+        // region), so only the fresh userdata needs a root across
+        // allocCclosure's cell/closure allocations. Publication is the
+        // infallible outs[0] write; an allocCclosure failure rolls back
+        // its own registrations, leaving the userdata as plain garbage.
+        var scope = try self.openRootScope(1, 0);
+        defer scope.close();
+        const gm_ud = try self.allocUserdata(@sizeOf(GmatchState), 0);
+        _ = scope.protectValueAssumeCapacity(.{ .Userdata = gm_ud });
+        gmatchStateOf(gm_ud).* = .{ .s = sls, .p = pls, .pos = pos };
+        const cl = try self.allocCclosure(&gmatchAuxShim, &.{
+            .{ .String = sls }, .{ .String = pls }, .{ .Userdata = gm_ud },
+        });
+        outs[0] = .{ .Closure = cl };
     }
 
-    fn builtinStringGmatchIter(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
-        _ = args;
-        if (outs.len == 0) return;
-        var st = self.gmatch_state orelse {
-            outs[0] = .Nil;
-            return;
-        };
-        const s = st.s.bytes();
-        const p = st.p.bytes();
-        if (st.pos > s.len) {
-            self.gmatch_state = null;
-            outs[0] = .Nil;
-            return;
-        }
+    /// The GMatchState payload of a gmatch iterator's userdata upvalue
+    /// (PUC lua_newuserdatauv(sizeof(GMatchState), 0) — the payload IS
+    /// the state; the subject/pattern pointers stay alive through the
+    /// closure's upvalue cells 1/2 for the payload's whole lifetime).
+    fn gmatchStateOf(ud: *Userdata) *GmatchState {
+        return @alignCast(std.mem.bytesAsValue(GmatchState, ud.payload));
+    }
+
+    /// PUC gmatch_aux (lstrlib.c:832-846) over the userdata payload:
+    /// advance from gm.pos, skip an empty match ending where the previous
+    /// match ended (the lastmatch rule, modeled by disallow_empty_at),
+    /// return the EXACT capture count (the whole match when the pattern
+    /// captures nothing) and 0 on exhaustion. A leading '^' is a LITERAL
+    /// here (PUC anchors only in str_find_aux); a trailing '$' matches
+    /// only at the subject's end (PUC match()'s own end anchor). The
+    /// cursor advances BEFORE the results are interned (PUC assigns
+    /// gm->src/gm->lastmatch before push_captures, so an OOM mid-result
+    /// leaves the same advanced state). outs is the caller's staging
+    /// window on th.stack: every interned capture lands on a GC root the
+    /// moment it is produced (the intern table is weak).
+    fn gmatchAuxCore(self: *Vm, gm: *GmatchState, outs: []Value) DispatchError!usize {
+        const s = gm.s.bytes();
+        const p = gm.p.bytes();
+        if (gm.pos > s.len) return 0;
 
         var pat = p;
-        var anchored_start = false;
         var anchored_end = false;
-        if (pat.len > 0 and pat[0] == '^') {
-            anchored_start = true;
-            pat = pat[1..];
-        }
         if (pat.len > 0 and pat[pat.len - 1] == '$' and (pat.len == 1 or pat[pat.len - 2] != '%')) {
             anchored_end = true;
             pat = pat[0 .. pat.len - 1];
@@ -46508,16 +46513,12 @@ pub const Vm = struct {
         self.beginPatternMatchBudget(s.len, toks.len);
         defer self.pattern_budget_active = false;
 
-        var start = st.pos;
+        var start = gm.pos;
         while (start <= s.len) : (start += 1) {
-            if (anchored_start and start != st.pos) break;
             var caps: [10]Capture = [_]Capture{.{}} ** 10;
             const endpos = try self.matchTokens(toks, 0, s, start, &caps, start, anchored_end) orelse continue;
-            if (anchored_end and endpos != s.len) {
-                if (anchored_start) break;
-                continue;
-            }
-            if (endpos == start and st.disallow_empty_at != null and st.disallow_empty_at.? == start) {
+            if (anchored_end and endpos != s.len) continue;
+            if (endpos == start and gm.disallow_empty_at != null and gm.disallow_empty_at.? == start) {
                 if (start >= s.len) break;
                 continue;
             }
@@ -46528,35 +46529,102 @@ pub const Vm = struct {
                 if (caps[cap_i].set) cap_count += 1;
             }
 
+            gm.pos = if (endpos > start) endpos else if (start < s.len) start + 1 else s.len + 1;
+            gm.disallow_empty_at = if (endpos > start) endpos else null;
+
             if (cap_count == 0) {
-                const istr = try self.internStr(s[start..endpos]);
-                outs[0] = .{ .String = istr };
-                var oi: usize = 1;
-                while (oi < outs.len) : (oi += 1) outs[oi] = .Nil;
-            } else {
-                var oi: usize = 0;
-                cap_i = 1;
-                while (cap_i < caps.len and oi < outs.len) : (cap_i += 1) {
-                    if (!caps[cap_i].set) continue;
-                    if (caps[cap_i].is_pos) {
-                        outs[oi] = .{ .Int = @intCast(caps[cap_i].start + 1) };
-                    } else {
-                        const istr2 = try self.internStr(s[caps[cap_i].start..caps[cap_i].end]);
-                        outs[oi] = .{ .String = istr2 };
-                    }
-                    oi += 1;
-                }
-                while (oi < outs.len) : (oi += 1) outs[oi] = .Nil;
+                outs[0] = .{ .String = try self.internStr(s[start..endpos]) };
+                return 1;
             }
-
-            st.pos = if (endpos > start) endpos else if (start < s.len) start + 1 else s.len + 1;
-            st.disallow_empty_at = if (endpos > start) endpos else null;
-            self.gmatch_state = st;
-            return;
+            var oi: usize = 0;
+            cap_i = 1;
+            while (cap_i < caps.len) : (cap_i += 1) {
+                if (!caps[cap_i].set) continue;
+                if (caps[cap_i].is_pos) {
+                    outs[oi] = .{ .Int = @intCast(caps[cap_i].start + 1) };
+                } else {
+                    outs[oi] = .{ .String = try self.internStr(s[caps[cap_i].start..caps[cap_i].end]) };
+                }
+                oi += 1;
+            }
+            return oi;
         }
+        return 0;
+    }
 
-        self.gmatch_state = null;
-        outs[0] = .Nil;
+    /// The gmatch iterator's result window bound: the matcher tracks at
+    /// most 9 captures (caps[1..10)), so one call produces at most 9
+    /// values (the whole-match form produces 1).
+    const gmatch_iter_max_results = 10;
+
+    /// PUC gmatch_aux as a CClosure(3) target: the whole iteration state
+    /// is the GMatchState userdata of upvalue 3 of the running
+    /// activation's closure (upvalues 1/2 only keep the subject/pattern
+    /// strings alive for the payload's raw pointers — gmatch_aux reads
+    /// nothing else). Results are staged on th.stack above the
+    /// activation's args (PUC reserves the callee's result slots inside
+    /// the activation's pre-reserved stack space) and the return count
+    /// trims th.top to the produced prefix.
+    fn gmatchAuxShim(L: ?*lua_State) callconv(.c) c_int {
+        const h = L orelse return 0;
+        const self = h.vm;
+        const th = self.activeBytecodeThread();
+        const gm: ?*GmatchState = blk: {
+            if (th.call_frames.len() == 0) break :blk null;
+            const fr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
+            if (!fr.isC() or fr.func_slot >= th.top or th.stack[fr.func_slot] != .Closure) break :blk null;
+            const cl = th.stack[fr.func_slot].Closure;
+            if (cl.upvalues.len != 3) break :blk null;
+            const ud = switch (cl.upvalues[2].value) {
+                .Userdata => |u| u,
+                else => break :blk null,
+            };
+            if (ud.payload.len != @sizeOf(GmatchState)) break :blk null;
+            break :blk gmatchStateOf(ud);
+        } orelse {
+            _ = self.failC("string.gmatch iterator: missing state upvalue", .{}) catch {};
+            return -1;
+        };
+        self.cWindowEnsure(th, gmatch_iter_max_results) catch {
+            self.setOutOfMemoryError();
+            self.latchErrmemRaiseWindow(th);
+            self.c_error_value = self.errThread().err_obj;
+            self.c_error_status = 4; // LUA_ERRMEM
+            if (self.c_error_jmp) |jb| {
+                _longjmp(@ptrCast(jb), 1);
+            }
+            std.process.abort();
+        };
+        const base = th.top;
+        const outs = th.stack[base .. base + gmatch_iter_max_results];
+        @memset(outs, .Nil);
+        th.top = base + gmatch_iter_max_results;
+        const n = self.gmatchAuxCore(gm.?, outs) catch |e| {
+            // Plain errors kill the staging window before the shim tail
+            // (the OOM latch then sees the pre-staging window shape);
+            // suspension-shaped errors are invariant breaches — the core
+            // runs no user code (the emergency GC suppresses finalizers).
+            th.top = base;
+            return switch (e) {
+                error.RuntimeError => -1,
+                error.MainDestined => -3,
+                error.OutOfMemory => {
+                    self.setOutOfMemoryError();
+                    self.latchErrmemRaiseWindow(th);
+                    self.c_error_value = self.errThread().err_obj;
+                    self.c_error_status = 4; // LUA_ERRMEM
+                    if (self.c_error_jmp) |jb| {
+                        _longjmp(@ptrCast(jb), 1);
+                    }
+                    std.process.abort();
+                },
+                error.Yield, error.ThreadSwitch, error.YieldAbsorbed => @panic(
+                    "gmatch shim: coroutine control flow crossed the gmatch core boundary",
+                ),
+            };
+        };
+        th.top = base + n;
+        return @intCast(n);
     }
 
     fn beginPatternMatchBudget(self: *Vm, s_len: usize, toks_len: usize) void {
@@ -56751,7 +56819,6 @@ pub const Vm = struct {
         t[@intFromEnum(BuiltinId.string_sub)] = 1;
         t[@intFromEnum(BuiltinId.string_gsub)] = 2;
         t[@intFromEnum(BuiltinId.string_gmatch)] = 1;
-        t[@intFromEnum(BuiltinId.string_gmatch_iter)] = 10;
         t[@intFromEnum(BuiltinId.utf8_char)] = 1;
         t[@intFromEnum(BuiltinId.utf8_len)] = 2;
         t[@intFromEnum(BuiltinId.utf8_offset)] = 2;
@@ -74861,6 +74928,53 @@ test "Proof 7: CClosure upvalues work without c_active_closure (top C frame)" {
     try testing.expect((state.pcall(0, 0) catch |e| return e) == .ok);
     try testing.expectEqual(@as(i64, 999), a11p7_outer_up2);
     c_api.lua_pop(L, 1);
+}
+
+test "vm: gmatch iterator is a per-call CClosure(3) over a userdata payload" {
+    const testing = std.testing;
+
+    var vm: Vm = .init(testing.allocator, false);
+    defer vm.deinit();
+
+    // The PUC lstrlib.c gmatch contract: every string.gmatch call returns a
+    // FRESH CClosure(3) — subject string, pattern string, GMatchState
+    // userdata — whose only mutable state is the userdata payload, so two
+    // iterators interleave independently and exhaustion returns 0 values.
+    // The last lane pins the disclosed divergence: replacing the state
+    // upvalue with nil keeps the iterator's failure a catchable error
+    // (PUC NULL-derefs the userdata and crashes; asserted by class only).
+    const ret = try vimpl1RunIn(&vm,
+        \\local it = string.gmatch('a1b2', '%a%d')
+        \\local _, s1 = debug.getupvalue(it, 1)
+        \\local _, p1 = debug.getupvalue(it, 2)
+        \\local _, u3 = debug.getupvalue(it, 3)
+        \\local has4 = debug.getupvalue(it, 4)
+        \\local gi = debug.getinfo(it)
+        \\local g1 = string.gmatch('a1b2', '%a%d')
+        \\local g2 = string.gmatch('x9y8', '%a%d')
+        \\local i1, i2, i3, i4 = g1(), g2(), g1(), g2()
+        \\local ex = string.gmatch('z', '%a')
+        \\_ = ex()
+        \\local exn = select('#', ex())
+        \\local ub = string.gmatch('a', '%a')
+        \\local _su = debug.setupvalue(ub, 3, nil)
+        \\local ok = pcall(ub)
+        \\return s1, p1, type(u3), has4 == nil, gi.nups,
+        \\  i1, i2, i3, i4, exn, ok
+    , "=p4i1-gmatch");
+    defer vm.alloc.free(ret);
+    try testing.expectEqual(@as(usize, 11), ret.len);
+    try testing.expectEqualStrings("a1b2", ret[0].String.bytes());
+    try testing.expectEqualStrings("%a%d", ret[1].String.bytes());
+    try testing.expectEqualStrings("userdata", ret[2].String.bytes());
+    try testing.expect(ret[3] == .Bool and ret[3].Bool);
+    try testing.expectEqual(@as(i64, 3), ret[4].Int);
+    try testing.expectEqualStrings("a1", ret[5].String.bytes());
+    try testing.expectEqualStrings("x9", ret[6].String.bytes());
+    try testing.expectEqualStrings("b2", ret[7].String.bytes());
+    try testing.expectEqualStrings("y8", ret[8].String.bytes());
+    try testing.expectEqual(@as(i64, 0), ret[9].Int);
+    try testing.expect(ret[10] == .Bool and !ret[10].Bool);
 }
 
 // ─────────────────────────────────────────────────────────────────────

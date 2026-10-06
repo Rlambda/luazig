@@ -45,11 +45,16 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
-- [ ] **io.input/io.output закрывают заменяемый default file (HIGH,
+- [x] **io.input/io.output закрывают заменяемый default file (BLOCKER,
   pre-existing; найден p4res 2026-10-06).** PUC НЕ закрывает старый
   default file при io.input(new) — живой итератор по нему продолжает
   работать; zig закрывает → поломка наблюдаемого контракта.
-  Отдельный cut в рамках P4 (см. p4res_report findings).
+  P4 prerequisite/FIX-NOW в iterator lifetime cut: сохранить старый
+  file до его явного close/GC (см. p4res_report findings).
+  CLOSED (P4 cut 2, `ee1ba04`, 2026-10-06): maybeCloseReplacedDefault
+  и все call sites удалены; io.input/io.output меняют registry-ссылку
+  (PUC g_iofile), живой итератор продолжает читать старый file;
+  file:close/EOF auto-close/GC-finalizer работают.
 
 - [x] **P3(math.random) implementation review correction: RanState CClosure-миграция.**
   Утверждённый A-full target: свежий RanState userdata как общий upvalue
@@ -1505,7 +1510,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   STEP-проверки. Fate: ARCHITECTURAL-BACKLOG (eager-init →
   openselectedlibs-driven публикация — отдельное embedding-решение).
 
-- [ ] **Stdlib completeness: `string.gmatch` не даёт независимые
+- [x] **Stdlib completeness: `string.gmatch` не даёт независимые
   итераторы (BLOCKER, pre-existing, ARCHITECTURAL-BACKLOG).**
   `Vm.gmatch_state` — один mutable slot; каждый `string.gmatch` возвращает
   один и тот же `.Builtin = .string_gmatch_iter`. PUC создаёт closure с
@@ -1539,6 +1544,33 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   io.lines 27x медленнее PUC — pre-existing backlog). STOP не
   сработал: новый глобальный owner не нужен. Пункт остаётся открытым
   до implementation.
+  REVIEW 2026-10-06: **ACCEPT + RECORD** research `291e5f6`.
+  Ревьювер независимо повторил gmatch interleaving/exhaustion,
+  io.lines(fn) type/4-tuple/nups и io.input swap; результаты
+  соответствуют PUC source и raw артефактам. Severity correction:
+  trailing-nil truncation и io.input/io.output premature close имеют
+  BLOCKER-эффект по AGENTS.md (не HIGH), поскольку меняют поведение
+  валидной программы. C-probe f:lines печатает верхний nil из трёх
+  результатов Zig, поэтому его `f-lines-it: type=nil` не является
+  type-evidence итератора; Lua-probe и PUC source достаточны для
+  shape-вывода. P4 implementation остаётся открытым.
+  CLOSED (A-full P4, cuts `5fefc24` + `ee1ba04`, 2026-10-06): gmatch —
+  per-iterator CClosure(3) [subject, pattern, GMatchState userdata]
+  (PUC-форма; gmatchAuxCore/gmatchAuxShim; PUC gmatch_aux семантика:
+  точные counts, ^-литерал, $ end-anchor, init/lastmatch,
+  cursor-независимость от setupvalue); Vm.gmatch_state/оба GC-mark
+  sites/BuiltinId.string_gmatch_iter/fake nups удалены. Suite 51 +
+  smoke 97 byte-identical PUC D+RF (координатор лично; старый путь
+  проваливает). В cut 2: io.lines/file:lines CClosure(3+n)
+  [file,n,toclose,fmts] (aux_lines/io_readline parity; 4/1/1 return
+  формы; file-upvalue swap меняет читаемый file); makeLinesIter/
+  io_lines_iter удалены; io.input/output не закрывают заменённый
+  file; попутные pre-existing fixed: g_read argerror shape, "n"
+  read_number state machine (failed read больше не съедает строку),
+  io.open/io.tmpfile multret 3→1, opencheck luaL_where(1) позиции.
+  Suite 52 + smoke 98 byte-identical PUC D+RF; unit 378/378; matrix
+  33 pass (exit parity, было 31/32); perf: gmatch −12%, io.lines
+  0.94–0.98. П4 MILESTONE COMPLETE.
 
 - [ ] **edge_a4: stale `bytecode_inplace_suspended` на trampoline-пути —
   Debug panic / RF segfault на ВАЛИДНОЙ pcallk+toclose форме

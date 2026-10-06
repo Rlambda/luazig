@@ -45,7 +45,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
-- [ ] **P3(math.random) implementation ready: RanState CClosure-миграция.**
+- [x] **P3(math.random) implementation ready: RanState CClosure-миграция.**
   Утверждённый A-full target: свежий RanState userdata как общий upvalue
   двух CClosure(1) на каждое `luaopen_math`; удалить `Vm.rng_state` и
   `BuiltinId.math_random*`, включить 1-arg `project()` rejection-путь.
@@ -75,6 +75,28 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   `prompt.md`. Prototype perf: math.random ~1.85–2.05x и tmpname ~2x
   медленнее в отдельных микропробах; финального paired измерения ещё нет.
 
+  IMPLEMENTED (P3, `2e9813b`, 2026-10-06): openMathLibrary() —
+  свежая table + RanState userdata (32B/0 uservalues) + две CClosure(1)
+  с одним userdata value; luaopen_math — publication-order контракт
+  luaopen_package; Vm.rng_state/builtinMathRandom*/BuiltinId.
+  math_random* удалены (rg-proof 0 refs); debugUpvalueName "" для
+  ВСЕХ CClosure; 1-arg project() rejection; T1 stateless tmpname
+  (Zig exclusive create 0600 + std.Io.random; no-result side effect
+  создаёт файл — прежний product пропускал его по outs.len==0).
+  Постоянные suites 48/49/50 (50 с новой -pucposix lane — закрывает
+  F8-note) + smoke 95/96. Координатор верифицировал лично: 48/49
+  IDENTICAL D+RF, 50 IDENTICAL против POSIX PUC build; upvalue-проба
+  `userdata true` (= PUC); 377/377 D+RF; smoke 95/95; matrix
+  zig_fail=0; fmt/diff-check; rng_state refs=0. Perf (paired RF A/B
+  vs baseline): math.random ~1.85x no-arg / ~2.0x 1-arg instructions
+  (атрибуция generic C-call boundary: openRootScope ~15%,
+  callCFunction ~7.8%, sigsetjmp/C-frame/result-transport; math-код
+  ~4%); os.tmpname 1000 вызовов 0.009-0.012s (PUC 0.004-0.008 — цена
+  самого PUC-контракта); baselines не обновлены (owner decision).
+  Новых BLOCKER/HIGH нет; findings pre-existing + tooling-notes
+  (--suite-release-gate не append, testes_matrix_safe.sh --no-build
+  сломан, api580 harness) — severity/fate в p3i_report. Пункт
+  закрывается; P3 READY FOR REVIEW.
 - [ ] **debug.setupvalue(f, n, g()) multret-tail: zig устанавливает
   args[2] вместо top-of-stack (BLOCKER-класс, pre-existing; найден
   p3res 2026-10-05).** Ортогонален P3; нужен отдельный PUC-дифференциал

@@ -4709,9 +4709,42 @@ pub export fn luaopen_io(L: ?*lua_State) c_int {
 /// PUC `luaopen_math` (lmathlib.c): opens the math library.
 pub export fn luaopen_math(L: ?*lua_State) c_int {
     var s = api.State.fromHandle(L orelse return 0);
-    // PUC pushes the module table — OOM is LUA_ERRMEM
-    // (P16.50-review-5 B2 — the old `catch return 0` pushed nothing).
-    _ = s.getglobal("math") catch |e| cThrowOn(s.vm, L.?, e);
+    // PUC publication-order contract (luaopen_package pattern over
+    // luaD_checkstack): every fallible step — the return-tail reserve,
+    // the rooting scope, the whole constructor (fresh table + RanState
+    // userdata + the two CClosure(1) shims) — precedes the window push;
+    // the tail protect/push/result handoff is allocation-free, so a
+    // failed open leaves the thread byte-exact.
+    s.vm.cReturnTailReserve(Vm.handleThread(L.?), 1) catch |e|
+        cThrowOn(s.vm, L.?, api.mapVmError(e));
+    var scope = s.vm.openRootScope(1, 0) catch cThrowOn(s.vm, L.?, error.OutOfMemory);
+    defer scope.close();
+    const math_tbl = s.vm.openMathLibrary() catch |e| switch (e) {
+        error.OutOfMemory => cThrowOn(s.vm, L.?, error.OutOfMemory),
+        error.RuntimeError => cThrowOn(s.vm, L.?, error.Runtime),
+        error.MainDestined => cRelayMainDestined(s.vm),
+        // The constructor runs no user code: coroutine control flow cannot
+        // legitimately cross this boundary — fail loudly instead of
+        // silently re-labeling it as ERRRUN.
+        error.Yield, error.ThreadSwitch => @panic(
+            "luaopen_math: coroutine control flow crossed the constructor boundary",
+        ),
+        // the constructor runs no host C callbacks: an absorption cannot
+        // start here; relay if a regression ever produces one.
+        error.YieldAbsorbed => {
+            if (s.vm.c_error_jmp) |jb| {
+                s.vm.c_error_status = 1; // LUA_YIELD sentinel: the raw-yield absorption fact
+                _longjmp(jb, 1);
+            }
+            s.vm.panicHookAbort(s.vm.raw_yield_absorb_thrower);
+        },
+    };
+    // Root the fresh table across the window push: until the value lands
+    // on the thread stack it is visible only to this C frame (the
+    // constructor's root scope has closed). Abandoned scopes on a throw
+    // are cleaned by the C landing pad's restoreRoots.
+    _ = scope.protectValueAssumeCapacity(.{ .Table = math_tbl });
+    s.vm.cWindowPush(Vm.handleThread(L.?), .{ .Table = math_tbl }) catch |e| cThrowOn(s.vm, L.?, api.mapVmError(e));
     return 1;
 }
 

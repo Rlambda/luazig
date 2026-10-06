@@ -235,8 +235,6 @@ pub const BuiltinId = enum(u8) {
     os_remove,
     os_rename,
     os_setlocale,
-    math_random,
-    math_randomseed,
     math_tointeger,
     math_sin,
     math_cos,
@@ -422,8 +420,6 @@ pub const BuiltinId = enum(u8) {
             .os_remove => "os.remove",
             .os_rename => "os.rename",
             .os_setlocale => "os.setlocale",
-            .math_random => "math.random",
-            .math_randomseed => "math.randomseed",
             .math_tointeger => "math.tointeger",
             .math_sin => "math.sin",
             .math_cos => "math.cos",
@@ -5063,17 +5059,12 @@ pub const Vm = struct {
     /// via `luaL_getmetafield` / `luaH_Hgetshortstr` with on-demand interning.
     /// We pre-intern them for the same pointer-identity fast path as `tm_names`.
     metafield_names: [@typeInfo(MetaField).@"enum".fields.len]*LuaString = undefined,
-    /// PUC lmathlib.c `setrandfunc`: the initial seed comes from
-    /// `luaL_makeseed` which mixes `time(NULL)` + a stack address.
-    /// We approximate with `std.time.timestamp()` + address of a local.
-    /// The seed is then "spread" by 16 discard iterations (setseed).
-    rng_state: [4]u64 = .{ 1, 0xff, 0, 0 },
 
     // Stable hash seed for `ltable.keyHash` (hashes every int/pointer key on
     // each lookup) and for `internStr` (Wyhash init seed for string content).
-    // MUST be invariant across the Vm's lifetime: a mutating seed (e.g. reading
-    // rng_state mid-run) would orphan every prior insert and break intern-table
-    // lookups for strings interned earlier.
+    // MUST be invariant across the Vm's lifetime: a mutating seed would
+    // orphan every prior insert and break intern-table lookups for strings
+    // interned earlier.
     //
     // PUC Lua initializes `g->seed` once per lua_State from entropy via
     // `luai_makeseed` (lauxlib.c:1155 — time + address mixing) in `lua_newstate`
@@ -5082,8 +5073,8 @@ pub const Vm = struct {
     // `Rand64` state stored in the math library's uservalue (lmathlib.c:617-642).
     // We mirror this: `hash_seed` is set once in `Vm.init` from `makeRandomSeed`
     // (same time+address entropy as PUC) and never touched again. The PRNG
-    // (`rng_state`) is a completely separate field, warmed up in
-    // `bootstrapGlobals` via `randomSetSeed`.
+    // state lives in the math library's RanState userdata (openMathLibrary),
+    // never on the Vm.
     //
     // A zero seed makes `hash_search`'s `rnd = 0`, so the exponential probe
     // always doubles (j = j*2 + 0), which an attacker can exploit by inserting
@@ -5922,7 +5913,8 @@ pub const Vm = struct {
     /// Used by `lua_newstate` (which receives the seed parameter) and by
     /// tests that require deterministic hashing. The seed is set ONCE here
     /// and never mutated (PUC: `g->seed` is stable for the state's lifetime,
-    /// independent of `math.random` which uses a separate `rng_state`).
+    /// independent of `math.random`, whose RanState lives in the math
+    /// library's userdata upvalue).
     pub fn initWithSeed(alloc: std.mem.Allocator, noenv: bool, hash_seed: u64) Vm {
         const env = alloc.create(Table) catch @panic("oom");
         env.* = .{};
@@ -5980,7 +5972,8 @@ pub const Vm = struct {
         // PUC lstate.c:354: g->seed = seed. The hash seed is initialized ONCE
         // from the caller-provided value (entropy via makeRandomSeed for
         // Vm.init, explicit seed for lua_newstate/tests). It is never mutated
-        // again — math.random/randomseed operate on the separate rng_state.
+        // again — math.random/randomseed operate on the math library's
+        // RanState userdata, never on the Vm.
         vm.hash_seed = hash_seed;
         // Pre-intern all metamethod name strings ("__index", "__newindex",
         // "__gc", "__mode", "__len", "__eq", "__add", ...). These are short
@@ -26855,8 +26848,6 @@ pub const Vm = struct {
             .os_remove => try self.builtinOsRemove(args, outs),
             .os_rename => try self.builtinOsRename(args, outs),
             .os_setlocale => try self.builtinOsSetlocale(args, outs),
-            .math_random => try self.builtinMathRandom(args, outs),
-            .math_randomseed => try self.builtinMathRandomseed(args, outs),
             .math_tointeger => try self.builtinMathTointeger(args, outs),
             .math_sin => try self.builtinMathSin(args, outs),
             .math_cos => try self.builtinMathCos(args, outs),
@@ -27428,49 +27419,12 @@ pub const Vm = struct {
         try self.setField(os_tbl, "setlocale", lightBuiltinValue(.os_setlocale));
         try self.setGlobal("os", .{ .Table = os_tbl });
 
-        // math subset — canonical light values for the nup=0 entries (PUC
-        // lmathlib.c math_funcs). random/randomseed stay .Builtin: PUC
-        // publishes them as CClosure(1) carrying the RanState userdata
-        // upvalue (a separate parity cut).
-        const math_tbl = try self.allocTableNoGc();
-        try self.setField(math_tbl, "random", .{ .Builtin = .math_random });
-        try self.setField(math_tbl, "randomseed", .{ .Builtin = .math_randomseed });
-        try self.setField(math_tbl, "tointeger", lightBuiltinValue(.math_tointeger));
-        try self.setField(math_tbl, "sin", lightBuiltinValue(.math_sin));
-        try self.setField(math_tbl, "cos", lightBuiltinValue(.math_cos));
-        try self.setField(math_tbl, "tan", lightBuiltinValue(.math_tan));
-        try self.setField(math_tbl, "asin", lightBuiltinValue(.math_asin));
-        try self.setField(math_tbl, "acos", lightBuiltinValue(.math_acos));
-        try self.setField(math_tbl, "atan", lightBuiltinValue(.math_atan));
-        try self.setField(math_tbl, "deg", lightBuiltinValue(.math_deg));
-        try self.setField(math_tbl, "rad", lightBuiltinValue(.math_rad));
-        try self.setField(math_tbl, "abs", lightBuiltinValue(.math_abs));
-        try self.setField(math_tbl, "sqrt", lightBuiltinValue(.math_sqrt));
-        try self.setField(math_tbl, "exp", lightBuiltinValue(.math_exp));
-        try self.setField(math_tbl, "ldexp", lightBuiltinValue(.math_ldexp));
-        try self.setField(math_tbl, "frexp", lightBuiltinValue(.math_frexp));
-        try self.setField(math_tbl, "ceil", lightBuiltinValue(.math_ceil));
-        try self.setField(math_tbl, "ult", lightBuiltinValue(.math_ult));
-        try self.setField(math_tbl, "modf", lightBuiltinValue(.math_modf));
-        try self.setField(math_tbl, "log", lightBuiltinValue(.math_log));
-        try self.setField(math_tbl, "fmod", lightBuiltinValue(.math_fmod));
-        try self.setField(math_tbl, "floor", lightBuiltinValue(.math_floor));
-        try self.setField(math_tbl, "type", lightBuiltinValue(.math_type));
-        try self.setField(math_tbl, "min", lightBuiltinValue(.math_min));
-        try self.setField(math_tbl, "max", lightBuiltinValue(.math_max));
-        try self.setField(math_tbl, "huge", .{ .Num = std.math.inf(f64) });
-        try self.setField(math_tbl, "pi", .{ .Num = std.math.pi });
-        try self.setField(math_tbl, "maxinteger", .{ .Int = std.math.maxInt(i64) });
-        try self.setField(math_tbl, "mininteger", .{ .Int = std.math.minInt(i64) });
+        // math — canonical light values for the nup=0 entries (PUC
+        // lmathlib.c math_funcs); random/randomseed are CClosure(1) pairs
+        // over a per-opening RanState userdata (PUC setrandfunc,
+        // openMathLibrary).
+        const math_tbl = try self.openMathLibrary();
         try self.setGlobal("math", .{ .Table = math_tbl });
-
-        // PUC setrandfunc (lmathlib.c:657-662): seed the PRNG with
-        // luaL_makeseed (time + address entropy) + 16 warmup iterations.
-        // Without this, math.random produces a deterministic sequence.
-        {
-            const seed = makeRandomSeed();
-            self.randomSetSeed(seed, 0);
-        }
 
         // string = { format = builtin } — canonical light values (PUC
         // lstrlib.c string_funcs, nup=0).
@@ -39983,6 +39937,9 @@ pub const Vm = struct {
     /// `lua_getupvalue` returns `getstr(name)` without allocating). The
     /// literals below are static and NUL-terminated.
     pub fn debugUpvalueName(cl: *const Closure, uidx: usize) [:0]const u8 {
+        // C closures have no upvalue names (PUC aux_upvalue LUA_VCCL arm
+        // returns the static "").
+        if (cl.c_func != null) return "";
         // For bytecode closures, upvalue names live in the Proto.
         if (cl.proto) |p| {
             if (uidx < p.upvalues.len) {
@@ -40024,9 +39981,9 @@ pub const Vm = struct {
             },
             // Owner: the only .Builtin values reachable from Lua are the
             // stateful/upvalue classes not yet migrated to light
-            // publications (math.random/randomseed, the gmatch/io.lines
-            // iterator products, testc_*). Their PUC classes are C closures
-            // with real upvalues; parity for this arm lands with those cuts.
+            // publications (the gmatch/io.lines iterator products, testc_*).
+            // Their PUC classes are C closures with real upvalues; parity
+            // for this arm lands with those cuts.
             .Builtin => {
                 if (uidx != 0) return;
                 if (outs.len > 0) {
@@ -43148,16 +43105,18 @@ pub const Vm = struct {
         return std.math.rotl(u64, x, n);
     }
 
-    fn nextRandomU64(self: *Vm) u64 {
-        const s0 = self.rng_state[0];
-        const s1 = self.rng_state[1];
-        const s2 = self.rng_state[2] ^ s0;
-        const s3 = self.rng_state[3] ^ s1;
+    /// PUC nextrand (lmathlib.c:476-486, xoshiro256**): the ONLY mutation
+    /// path of a math-library RanState — no VM-global state exists.
+    fn ranNext(s: *[4]u64) u64 {
+        const s0 = s[0];
+        const s1 = s[1];
+        const s2 = s[2] ^ s0;
+        const s3 = s[3] ^ s1;
         const res = rotl64(s1 *% 5, 7) *% 9;
-        self.rng_state[0] = s0 ^ s3;
-        self.rng_state[1] = s1 ^ s2;
-        self.rng_state[2] = s2 ^ (s1 << 17);
-        self.rng_state[3] = rotl64(s3, 45);
+        s[0] = s0 ^ s3;
+        s[1] = s1 ^ s2;
+        s[2] = s2 ^ (s1 << 17);
+        s[3] = rotl64(s3, 45);
         return res;
     }
 
@@ -43169,7 +43128,9 @@ pub const Vm = struct {
         return res;
     }
 
-    fn randomProject(self: *Vm, ran0: u64, n: u64) u64 {
+    /// PUC project (lmathlib.c:569-579): uniform Mersenne-mask rejection
+    /// sampling into [0, n] — used for BOTH the 1-arg and 2-arg intervals.
+    fn ranProject(s: *[4]u64, ran0: u64, n: u64) u64 {
         var ran = ran0;
         var lim = n;
         var sh: u8 = 1;
@@ -43179,62 +43140,269 @@ pub const Vm = struct {
         while (true) {
             ran &= lim;
             if (ran <= n) return ran;
-            ran = self.nextRandomU64();
+            ran = ranNext(s);
         }
     }
 
-    fn randomSetSeed(self: *Vm, n1: u64, n2: u64) void {
-        self.rng_state[0] = n1;
-        self.rng_state[1] = 0xff;
-        self.rng_state[2] = n2;
-        self.rng_state[3] = 0;
+    /// PUC setseed (lmathlib.c:617-628).
+    fn ranSetSeed(s: *[4]u64, n1: u64, n2: u64) void {
+        s[0] = n1;
+        s[1] = 0xff;
+        s[2] = n2;
+        s[3] = 0;
         var i: usize = 0;
-        while (i < 16) : (i += 1) _ = self.nextRandomU64();
+        while (i < 16) : (i += 1) _ = ranNext(s);
     }
 
-    fn builtinMathRandom(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+    /// The RanState payload of a math-library userdata upvalue (PUC
+    /// lua_newuserdatauv(sizeof(RanState), 0) — the payload IS the state).
+    fn ranStateOf(ud: *Userdata) *[4]u64 {
+        return @alignCast(std.mem.bytesAsValue([4]u64, ud.payload));
+    }
+
+    /// PUC luaL_checkinteger argerror for the math shims: the function
+    /// name is derived from the raising C-frame (PUC getfuncname via the
+    /// caller) with the globals/loaded-table walk fallback (PUC
+    /// pushglobalfuncname) — no hardcoded name.
+    fn mathArgError(self: *Vm, arg_no: usize, extra: []const u8, got: []const u8) Error {
+        const th = self.activeBytecodeThread();
+        var nm: []const u8 = "?";
+        if (th.call_frames.len() >= 2) {
+            const top = th.call_frames.len() - 1;
+            if (th.call_frames.getConstPtr(top).isC()) {
+                if (th.stack[th.call_frames.getConstPtr(top).func_slot] == .Closure) {
+                    var buf: [128]u8 = undefined;
+                    if (self.pushGlobalFuncName(buf[0..], th.stack[th.call_frames.getConstPtr(top).func_slot])) |n| nm = n;
+                }
+            }
+        }
+        return self.failArgerror("bad argument #{d} to '{s}' ({s}, got {s})", .{ arg_no, nm, extra, got });
+    }
+
+    /// PUC math_random (lmathlib.c:582-614) over an explicit RanState.
+    fn mathRandomCore(self: *Vm, s: *[4]u64, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len > 2) return self.fail("wrong number of arguments", .{});
-        const r = self.nextRandomU64();
+        const r = ranNext(s);
         if (args.len == 0) {
             outs[0] = .{ .Num = randomI2d(r) };
             return;
         }
         if (args.len == 1) {
-            const hi = try self.mathArgToInt(args[0], "random");
-            if (hi == 0) {
+            const up = try self.mathCheckInt(args[0], 1);
+            if (up == 0) { // single 0: full random integer
                 outs[0] = .{ .Int = @as(i64, @bitCast(r)) };
                 return;
             }
-            if (hi < 1) return self.fail("bad argument #1 to 'random' (interval is empty)", .{});
-            const span: u64 = @intCast(hi);
-            outs[0] = .{ .Int = @as(i64, @intCast((r % span) + 1)) };
+            if (up < 1) return self.mathIntervalError();
+            const p = ranProject(s, r, @as(u64, @bitCast(up)) -% 1);
+            outs[0] = .{ .Int = @bitCast(p +% 1) };
             return;
         }
-        const lo = try self.mathArgToInt(args[0], "random");
-        const hi = try self.mathArgToInt(args[1], "random");
-        if (lo > hi) return self.fail("bad arguments to 'random' (interval is empty)", .{});
-        const low_u: u64 = @bitCast(lo);
-        const hi_u: u64 = @bitCast(hi);
-        const p = self.randomProject(r, hi_u -% low_u);
+        const low = try self.mathCheckInt(args[0], 1);
+        const up = try self.mathCheckInt(args[1], 2);
+        if (low > up) return self.mathIntervalError();
+        const low_u: u64 = @bitCast(low);
+        const up_u: u64 = @bitCast(up);
+        const p = ranProject(s, r, up_u -% low_u);
         outs[0] = .{ .Int = @bitCast(p +% low_u) };
     }
 
-    fn builtinMathRandomseed(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+    /// PUC math_randomseed (lmathlib.c:631-644) over an explicit RanState:
+    /// no-arg seeding takes n1 from entropy (luaL_makeseed) and n2 from one
+    /// nextrand draw; returns both seeds.
+    fn mathRandomseedCore(self: *Vm, s: *[4]u64, args: []const Value, outs: []Value) DispatchError!void {
         var n1: u64 = 0;
         var n2: u64 = 0;
         if (args.len == 0) {
-            n1 = self.nextRandomU64();
-            n2 = self.nextRandomU64();
+            n1 = makeRandomSeed();
+            n2 = ranNext(s);
         } else {
-            const s1: i64 = try self.mathArgToInt(args[0], "randomseed");
-            const s2: i64 = if (args.len >= 2) try self.mathArgToInt(args[1], "randomseed") else 0;
-            n1 = @bitCast(s1);
-            n2 = @bitCast(s2);
+            const a1 = try self.mathCheckInt(args[0], 1);
+            const a2: i64 = if (args.len >= 2) try self.mathCheckInt(args[1], 2) else 0;
+            n1 = @bitCast(a1);
+            n2 = @bitCast(a2);
         }
-        self.randomSetSeed(n1, n2);
+        ranSetSeed(s, n1, n2);
         if (outs.len > 0) outs[0] = .{ .Int = @bitCast(n1) };
         if (outs.len > 1) outs[1] = .{ .Int = @bitCast(n2) };
+    }
+
+    /// luaL_checkinteger shape for the math shims (interror texts).
+    fn mathCheckInt(self: *Vm, v: Value, arg_no: usize) DispatchError!i64 {
+        return switch (v) {
+            .Int => |i| i,
+            .Num => |n| blk: {
+                if (!std.math.isFinite(n))
+                    return self.mathArgError(arg_no, "number expected", self.valueTypeName(v));
+                const t = std.math.trunc(n);
+                if (t != n or t < -9223372036854775808.0 or t >= 9223372036854775808.0)
+                    return self.mathArgError(arg_no, "number has no integer representation", self.valueTypeName(v));
+                break :blk @intFromFloat(t);
+            },
+            else => self.mathArgError(arg_no, "number expected", self.valueTypeName(v)),
+        };
+    }
+
+    fn mathIntervalError(self: *Vm) Error {
+        const th = self.activeBytecodeThread();
+        var nm: []const u8 = "?";
+        if (th.call_frames.len() >= 2) {
+            const top = th.call_frames.len() - 1;
+            if (th.call_frames.getConstPtr(top).isC()) {
+                if (th.stack[th.call_frames.getConstPtr(top).func_slot] == .Closure) {
+                    var buf: [128]u8 = undefined;
+                    if (self.pushGlobalFuncName(buf[0..], th.stack[th.call_frames.getConstPtr(top).func_slot])) |n| nm = n;
+                }
+            }
+        }
+        return self.failArgerror("bad argument #1 to '{s}' (interval is empty)", .{nm});
+    }
+
+    /// The running math shim's context: the RanState upvalue of the C-frame's
+    /// closure plus the activation's argument window (packageShimContext
+    /// pattern).
+    const MathShimContext = struct { s: *[4]u64, args: []const Value };
+
+    fn mathShimContext(self: *Vm) ?MathShimContext {
+        const th = self.activeBytecodeThread();
+        if (th.call_frames.len() == 0) return null;
+        const fr_idx = th.call_frames.len() - 1;
+        const fr = th.call_frames.getConstPtr(fr_idx);
+        if (!fr.isC() or fr.func_slot >= th.top or th.stack[fr.func_slot] != .Closure) return null;
+        const cl = th.stack[fr.func_slot].Closure;
+        if (cl.upvalues.len != 1) return null;
+        const ud = switch (cl.upvalues[0].value) {
+            .Userdata => |u| u,
+            else => return null,
+        };
+        if (ud.payload.len != @sizeOf([4]u64)) return null;
+        return .{ .s = ranStateOf(ud), .args = th.stack[fr.func_slot + 1 .. th.top] };
+    }
+
+    /// Error mapping for the math shims: the cores run no user code (no
+    /// metamethods, no yields), so coroutine-control errors are invariant
+    /// breaches — fail loudly (luaopen_package constructor rule).
+    fn mathShimFail(self: *Vm, e: DispatchError) c_int {
+        return switch (e) {
+            error.RuntimeError => -1,
+            error.MainDestined => -3,
+            error.OutOfMemory => {
+                const th = self.activeBytecodeThread();
+                if (self.c_error_jmp) |jb| {
+                    self.setOutOfMemoryError();
+                    self.latchErrmemRaiseWindow(th);
+                    self.c_error_value = self.errThread().err_obj;
+                    self.c_error_status = 4; // LUA_ERRMEM
+                    _longjmp(@ptrCast(jb), 1);
+                }
+                std.process.abort();
+            },
+            error.Yield, error.ThreadSwitch, error.YieldAbsorbed => @panic(
+                "math shim: coroutine control flow crossed the math core boundary",
+            ),
+        };
+    }
+
+    /// Lean result push for the math shims: results are always Int/Num
+    /// (never GC-referencing), so unlike packageShimReturn there is no
+    /// result-slice allocation and no rooting scope — only the window
+    /// extension remains fallible (packageShimReturn's OOM arm shape).
+    fn mathShimPush(self: *Vm, vals: []const Value) c_int {
+        const th = self.activeBytecodeThread();
+        self.cWindowPushSlice(th, vals) catch |e| switch (e) {
+            error.OutOfMemory => {
+                if (self.c_error_jmp) |jb| {
+                    self.setOutOfMemoryError();
+                    self.latchErrmemRaiseWindow(th);
+                    self.c_error_value = self.errThread().err_obj;
+                    self.c_error_status = 4; // LUA_ERRMEM
+                    _longjmp(@ptrCast(jb), 1);
+                }
+                std.process.abort();
+            },
+            else => @panic("math shim: unexpected error from window push"),
+        };
+        return @intCast(vals.len);
+    }
+
+    /// PUC math_random as a CClosure(1) target: the RanState comes from
+    /// upvalue 1 of the running activation's closure.
+    fn mathRandomShim(L: ?*lua_State) callconv(.c) c_int {
+        const h = L orelse return 0;
+        const self = h.vm;
+        const ctx = self.mathShimContext() orelse {
+            _ = self.failC("math.random: missing RanState upvalue", .{}) catch {};
+            return -1;
+        };
+        var vals: [1]Value = .{.{ .Int = 0 }};
+        self.mathRandomCore(ctx.s, ctx.args, vals[0..]) catch |e| return self.mathShimFail(e);
+        return self.mathShimPush(vals[0..]);
+    }
+
+    /// PUC math_randomseed as a CClosure(1) target.
+    fn mathRandomseedShim(L: ?*lua_State) callconv(.c) c_int {
+        const h = L orelse return 0;
+        const self = h.vm;
+        const ctx = self.mathShimContext() orelse {
+            _ = self.failC("math.randomseed: missing RanState upvalue", .{}) catch {};
+            return -1;
+        };
+        var vals: [2]Value = .{ .{ .Int = 0 }, .{ .Int = 0 } };
+        self.mathRandomseedCore(ctx.s, ctx.args, vals[0..]) catch |e| return self.mathShimFail(e);
+        return self.mathShimPush(vals[0..]);
+    }
+
+    /// PUC luaopen_math (lmathlib.c:752-764) + setrandfunc (657-662): a
+    /// FRESH table per opening; one RanState userdata is created per
+    /// opening and shared by the random/randomseed CClosures as upvalue 1
+    /// (the sole mutable owner of the PRNG — no VM-global state). Value
+    /// roots: table + userdata + 2 closures = 4, held until every field is
+    /// published (PUC anchors them on L->stack for the whole open).
+    pub fn openMathLibrary(self: *Vm) DispatchError!*Table {
+        var scope = try self.openRootScope(4, 0);
+        defer scope.close();
+        const math_tbl = try self.allocTableNoGc();
+        _ = scope.protectValueAssumeCapacity(.{ .Table = math_tbl });
+        try self.setField(math_tbl, "tointeger", lightBuiltinValue(.math_tointeger));
+        try self.setField(math_tbl, "sin", lightBuiltinValue(.math_sin));
+        try self.setField(math_tbl, "cos", lightBuiltinValue(.math_cos));
+        try self.setField(math_tbl, "tan", lightBuiltinValue(.math_tan));
+        try self.setField(math_tbl, "asin", lightBuiltinValue(.math_asin));
+        try self.setField(math_tbl, "acos", lightBuiltinValue(.math_acos));
+        try self.setField(math_tbl, "atan", lightBuiltinValue(.math_atan));
+        try self.setField(math_tbl, "deg", lightBuiltinValue(.math_deg));
+        try self.setField(math_tbl, "rad", lightBuiltinValue(.math_rad));
+        try self.setField(math_tbl, "abs", lightBuiltinValue(.math_abs));
+        try self.setField(math_tbl, "sqrt", lightBuiltinValue(.math_sqrt));
+        try self.setField(math_tbl, "exp", lightBuiltinValue(.math_exp));
+        try self.setField(math_tbl, "ldexp", lightBuiltinValue(.math_ldexp));
+        try self.setField(math_tbl, "frexp", lightBuiltinValue(.math_frexp));
+        try self.setField(math_tbl, "ceil", lightBuiltinValue(.math_ceil));
+        try self.setField(math_tbl, "ult", lightBuiltinValue(.math_ult));
+        try self.setField(math_tbl, "modf", lightBuiltinValue(.math_modf));
+        try self.setField(math_tbl, "log", lightBuiltinValue(.math_log));
+        try self.setField(math_tbl, "fmod", lightBuiltinValue(.math_fmod));
+        try self.setField(math_tbl, "floor", lightBuiltinValue(.math_floor));
+        try self.setField(math_tbl, "type", lightBuiltinValue(.math_type));
+        try self.setField(math_tbl, "min", lightBuiltinValue(.math_min));
+        try self.setField(math_tbl, "max", lightBuiltinValue(.math_max));
+        try self.setField(math_tbl, "huge", .{ .Num = std.math.inf(f64) });
+        try self.setField(math_tbl, "pi", .{ .Num = std.math.pi });
+        try self.setField(math_tbl, "maxinteger", .{ .Int = std.math.maxInt(i64) });
+        try self.setField(math_tbl, "mininteger", .{ .Int = std.math.minInt(i64) });
+        // setrandfunc: fresh RanState per opening, seeded from entropy like
+        // PUC setseed(luaL_makeseed(L), 0).
+        const ran_ud = try self.allocUserdata(@sizeOf([4]u64), 0);
+        _ = scope.protectValueAssumeCapacity(.{ .Userdata = ran_ud });
+        ranSetSeed(ranStateOf(ran_ud), makeRandomSeed(), 0);
+        const random_cl = try self.allocCclosure(&mathRandomShim, &.{.{ .Userdata = ran_ud }});
+        _ = scope.protectValueAssumeCapacity(.{ .Closure = random_cl });
+        const randomseed_cl = try self.allocCclosure(&mathRandomseedShim, &.{.{ .Userdata = ran_ud }});
+        _ = scope.protectValueAssumeCapacity(.{ .Closure = randomseed_cl });
+        try self.setField(math_tbl, "random", .{ .Closure = random_cl });
+        try self.setField(math_tbl, "randomseed", .{ .Closure = randomseed_cl });
+        return math_tbl;
     }
 
     fn builtinMathTointeger(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -44173,14 +44341,42 @@ pub const Vm = struct {
     fn builtinOsTmpname(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = args;
         if (outs.len == 0) return;
-        var buf: [128]u8 = undefined;
-        const r = self.nextRandomU64();
-        // PUC uses tmpnam() which generates names without dots. A dot in the
-        // name breaks `-l <tmpfile>` because require() converts dots to path
-        // separators. Use an underscore-separated name with no extension.
-        const p = std.fmt.bufPrint(buf[0..], "/tmp/luazig_{x}", .{r}) catch return error.OutOfMemory;
-        const istr = try self.internStr(p);
-        outs[0] = .{ .String = istr };
+        // PUC POSIX os_tmpname (loslib.c): mkstemp("/tmp/lua_XXXXXX") creates
+        // the file atomically (O_EXCL inside mkstemp) and closes the fd; the
+        // kernel is the uniqueness authority, so no Lua- or VM-owned RNG
+        // state participates and the math RanState sequence is untouched.
+        // Zig std has no mkstemp; compose the same contract from the native
+        // std.Io interface: exclusive create + collision retry, per-attempt
+        // candidate entropy from std.Io.random (process CSPRNG). The modulo
+        // bias of the alphabet mapping is harmless: uniqueness is decided by
+        // the exclusive create, entropy only spreads the candidates.
+        const io = stdio.activeIo();
+        const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        var buf: [15]u8 = undefined;
+        @memcpy(buf[0..9], "/tmp/lua_");
+        var attempts: usize = 0;
+        while (attempts < 64) : (attempts += 1) {
+            var rnd: [6]u8 = undefined;
+            io.random(&rnd);
+            for (0..6) |i| buf[9 + i] = alphabet[rnd[i] % alphabet.len];
+            const file = std.Io.Dir.createFileAbsolute(io, buf[0..], .{
+                .exclusive = true,
+                .truncate = false,
+                .permissions = @enumFromInt(0o600),
+            }) catch |e| switch (e) {
+                error.PathAlreadyExists => continue,
+                // PUC raises luaL_error("unable to generate a unique
+                // filename") on any mkstemp failure.
+                else => return self.fail("unable to generate a unique filename", .{}),
+            };
+            // mkstemp parity: the descriptor is closed immediately; the
+            // created empty file remains, exactly like PUC.
+            file.close(io);
+            const istr = try self.internStr(buf[0..]);
+            outs[0] = .{ .String = istr };
+            return;
+        }
+        return self.fail("unable to generate a unique filename", .{});
     }
 
     fn builtinOsRemove(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -47442,10 +47638,10 @@ pub const Vm = struct {
     /// searchpath/loadlib), plus the internal-only iterator products PUC
     /// hands out via lua_pushcfunction (ipairs' ipairsaux, utf8.codes'
     /// strict/lax iterators). Excluded by PUC class: require and the four
-    /// searchers (CClosure(1)), math.random/randomseed (CClosure(1),
-    /// RanState upvalue), and the stateful per-iterator generators
-    /// (string.gmatch's gmatch_aux CClosure(3), io.lines' io_readline
-    /// CClosure(3+n)) — those stay on their existing lanes.
+    /// searchers (CClosure(1)), math.random/randomseed (CClosure(1) over the
+    /// RanState userdata, openMathLibrary), and the stateful per-iterator
+    /// generators (string.gmatch's gmatch_aux CClosure(3), io.lines'
+    /// io_readline CClosure(3+n)) — those stay on their existing lanes.
     const light_builtin_ids = [_]BuiltinId{
         // base (lbaselib.c base_funcs, nup=0)
         .print,              .warn,                  .tostring,
@@ -56469,8 +56665,6 @@ pub const Vm = struct {
         t[@intFromEnum(BuiltinId.file_write)] = 4;
         t[@intFromEnum(BuiltinId.os_remove)] = 3;
         t[@intFromEnum(BuiltinId.os_rename)] = 3;
-        t[@intFromEnum(BuiltinId.math_random)] = 1;
-        t[@intFromEnum(BuiltinId.math_randomseed)] = 2;
         t[@intFromEnum(BuiltinId.pairs)] = 4;
         t[@intFromEnum(BuiltinId.ipairs)] = 3;
         t[@intFromEnum(BuiltinId.ipairs_iter)] = 2;

@@ -209,7 +209,6 @@ pub const BuiltinId = enum(u8) {
     io_tmpfile,
     io_read,
     io_lines,
-    io_lines_iter,
     io_flush,
     io_input,
     io_output,
@@ -393,7 +392,6 @@ pub const BuiltinId = enum(u8) {
             .io_tmpfile => "io.tmpfile",
             .io_read => "io.read",
             .io_lines => "io.lines",
-            .io_lines_iter => "io.lines_iter",
             .io_flush => "io.flush",
             .io_input => "io.input",
             .io_output => "io.output",
@@ -26846,7 +26844,6 @@ pub const Vm = struct {
             .io_tmpfile => try self.builtinIoTmpfile(args, outs),
             .io_read => try self.builtinIoRead(args, outs),
             .io_lines => try self.builtinIoLines(args, outs),
-            .io_lines_iter => try self.builtinIoLinesIter(args, outs),
             .io_flush => try self.builtinIoFlush(args, outs),
             .io_input => try self.builtinIoInput(args, outs),
             .io_output => try self.builtinIoOutput(args, outs),
@@ -39955,10 +39952,10 @@ pub const Vm = struct {
                 self.last_builtin_out_count = 2;
             },
             // Owner: the only .Builtin values reachable from Lua are the
-            // stateful/upvalue classes not yet migrated to light
-            // publications (the io.lines iterator product, testc_*).
-            // Their PUC classes are C closures with real upvalues; parity
-            // for this arm lands with those cuts.
+            // testc_* helpers (the stateful iterator products are all
+            // per-call CClosures now). Their PUC class is a C closure
+            // with real upvalues; parity for this arm lands with a
+            // testc migration, if ever needed.
             .Builtin => {
                 if (uidx != 0) return;
                 if (outs.len > 0) {
@@ -41777,16 +41774,15 @@ pub const Vm = struct {
             outs[0] = self.getFieldOpt(io_tbl, "input_stream") orelse (self.getFieldOpt(io_tbl, "stdin") orelse .Nil);
             return;
         }
-        const old_in = self.getFieldOpt(io_tbl, "input_stream") orelse (self.getFieldOpt(io_tbl, "stdin") orelse .Nil);
         if (args[0] == .String) {
             var open_out = [_]Value{ .Nil, .Nil, .Nil };
             const file_v = try self.ioOpenPath(args[0].String.bytes(), "r", open_out[0..]) orelse {
                 const msg = if (open_out[1] == .String) ioErrText(open_out[1].String.bytes()) else "cannot open file";
-                return self.fail("cannot open file '{s}' ({s})", .{ args[0].String.bytes(), msg });
+                // PUC opencheck: luaL_error — position from luaL_where(1),
+                // the immediate caller of this C frame.
+                return self.failWithPosFrame(self.immediateCallerOfTopCFrame(), "cannot open file '{s}' ({s})", .{ args[0].String.bytes(), msg });
             };
             try self.setField(io_tbl, "input_stream", file_v);
-
-            try self.maybeCloseReplacedDefault(old_in, file_v);
             outs[0] = file_v;
             return;
         }
@@ -41795,7 +41791,6 @@ pub const Vm = struct {
             return self.fail("bad argument #1 to 'input' (FILE* expected, got {s})", .{name});
         }
         try self.setField(io_tbl, "input_stream", args[0]);
-        try self.maybeCloseReplacedDefault(old_in, args[0]);
         outs[0] = args[0];
     }
 
@@ -42289,6 +42284,9 @@ pub const Vm = struct {
         } else "r";
         const file_v = try self.ioOpenPath(path, mode_s, outs) orelse return;
         outs[0] = file_v;
+        // PUC io_open success: exactly one result (the handle); the window
+        // (3) only covers the failure triple.
+        self.last_builtin_out_count = 1;
     }
 
     fn builtinIoPopen(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -42363,17 +42361,46 @@ pub const Vm = struct {
         const tmp = tmp_out[0].String.bytes();
         const f = try self.ioOpenPath(tmp, "w+", outs) orelse return;
         outs[0] = f;
+        // PUC io_tmpfile success: exactly one result (the handle); the
+        // window (3) only covers the failure triple.
+        self.last_builtin_out_count = 1;
     }
 
-    fn readOneFormat(self: *Vm, file_v: Value, spec: Value) DispatchError!Value {
+    /// PUC g_read's per-format core (liolib.c:568). `argno` is the format's
+    /// stack index in the raising C function's frame (io.read: the arg
+    /// position; file:read: one past the handle; the lines iterator: one
+    /// past the iterator) and `raiser` the raising function's value — both
+    /// feed the luaL_argerror-shaped raise (failCArgerror): a number is a
+    /// byte count (luaL_checkinteger: exactly-integral floats included, a
+    /// non-integral or out-of-range float is the "number has no integer
+    /// representation" argerror, a negative count is the huge-size_t
+    /// "resulting string too large"), anything else must be
+    /// string-coercible (luaL_checklstring) and match l/L/a/n.
+    fn readOneFormat(self: *Vm, file_v: Value, spec: Value, argno: i64, raiser: Value) DispatchError!Value {
         const f = self.getManagedFile(file_v) orelse return self.fail("closed file", .{});
         const fb = self.getFileBuffer(file_v) orelse return self.fail("closed file", .{});
-        if (spec == .Int) {
-            if (spec.Int < 0) return self.fail("bad argument to 'read' (invalid format)", .{});
-            const s = try self.readCountAlloc(f, fb, @intCast(spec.Int));
+        const count: ?i64 = switch (spec) {
+            .Int => |x| x,
+            .Num => |x| blk: {
+                if (x != @trunc(x) or
+                    x < -9223372036854775808.0 or x >= 9223372036854775808.0)
+                {
+                    return self.failCArgerror(argno, raiser, "number has no integer representation", .{});
+                }
+                break :blk @as(i64, @intFromFloat(x));
+            },
+            else => null,
+        };
+        if (count) |c| {
+            // PUC: (size_t)negative is a huge size — luaL_prepbuffsize
+            // raises before any allocation.
+            if (c < 0) return self.fail("resulting string too large", .{});
+            const s = try self.readCountAlloc(f, fb, @intCast(c));
             return if (s) |ls| .{ .String = ls } else .Nil;
         }
-        const fmt: []const u8 = if (spec == .String) spec.String.bytes() else return self.fail("bad argument to 'read' (invalid format)", .{});
+        const fmt: []const u8 = if (spec == .String) spec.String.bytes() else {
+            return self.failCArgerror(argno, raiser, "string expected, got {s}", .{self.valueTypeName(spec)});
+        };
         if (std.mem.eql(u8, fmt, "l") or std.mem.eql(u8, fmt, "*l")) {
             const s = try self.readLineAlloc(f, fb, false);
             return if (s) |ls| .{ .String = ls } else .Nil;
@@ -42387,117 +42414,116 @@ pub const Vm = struct {
             return .{ .String = s };
         }
         if (std.mem.eql(u8, fmt, "n") or std.mem.eql(u8, fmt, "*n")) {
-            var tok = std.ArrayList(u8).empty;
-            defer tok.deinit(self.alloc);
-            while (true) {
-                const b = readByte(f, fb) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
-                if (b == null) break;
-                if (std.ascii.isWhitespace(b.?)) continue;
-                unreadByte(fb, b.?);
-                break;
+            // PUC read_number (liolib.c:479): a look-ahead state machine.
+            // Spaces are skipped (consumed, never ungot); the look-ahead
+            // char is ungot at the end; the conversion runs over the
+            // collected text and a failure pushes nil having consumed
+            // exactly the matched prefix — "B2" consumes nothing (the
+            // next read sees the whole line), "0xZ" consumes "0x", an
+            // overlong numeral (L_MAXLENNUM 200) consumes its first 200
+            // chars and ungets the look-ahead.
+            var buff: [200]u8 = undefined;
+            var bn: usize = 0;
+            var valid = true;
+            var c: ?u8 = readByte(f, fb) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
+            while (c != null and std.ascii.isWhitespace(c.?)) {
+                c = readByte(f, fb) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
             }
-            while (true) {
-                const b = readByte(f, fb) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
-                if (b == null) break;
-                const c = b.?;
-                const ok = std.ascii.isDigit(c) or c == '+' or c == '-' or c == '.' or c == 'x' or c == 'X' or c == 'p' or c == 'P' or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
-                if (!ok) {
-                    unreadByte(fb, c);
+            // nextc: save the current char and advance; on buffer
+            // overflow PUC invalidates the result and does NOT advance
+            // (the char stays as the look-ahead and is ungot at the end).
+            const nextc = struct {
+                fn go(
+                    vm: *Vm,
+                    f2: @TypeOf(f),
+                    fb2: @TypeOf(fb),
+                    buff2: []u8,
+                    bn2: *usize,
+                    c2: *?u8,
+                ) Error!bool {
+                    if (bn2.* >= buff2.len) return false;
+                    buff2[bn2.*] = c2.*.?;
+                    bn2.* += 1;
+                    c2.* = readByte(f2, fb2) catch |e|
+                        return vm.fail("read error: {s}", .{@errorName(e)});
+                    return true;
+                }
+            }.go;
+            // optional sign
+            if (c != null and (c.? == '-' or c.? == '+')) {
+                if (!try nextc(self, f, fb, buff[0..], &bn, &c)) valid = false;
+            }
+            var ndigits: usize = 0;
+            var hex = false;
+            if (c != null and c.? == '0') {
+                if (!try nextc(self, f, fb, buff[0..], &bn, &c)) valid = false;
+                if (c != null and (c.? == 'x' or c.? == 'X')) {
+                    if (!try nextc(self, f, fb, buff[0..], &bn, &c)) valid = false;
+                    hex = true;
+                } else ndigits = 1; // initial '0' is a valid digit
+            }
+            // integral part
+            while (c != null and (if (hex) std.ascii.isHex(c.?) else std.ascii.isDigit(c.?))) {
+                if (!try nextc(self, f, fb, buff[0..], &bn, &c)) {
+                    valid = false;
                     break;
                 }
-                try tok.append(self.alloc, c);
+                ndigits += 1;
             }
-            if (tok.items.len == 0) return .Nil;
-            const sfull = tok.items;
-            var i: usize = 0;
-            if (sfull[i] == '+' or sfull[i] == '-') {
-                i += 1;
-                if (i >= sfull.len) return .Nil;
+            // decimal point + fractional part
+            if (c != null and c.? == '.') {
+                if (!try nextc(self, f, fb, buff[0..], &bn, &c)) valid = false;
+                while (c != null and (if (hex) std.ascii.isHex(c.?) else std.ascii.isDigit(c.?))) {
+                    if (!try nextc(self, f, fb, buff[0..], &bn, &c)) {
+                        valid = false;
+                        break;
+                    }
+                    ndigits += 1;
+                }
             }
-            var consume_len: usize = 0;
+            // exponent (only after at least one digit)
+            if (ndigits > 0 and c != null and
+                (if (hex) (c.? == 'p' or c.? == 'P') else (c.? == 'e' or c.? == 'E')))
+            {
+                if (!try nextc(self, f, fb, buff[0..], &bn, &c)) valid = false;
+                if (c != null and (c.? == '-' or c.? == '+')) {
+                    if (!try nextc(self, f, fb, buff[0..], &bn, &c)) valid = false;
+                }
+                while (c != null and std.ascii.isDigit(c.?)) {
+                    if (!try nextc(self, f, fb, buff[0..], &bn, &c)) {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            // unget the look-ahead (no-op at EOF)
+            if (c) |ch| unreadByte(fb, ch);
+            if (!valid or bn == 0) return .Nil;
+            const s = buff[0..bn];
             var parsed: ?Value = null;
-
-            const is_hex = i + 1 < sfull.len and sfull[i] == '0' and (sfull[i + 1] == 'x' or sfull[i + 1] == 'X');
-            if (is_hex) {
-                i += 2; // consume 0x
-                var has_hex = false;
-                while (i < sfull.len and ((sfull[i] >= '0' and sfull[i] <= '9') or (sfull[i] >= 'a' and sfull[i] <= 'f') or (sfull[i] >= 'A' and sfull[i] <= 'F'))) : (i += 1) has_hex = true;
-                var had_dot = false;
-                if (i < sfull.len and sfull[i] == '.') {
-                    had_dot = true;
-                    i += 1;
-                    while (i < sfull.len and ((sfull[i] >= '0' and sfull[i] <= '9') or (sfull[i] >= 'a' and sfull[i] <= 'f') or (sfull[i] >= 'A' and sfull[i] <= 'F'))) : (i += 1) has_hex = true;
-                }
-                var had_exp = false;
-                var exp_digits: usize = 0;
-                if (has_hex and i < sfull.len and (sfull[i] == 'p' or sfull[i] == 'P')) {
-                    had_exp = true;
-                    i += 1;
-                    if (i < sfull.len and (sfull[i] == '+' or sfull[i] == '-')) i += 1;
-                    while (i < sfull.len and (sfull[i] >= '0' and sfull[i] <= '9')) : (i += 1) exp_digits += 1;
-                }
-                consume_len = i;
-                const complete = has_hex and ((!had_dot and !had_exp) or (had_exp and exp_digits > 0));
-                if (complete) {
-                    const s = sfull[0..consume_len];
-                    if (parseHexStringIntWrap(s)) |iv| {
-                        parsed = .{ .Int = iv };
-                    } else if (std.fmt.parseFloat(f64, s)) |n| {
+            if (s.len >= 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X')) {
+                if (parseHexStringIntWrap(s)) |iv| {
+                    parsed = .{ .Int = iv };
+                } else if (std.fmt.parseFloat(f64, s)) |n| {
+                    parsed = .{ .Num = n };
+                } else |_| {}
+            } else if (std.mem.indexOfAny(u8, s, ".eE") == null) {
+                if (std.fmt.parseInt(i64, s, 10)) |iv| {
+                    parsed = .{ .Int = iv };
+                } else |_| {}
+                if (parsed == null) {
+                    if (std.fmt.parseFloat(f64, s)) |n| {
                         parsed = .{ .Num = n };
                     } else |_| {}
-                } else if (consume_len == 0) {
-                    consume_len = 1;
                 }
             } else {
-                i = 0;
-                if (sfull[i] == '+' or sfull[i] == '-') i += 1;
-                var has_dec = false;
-                while (i < sfull.len and (sfull[i] >= '0' and sfull[i] <= '9')) : (i += 1) has_dec = true;
-                if (i < sfull.len and sfull[i] == '.') {
-                    i += 1;
-                    while (i < sfull.len and (sfull[i] >= '0' and sfull[i] <= '9')) : (i += 1) has_dec = true;
-                }
-                var had_exp = false;
-                var exp_digits: usize = 0;
-                if (has_dec and i < sfull.len and (sfull[i] == 'e' or sfull[i] == 'E')) {
-                    had_exp = true;
-                    i += 1;
-                    if (i < sfull.len and (sfull[i] == '+' or sfull[i] == '-')) i += 1;
-                    while (i < sfull.len and (sfull[i] >= '0' and sfull[i] <= '9')) : (i += 1) exp_digits += 1;
-                }
-                consume_len = i;
-                const complete = has_dec and (!had_exp or exp_digits > 0);
-                if (complete) {
-                    const s = sfull[0..consume_len];
-                    if (std.mem.indexOfAny(u8, s, ".eE") == null) {
-                        if (std.fmt.parseInt(i64, s, 10)) |iv| {
-                            parsed = .{ .Int = iv };
-                        } else |_| {}
-                    }
-                    if (parsed == null) {
-                        if (std.fmt.parseFloat(f64, s)) |n| {
-                            parsed = .{ .Num = n };
-                        } else |_| {}
-                    }
-                } else {
-                    if (consume_len == 0) {
-                        consume_len = if (sfull[0] == '+' or sfull[0] == '-' or sfull[0] == '.') 1 else 0;
-                    }
-                    if (consume_len == 0) return .Nil;
-                }
+                if (std.fmt.parseFloat(f64, s)) |n| {
+                    parsed = .{ .Num = n };
+                } else |_| {}
             }
-            // Overlong numerals: fail, but keep tail in stream.
-            if (consume_len > 200) {
-                const keep: usize = @min(@as(usize, 32), consume_len);
-                const unread_n = sfull.len - keep;
-                if (unread_n != 0) fb.pos -|= unread_n;
-                return .Nil;
-            }
-            const unread_n = sfull.len - consume_len;
-            if (unread_n != 0) fb.pos -|= unread_n;
             return parsed orelse .Nil;
         }
-        return self.fail("bad argument to 'read' (invalid format)", .{});
+        return self.failCArgerror(argno, raiser, "invalid format", .{});
     }
 
     fn currentInputFile(self: *Vm) DispatchError!Value {
@@ -42520,14 +42546,14 @@ pub const Vm = struct {
         }
         if (!fileCanRead(self, file_v)) return self.fail(" input file is closed", .{});
         if (args.len == 0) {
-            if (outs.len > 0) outs[0] = try self.readOneFormat(file_v, .{ .String = try self.internStr("l") });
+            if (outs.len > 0) outs[0] = try self.readOneFormat(file_v, .{ .String = try self.internStr("l") }, 1, lightBuiltinValue(.io_read));
             self.last_builtin_out_count = 1;
             return;
         }
         var out_i: usize = 0;
         var i: usize = 0;
         while (i < args.len and out_i < outs.len) : (i += 1) {
-            const v = try self.readOneFormat(file_v, args[i]);
+            const v = try self.readOneFormat(file_v, args[i], @as(i64, @intCast(i)) + 1, lightBuiltinValue(.io_read));
             outs[out_i] = v;
             if (v == .Nil) break;
             out_i += 1;
@@ -42535,108 +42561,275 @@ pub const Vm = struct {
         self.last_builtin_out_count = out_i + @intFromBool(out_i < outs.len and out_i < args.len and outs[out_i] == .Nil);
     }
 
-    fn makeLinesIter(self: *Vm, file_v: Value, auto_close: bool, fmts: []const Value) DispatchError!Value {
-        // P16.50-review-15 BLOCKER 2: until `obj.__file = file_v` (and
-        // `obj.__fmts`) are published, the fresh managed file and the format
-        // values live ONLY in this Zig frame — PUC keeps them on L->stack
-        // for the whole construction window (io_lines leaves the file
-        // userdata and the format arguments below the iterator closure).
-        // Every allocation below (tables, interned field keys, array
-        // resize, metatable barrier prep) can fire an emergency GC, which
-        // would otherwise finalize/sweep the file (closing the OS handle)
-        // or reclaim a format string, leaving the iterator with a
-        // dangling/closing pointer. Root the inputs AND the fresh tables
-        // in ONE owner, reserved before the first VM-allocation so every
-        // add is infallible (review-7 discipline); inputs go in first,
-        // each allocation is added immediately, and the roots are released
-        // only after the fully-published iterator is returned.
-        var scope = try self.openRootScope(3 + 1 + fmts.len, 0);
+    /// PUC lua_tolstring's coercion set (lapi.c): only strings and numbers
+    /// convert to a string in situ; io.lines' luaL_checkstring argcheck
+    /// (liolib.c io_lines) accepts exactly these.
+    fn stringCoercible(v: Value) bool {
+        return switch (v) {
+            .String, .Int, .Num => true,
+            else => false,
+        };
+    }
+
+    /// PUC MAXARGLINE (liolib.c): the io.lines/file:lines format bound —
+    /// the iterator closure's 3 + n upvalues must fit the upvalue limit.
+    const max_line_formats = 250;
+
+    /// PUC aux_lines (liolib.c:365): the lines iterator is a FRESH
+    /// CClosure(3 + n) per producer call with upvalues [file, n, toclose,
+    /// formats...]. The file upvalue is re-read on EVERY iterator call
+    /// (io_readline), so a debug.setupvalue swap of upvalue 1 changes the
+    /// file being read; upvalues 1/3+n are also the only roots keeping the
+    /// file and the format strings alive for the iterator's lifetime (PUC
+    /// arms them on the closure for exactly that).
+    fn makeLinesClosure(
+        self: *Vm,
+        file_v: Value,
+        toclose: bool,
+        fmts: []const Value,
+    ) std.mem.Allocator.Error!*Closure {
+        // The fresh file (io.lines(filename)) lives only in this Zig frame
+        // until the closure is published — root it, and the format values,
+        // across allocCclosure's cell/closure allocations (PUC keeps all
+        // of them on L->stack for the whole construction window: the file
+        // from io_lines' opencheck, the formats from the caller's frame).
+        // The upvalue staging array is a Zig local holding only already-
+        // rooted values. n/toclose are immediates. allocCclosure roots
+        // every cell and the closure itself and rolls back its own
+        // registrations on failure, so a failed construction leaves only
+        // collectable garbage (the fresh file is then finalized closed,
+        // like PUC's unreferenced LStream).
+        var scope = try self.openRootScope(1 + max_line_formats, 0);
         defer scope.close();
         _ = scope.protectValueAssumeCapacity(file_v);
         for (fmts) |f| _ = scope.protectValueAssumeCapacity(f);
-        const obj = try self.allocTableNoGc();
-        _ = scope.protectValueAssumeCapacity(.{ .Table = obj });
-        const mt = try self.allocTableNoGc();
-        _ = scope.protectValueAssumeCapacity(.{ .Table = mt });
-        const fmts_tbl = try self.allocTableNoGc();
-        _ = scope.protectValueAssumeCapacity(.{ .Table = fmts_tbl });
-        try self.setField(mt, "__call", .{ .Builtin = .io_lines_iter });
-        try self.gcStoreMetatable(obj, mt);
-        try self.setField(obj, "__file", file_v);
-        try self.setField(obj, "__auto_close", .{ .Bool = auto_close });
-        try self.setField(obj, "__closed_error", .{ .Bool = false });
-        const nfmts: usize = fmts.len;
-        try self.tableResizeArray(fmts_tbl, @intCast(nfmts));
-        for (0..nfmts) |i| fmts_tbl.array[i] = fmts[i];
-        try self.setField(obj, "__fmts", .{ .Table = fmts_tbl });
-        return .{ .Table = obj };
+        var upvs: [3 + max_line_formats]Value = undefined;
+        upvs[0] = file_v;
+        upvs[1] = .{ .Int = @intCast(fmts.len) };
+        upvs[2] = .{ .Bool = toclose };
+        for (fmts, 0..) |f, i| upvs[3 + i] = f;
+        return try self.allocCclosure(&ioReadlineShim, upvs[0 .. 3 + fmts.len]);
     }
 
     fn builtinIoLines(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         var file_v: Value = .Nil;
-        var auto_close = false;
+        var toclose = false;
         var fmt_start: usize = 0;
         if (args.len == 0 or args[0] == .Nil) {
             file_v = try self.currentInputFile();
             fmt_start = if (args.len == 0) 0 else 1;
-        } else if (args[0] == .String) {
+        } else if (stringCoercible(args[0])) {
+            // PUC io_lines: luaL_checkstring accepts numbers (lua_tolstring
+            // coercion) and opencheck opens the coerced name.
+            const name = try self.valueToStringAlloc(args[0]);
             var open_out = [_]Value{ .Nil, .Nil, .Nil };
-            file_v = (try self.ioOpenPath(args[0].String.bytes(), "r", open_out[0..])) orelse {
+            file_v = (try self.ioOpenPath(name, "r", open_out[0..])) orelse {
                 const msg = if (open_out[1] == .String) ioErrText(open_out[1].String.bytes()) else "cannot open file";
-                return self.fail("cannot open file '{s}' ({s})", .{ args[0].String.bytes(), msg });
+                // PUC opencheck: luaL_error — position from luaL_where(1),
+                // the immediate caller of this C frame.
+                return self.failWithPosFrame(self.immediateCallerOfTopCFrame(), "cannot open file '{s}' ({s})", .{ name, msg });
             };
-            auto_close = true;
+            toclose = true;
             fmt_start = 1;
         } else {
-            file_v = args[0];
-            fmt_start = 1;
+            return self.failCArgerror(1, lightBuiltinValue(.io_lines), "string expected, got {s}", .{self.valueTypeName(args[0])});
         }
-        if (asFileTable(self, file_v) == null) return self.fail("bad argument #1 to 'lines' (FILE* expected)", .{});
+        if (asFileTable(self, file_v) == null) {
+            return self.fail("bad argument #1 to 'lines' (FILE* expected, got {s})", .{self.valueTypeName(file_v)});
+        }
         const fmts = args[fmt_start..];
-        if (fmts.len > 250) return self.fail("too many arguments", .{});
-        const iter = try self.makeLinesIter(file_v, auto_close, fmts);
-        outs[0] = iter;
-        if (outs.len > 1) outs[1] = file_v;
-        if (outs.len > 2) outs[2] = .Nil;
-        if (auto_close and outs.len > 3) outs[3] = file_v;
-        self.last_builtin_out_count = @min(if (auto_close) @as(usize, 4) else @as(usize, 3), outs.len);
+        if (fmts.len > max_line_formats) {
+            return self.failCArgerror(max_line_formats + 2, lightBuiltinValue(.io_lines), "too many arguments", .{});
+        }
+        const cl = try self.makeLinesClosure(file_v, toclose, fmts);
+        outs[0] = .{ .Closure = cl };
+        if (toclose) {
+            // PUC io_lines toclose tail: [iterator, nil, nil, file] — the
+            // 4th result is the generic-for to-be-closed variable.
+            if (outs.len > 1) outs[1] = .Nil;
+            if (outs.len > 2) outs[2] = .Nil;
+            if (outs.len > 3) outs[3] = file_v;
+            self.last_builtin_out_count = @min(@as(usize, 4), outs.len);
+        } else {
+            self.last_builtin_out_count = @min(@as(usize, 1), outs.len);
+        }
     }
 
-    fn builtinIoLinesIter(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
-        if (args.len == 0 or args[0] != .Table) return self.fail("bad argument #1 to 'lines' iterator", .{});
-        const it = args[0].Table;
-        const file_v = self.getFieldOpt(it, "__file") orelse .Nil;
-        const closed_error = if (self.getFieldOpt(it, "__closed_error")) |v| (v == .Bool and v.Bool) else false;
-        if (file_v == .Nil) {
-            if (closed_error) return self.fail("file is already closed", .{});
-            self.last_builtin_out_count = 0;
-            return;
-        }
-        const fmt_tbl = if (self.getFieldOpt(it, "__fmts")) |v| if (v == .Table) v.Table else null else null;
-        const fmt_count: usize = if (fmt_tbl) |t| t.asize else 0;
-        const cnt = if (fmt_count == 0) 1 else fmt_count;
-        var out_i: usize = 0;
-        while (out_i < cnt and out_i < outs.len) : (out_i += 1) {
-            const spec = if (fmt_count == 0) Value{ .String = try self.internStr("l") } else fmt_tbl.?.array[out_i];
-            const v = try self.readOneFormat(file_v, spec);
-            if (out_i == 0 and v == .Nil) {
-                const auto_close = if (self.getFieldOpt(it, "__auto_close")) |av| (av == .Bool and av.Bool) else false;
-                if (auto_close) {
-                    if (asFileTable(self, file_v)) |t| {
-                        _ = self.closeManagedFile(t);
-                        _ = self.setField(t, "__closed", .{ .Bool = true }) catch {};
-                    }
-                    try self.setField(it, "__closed_error", .{ .Bool = true });
-                }
-                try self.setField(it, "__file", .Nil);
-                self.last_builtin_out_count = 0;
-                return;
+    /// PUC io_readline (liolib.c:632) as the CClosure(3+n) target: the file
+    /// comes from upvalue 1 of the running activation's closure (re-read
+    /// every call), n from upvalue 2 (lua_tointeger: 0 or garbage means the
+    /// single default "l" read), toclose from upvalue 3 (truthiness). A
+    /// closed file raises "file is already closed" BEFORE any read (PUC
+    /// isclosed check). Results: every read format's value in order — the
+    /// first nil stops the reads; a truthy first result returns ALL
+    /// produced values including a trailing read-nil (PUC g_read's
+    /// fail-to-nil tail), a nil first result is EOF: toclose closes the
+    /// file (once — the __closed flag is the closef == NULL equivalent)
+    /// and the call returns 0 values.
+    fn ioReadlineShim(L: ?*lua_State) callconv(.c) c_int {
+        const h = L orelse return 0;
+        const self = h.vm;
+        const th = self.activeBytecodeThread();
+        const cl: ?*Closure = blk: {
+            if (th.call_frames.len() == 0) break :blk null;
+            const fr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
+            if (!fr.isC() or fr.func_slot >= th.top or th.stack[fr.func_slot] != .Closure) break :blk null;
+            const c = th.stack[fr.func_slot].Closure;
+            if (c.upvalues.len < 3) break :blk null;
+            break :blk c;
+        } orelse {
+            // PUC NULL-derefs the upvalue userdata here (UB lane); the
+            // catchable-error class is the disclosed divergence.
+            _ = self.failC("io.lines iterator: malformed upvalues", .{}) catch {};
+            return -1;
+        };
+        const file_v = cl.?.upvalues[0].value;
+        const n_fmt: usize = switch (cl.?.upvalues[1].value) {
+            .Int => |x| if (x > 0) @intCast(x) else 0,
+            // PUC lua_tointeger also accepts exactly-integral floats.
+            .Num => |x| if (x > 0 and @floor(x) == x and x <= @as(f64, @floatFromInt(std.math.maxInt(i32)))) @as(usize, @intFromFloat(x)) else 0,
+            else => 0,
+        };
+        const toclose = switch (cl.?.upvalues[2].value) {
+            .Nil => false,
+            .Bool => |b| b,
+            else => true,
+        };
+        const file_tbl = asFileTable(self, file_v) orelse {
+            _ = self.failC("io.lines iterator: file upvalue is not a file", .{}) catch {};
+            return -1;
+        };
+        if (self.getFieldOpt(file_tbl, "__closed")) |cv| {
+            if (cv == .Bool and cv.Bool) {
+                // PUC luaL_error from io_readline: the position is
+                // luaL_where(1) — the iterator's immediate caller (a Lua
+                // caller prefixes its chunk:line, a C caller like pcall
+                // yields none).
+                _ = self.failWithPosFrame(self.immediateCallerOfTopCFrame(), "file is already closed", .{}) catch {};
+                return -1;
             }
-            outs[out_i] = v;
+        }
+        const cnt = if (n_fmt == 0) 1 else @min(n_fmt, cl.?.upvalues.len - 3);
+        var default_spec: Value = .Nil;
+        if (n_fmt == 0) {
+            default_spec = .{ .String = self.internStr("l") catch |e| return self.ioReadlineMapErr(th, e) };
+        }
+        self.cWindowEnsure(th, cnt) catch {
+            self.setOutOfMemoryError();
+            self.latchErrmemRaiseWindow(th);
+            self.c_error_value = self.errThread().err_obj;
+            self.c_error_status = 4; // LUA_ERRMEM
+            if (self.c_error_jmp) |jb| {
+                _longjmp(@ptrCast(jb), 1);
+            }
+            std.process.abort();
+        };
+        const base = th.top;
+        const outs = th.stack[base .. base + cnt];
+        @memset(outs, .Nil);
+        th.top = base + cnt;
+        var produced: usize = 0;
+        var i: usize = 0;
+        while (i < cnt) : (i += 1) {
+            const spec = if (n_fmt == 0) default_spec else cl.?.upvalues[3 + i].value;
+            // PUC io_readline: the format sits at stack index 2.. of the
+            // iterator's own frame (arg 1 is the iterator itself).
+            const v = self.readOneFormat(file_v, spec, @as(i64, @intCast(i)) + 2, .{ .Closure = cl.? }) catch |e| {
+                // Plain errors kill the staging window before the shim tail
+                // (the OOM latch then sees the pre-staging window shape);
+                // suspension-shaped errors are invariant breaches — the
+                // core runs no user code (the emergency GC suppresses
+                // finalizers).
+                th.top = base;
+                return self.ioReadlineMapErr(th, e);
+            };
+            outs[i] = v;
+            produced = i + 1;
             if (v == .Nil) break;
         }
-        self.last_builtin_out_count = out_i;
+        if (outs[0] != .Nil) {
+            th.top = base + produced;
+            return @intCast(produced);
+        }
+        // EOF on the first format: no error information (read errors were
+        // already raised inside readOneFormat); toclose closes the file
+        // exactly once (PUC aux_close).
+        if (toclose) {
+            _ = self.closeManagedFile(file_tbl);
+            self.setField(file_tbl, "__closed", .{ .Bool = true }) catch |e| {
+                th.top = base;
+                return self.ioReadlineMapErr(th, e);
+            };
+        }
+        th.top = base;
+        return 0;
+    }
+
+    /// The io.lines shim's DispatchError tail mapping (the gmatch shim's
+    /// contract): plain errors return the C sentinel, OOM raises ERRMEM
+    /// through the boundary longjmp, and suspension-shaped errors are an
+    /// invariant breach (the readline core runs no user code).
+    fn ioReadlineMapErr(self: *Vm, th: *Thread, e: DispatchError) c_int {
+        return switch (e) {
+            error.RuntimeError => -1,
+            error.MainDestined => -3,
+            error.OutOfMemory => {
+                self.setOutOfMemoryError();
+                self.latchErrmemRaiseWindow(th);
+                self.c_error_value = self.errThread().err_obj;
+                self.c_error_status = 4; // LUA_ERRMEM
+                if (self.c_error_jmp) |jb| {
+                    _longjmp(@ptrCast(jb), 1);
+                }
+                std.process.abort();
+            },
+            error.Yield, error.ThreadSwitch, error.YieldAbsorbed => @panic(
+                "io.lines shim: coroutine control flow crossed the readline core boundary",
+            ),
+        };
+    }
+
+    /// PUC luaL_argerror (lauxlib.c:171) for an argcheck raised inside a
+    /// builtin's or shim's C-frame (the io.lines/file:lines producers'
+    /// argchecks, the shared read-format argerrors): the argument number
+    /// skips a method-call self (colon syntax), the function name comes
+    /// from the caller's call site (getfuncname) with a pushglobalfuncname
+    /// fallback ('?'). The raising frames are C functions, so the
+    /// extraargs arm never applies.
+    fn failCArgerror(
+        self: *Vm,
+        arg: i64,
+        raiser: Value,
+        comptime extra_fmt: []const u8,
+        extra_args: anytype,
+    ) Error {
+        const th = self.activeBytecodeThread();
+        var argno = arg;
+        var nm: []const u8 = "?";
+        var resolved = false;
+        if (th.call_frames.len() >= 2) {
+            const top = th.call_frames.len() - 1;
+            if (th.call_frames.getConstPtr(top).isC()) {
+                if (self.getFuncNameForFrame(th, top)) |dn| {
+                    if (dn.name) |n| {
+                        nm = n;
+                        resolved = true;
+                        if (std.mem.eql(u8, dn.namewhat, "method")) argno -= 1;
+                    }
+                }
+            }
+        }
+        if (!resolved) {
+            var buf: [128]u8 = undefined;
+            if (self.pushGlobalFuncName(buf[0..], raiser)) |n| nm = n;
+        }
+        var tmp: [256]u8 = undefined;
+        const extra = std.fmt.bufPrint(tmp[0..], extra_fmt, extra_args) catch "";
+        if (argno == 0) {
+            return self.failArgerror("calling '{s}' on bad self ({s})", .{ nm, extra });
+        }
+        return self.failArgerror("bad argument #{d} to '{s}' ({s})", .{ argno, nm, extra });
     }
 
     fn builtinIoFlush(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -42671,15 +42864,15 @@ pub const Vm = struct {
             outs[0] = self.getFieldOpt(io_tbl, "output_stream") orelse (self.getFieldOpt(io_tbl, "stdout") orelse .Nil);
             return;
         }
-        const old_out = self.getFieldOpt(io_tbl, "output_stream") orelse (self.getFieldOpt(io_tbl, "stdout") orelse .Nil);
         if (args[0] == .String) {
             var open_out = [_]Value{ .Nil, .Nil, .Nil };
             const file_v = try self.ioOpenPath(args[0].String.bytes(), "w", open_out[0..]) orelse {
                 const msg = if (open_out[1] == .String) ioErrText(open_out[1].String.bytes()) else "cannot open file";
-                return self.fail("cannot open file '{s}' ({s})", .{ args[0].String.bytes(), msg });
+                // PUC opencheck: luaL_error — position from luaL_where(1),
+                // the immediate caller of this C frame.
+                return self.failWithPosFrame(self.immediateCallerOfTopCFrame(), "cannot open file '{s}' ({s})", .{ args[0].String.bytes(), msg });
             };
             try self.setField(io_tbl, "output_stream", file_v);
-            try self.maybeCloseReplacedDefault(old_out, file_v);
             outs[0] = file_v;
             return;
         }
@@ -42688,7 +42881,6 @@ pub const Vm = struct {
             return self.fail("bad argument #1 to 'output' (FILE* expected, got {s})", .{name});
         }
         try self.setField(io_tbl, "output_stream", args[0]);
-        try self.maybeCloseReplacedDefault(old_out, args[0]);
         outs[0] = args[0];
     }
 
@@ -42700,14 +42892,6 @@ pub const Vm = struct {
         const stdout_v = self.getFieldOpt(io_tbl, "stdout") orelse .Nil;
         const stderr_v = self.getFieldOpt(io_tbl, "stderr") orelse .Nil;
         return valuesEqual(v, stdin_v) or valuesEqual(v, stdout_v) or valuesEqual(v, stderr_v);
-    }
-
-    fn maybeCloseReplacedDefault(self: *Vm, old_v: Value, new_v: Value) DispatchError!void {
-        if (valuesEqual(old_v, new_v) or try self.isStdFile(old_v)) return;
-        if (asFileTable(self, old_v)) |t| {
-            _ = self.closeManagedFile(t);
-            _ = self.setField(t, "__closed", .{ .Bool = true }) catch {};
-        }
     }
 
     fn builtinIoClose(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -42823,14 +43007,17 @@ pub const Vm = struct {
             return;
         }
         if (args.len == 1) {
-            if (outs.len > 0) outs[0] = try self.readOneFormat(file_v, .{ .String = try self.internStr("l") });
+            if (outs.len > 0) outs[0] = try self.readOneFormat(file_v, .{ .String = try self.internStr("l") }, 1, lightBuiltinValue(.file_read));
             self.last_builtin_out_count = 1;
             return;
         }
         var out_i: usize = 0;
         var i: usize = 1;
         while (i < args.len and out_i < outs.len) : (i += 1) {
-            const v = try self.readOneFormat(file_v, args[i]);
+            // PUC f_read: the format sits at stack index i+1 of f_read's
+            // frame (arg 1 is the handle); failCArgerror's method-self
+            // adjustment then restores the user-visible argument number.
+            const v = try self.readOneFormat(file_v, args[i], @as(i64, @intCast(i)) + 1, lightBuiltinValue(.file_read));
             outs[out_i] = v;
             if (v == .Nil) break;
             out_i += 1;
@@ -42944,14 +43131,21 @@ pub const Vm = struct {
     }
 
     fn builtinFileLines(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
-        if (args.len == 0) return self.fail("bad argument #1 to 'lines' (FILE* expected)", .{});
-        if (args.len - 1 > 250) return self.fail("too many arguments", .{});
-        if (outs.len > 0) {
-            outs[0] = try self.makeLinesIter(args[0], false, args[1..]);
-            if (outs.len > 1) outs[1] = args[0];
-            if (outs.len > 2) outs[2] = .Nil;
-            self.last_builtin_out_count = @min(@as(usize, 3), outs.len);
+        if (args.len == 0) {
+            return self.failCArgerror(1, lightBuiltinValue(.file_lines), "FILE* expected, got no value", .{});
         }
+        // PUC f_lines: tofile's luaL_checkudata runs BEFORE aux_lines' format
+        // bound check.
+        if (asFileTable(self, args[0]) == null) {
+            return self.failCArgerror(1, lightBuiltinValue(.file_lines), "FILE* expected, got {s}", .{self.valueTypeName(args[0])});
+        }
+        if (args.len - 1 > max_line_formats) {
+            return self.failCArgerror(max_line_formats + 2, lightBuiltinValue(.file_lines), "too many arguments", .{});
+        }
+        if (outs.len == 0) return;
+        const cl = try self.makeLinesClosure(args[0], false, args[1..]);
+        outs[0] = .{ .Closure = cl };
+        self.last_builtin_out_count = @min(@as(usize, 1), outs.len);
     }
 
     fn builtinFileSetvbuf(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -56624,10 +56818,11 @@ pub const Vm = struct {
         const table = comptime blk: {
             var t = [_]bool{false} ** 256;
             for ([_]BuiltinId{
-                .coroutine_close, .utf8_codepoint, .io_lines_iter,   .io_read,
+                .coroutine_close, .utf8_codepoint, .io_read,
                 .file_read,       .file_close,     .io_close,        .io_popen,
-                .os_execute,      .io_lines,       .file_lines,      .debug_getupvalue,
+                .os_execute,      .io_lines,       .debug_getupvalue,
                 .string_find,     .string_match,   .package_loadlib,
+                .io_open,         .io_tmpfile,
             }) |d| t[@intFromEnum(d)] = true;
             break :blk t;
         };
@@ -56730,10 +56925,10 @@ pub const Vm = struct {
         var t = [_]?u16{1} ** @typeInfo(BuiltinId).@"enum".fields.len;
         // Argument-dependent (dynamic) out-counts — builtinOutLenDynamic.
         for ([_]BuiltinId{
-            .io_lines,        .io_lines_iter, .assert,       .select,
-            .string_byte,     .string_find,   .string_match, .utf8_codepoint,
-            .string_unpack,   .table_unpack,  .io_read,      .file_read,
-            .package_loadlib,
+            .io_lines,        .assert,       .select,
+            .string_byte,     .string_find,  .string_match, .utf8_codepoint,
+            .string_unpack,   .table_unpack, .io_read,      .file_read,
+            .package_loadlib, .io_open,      .io_tmpfile,
         }) |dyn_id| t[@intFromEnum(dyn_id)] = null;
         // Fixed out-counts (moved verbatim from the old switch).
         t[@intFromEnum(BuiltinId.print)] = 0;
@@ -56743,11 +56938,10 @@ pub const Vm = struct {
         t[@intFromEnum(BuiltinId.io_write)] = 1;
         t[@intFromEnum(BuiltinId.io_close)] = 3;
         t[@intFromEnum(BuiltinId.file_close)] = 3;
-        t[@intFromEnum(BuiltinId.io_open)] = 3;
         t[@intFromEnum(BuiltinId.io_popen)] = 3;
-        t[@intFromEnum(BuiltinId.io_tmpfile)] = 3;
         t[@intFromEnum(BuiltinId.os_execute)] = 3;
-        t[@intFromEnum(BuiltinId.file_lines)] = 3;
+        // PUC f_lines (liolib.c): exactly one result — the iterator.
+        t[@intFromEnum(BuiltinId.file_lines)] = 1;
         t[@intFromEnum(BuiltinId.io_flush)] = 1;
         t[@intFromEnum(BuiltinId.file_flush)] = 1;
         t[@intFromEnum(BuiltinId.file_setvbuf)] = 1;
@@ -56857,14 +57051,26 @@ pub const Vm = struct {
     /// in builtin_const_out_len (see its doc comment for the contract).
     fn builtinOutLenDynamic(self: *Vm, id: BuiltinId, call_args: []const Value) usize {
         return switch (id) {
+            // PUC io_lines (liolib.c:388): four results [iterator, nil,
+            // nil, file] when it opens the file by name (toclose — the
+            // 4th is the generic-for to-be-closed variable), exactly one
+            // (the iterator) for the default-input forms. The window is
+            // exact; the count never shrinks below it.
             .io_lines => blk: {
-                if (call_args.len > 0 and call_args[0] == .String) break :blk 4;
-                break :blk 3;
+                if (call_args.len > 0 and call_args[0] != .Nil and
+                    stringCoercible(call_args[0])) break :blk 4;
+                break :blk 1;
             },
             // PUC ll_loadlib: 1 result on success, the (nil, msg, what)
             // triple on failure — the core reports the produced count via
             // last_builtin_out_count; the window covers the triple.
             .package_loadlib => 3,
+            // PUC io_open/io_tmpfile (liolib.c): 1 result on success (the
+            // file handle), the (nil, msg, errno) luaL_fileresult triple on
+            // failure — the arm reports the produced count via
+            // last_builtin_out_count; the window covers the triple.
+            .io_open => 3,
+            .io_tmpfile => 3,
             // P16.50-review-7 BLOCKER 4: io_read/file_read windows are
             // argument-derivable — one result per format (PUC io_read:
             // one result per format, fewer on EOF/failure, reported via
@@ -56878,15 +57084,6 @@ pub const Vm = struct {
             // the window must cover it (PUC g_read: a failing fread
             // returns 3 values regardless of the format count).
             .file_read => if (call_args.len <= 1) 3 else @max(call_args.len - 1, 3),
-            .io_lines_iter => blk: {
-                if (call_args.len == 0 or call_args[0] != .Table) break :blk 8;
-                const it = call_args[0].Table;
-                const n = if (self.getFieldOpt(it, "__fmts")) |v|
-                    if (v == .Table) v.Table.asize else 0
-                else
-                    0;
-                break :blk if (n == 0) 1 else n;
-            },
             .assert => call_args.len,
             .select => blk: {
                 if (call_args.len == 0) break :blk 0;
@@ -73013,9 +73210,10 @@ test "cidxcut1: registry slot owner — RIDX population, slot writes, GC re-mark
 
 /// One edge iteration of the review-15 BLOCKER 2 matrix: fresh VM, real
 /// file, fresh format interns, ONE full GC (emergency or regular) fired
-/// at allocation `edge` of the makeLinesIter construction, then the full
-/// verification: iterator identity (same file table, same format
-/// strings), file OPEN and registered, iterator EXECUTION, and the
+/// at allocation `edge` of the makeLinesClosure construction, then the
+/// full verification: iterator identity (CClosure(3+n) armed with the
+/// same file table and the same format strings), file OPEN and
+/// registered, iterator EXECUTION through the real C-call path, and the
 /// full-GC lifecycle (rooted → survives open; dropped → finalized then
 /// freed). Returns whether the GC fired (false ⇒ the construction used
 /// fewer allocations — the matrix is complete).
@@ -73023,15 +73221,17 @@ fn r15b2EdgeIteration(path: []const u8, edge: usize, regular: bool) !bool {
     const testing = std.testing;
     var vm: Vm = .init(testing.allocator, false);
     defer vm.deinit();
+    _ = try vm.setupMainHandle();
+    defer vm.freeStateHandle(vm.main_handle.?);
 
-    // Pre-warm the root buffers so makeLinesIter's own RootScope
+    // Pre-warm the root buffers so makeLinesClosure's own RootScope
     // reserve allocates nothing: the matrix then covers exactly
     // the construction window (every allocation AFTER the inputs are
     // rooted). The residual cold-buffer reserve edge is a RootScope
     // mechanism property shared by every constructor, not this defect —
     // see the report finding.
     {
-        var warm = try vm.openRootScope(8, 8);
+        var warm = try vm.openRootScope(1 + Vm.max_line_formats, 0);
         defer warm.close();
     }
 
@@ -73052,40 +73252,43 @@ fn r15b2EdgeIteration(path: []const u8, edge: usize, regular: bool) !bool {
 
     var emerg = R15B2EdgeEmergencyAlloc{ .base = testing.allocator, .vm = &vm, .edge = edge, .regular = regular };
     vm.alloc = emerg.allocator();
-    const r = vm.makeLinesIter(file_v, true, fmts[0..]);
+    const r = vm.makeLinesClosure(file_v, true, fmts[0..]);
     vm.alloc = testing.allocator;
-    const objv = try r;
+    const cl = try r;
 
-    // Identity: the iterator is fully wired with the SAME file table and
-    // the SAME format strings (pointer identity — a swept-and-recreated
-    // input would differ).
-    try testing.expect(objv == .Table);
-    const obj = objv.Table;
-    const mt = obj.metatable.?;
-    const callv = vm.getFieldOpt(mt, "__call").?;
-    try testing.expect(callv == .Builtin and callv.Builtin == .io_lines_iter);
-    const fv = vm.getFieldOpt(obj, "__file").?;
-    try testing.expect(fv == .Table and fv.Table == file_v.Table);
-    const acv = vm.getFieldOpt(obj, "__auto_close").?;
-    try testing.expect(acv == .Bool and acv.Bool);
-    const cev = vm.getFieldOpt(obj, "__closed_error").?;
-    try testing.expect(cev == .Bool and !cev.Bool);
-    const fmtsv = vm.getFieldOpt(obj, "__fmts").?;
-    try testing.expect(fmtsv == .Table);
-    const fmts_tbl = fmtsv.Table;
-    try testing.expectEqual(@as(usize, 2), fmts_tbl.array.len);
-    try testing.expect(fmts_tbl.array[0] == .String and fmts_tbl.array[0].String == fmts[0].String);
-    try testing.expect(fmts_tbl.array[1] == .String and fmts_tbl.array[1].String == fmts[1].String);
+    // Identity: the iterator is a CClosure(3+2) armed with the SAME file
+    // table and the SAME format strings (pointer identity — a
+    // swept-and-recreated input would differ).
+    try testing.expect(cl.proto == null and cl.c_func == &Vm.ioReadlineShim);
+    try testing.expectEqual(@as(usize, 5), cl.upvalues.len);
+    try testing.expect(cl.upvalues[0].value == .Table and cl.upvalues[0].value.Table == file_v.Table);
+    try testing.expect(cl.upvalues[1].value == .Int and cl.upvalues[1].value.Int == 2);
+    try testing.expect(cl.upvalues[2].value == .Bool and cl.upvalues[2].value.Bool);
+    try testing.expect(cl.upvalues[3].value == .String and cl.upvalues[3].value.String == fmts[0].String);
+    try testing.expect(cl.upvalues[4].value == .String and cl.upvalues[4].value.String == fmts[1].String);
     // The file survived the fired edge OPEN and registered.
     try testing.expect(vm.getManagedFile(file_v) != null);
-    try testing.expect(p50StillRegistered(&vm, .{ .table = obj }));
+    try testing.expect(p50StillRegistered(&vm, .{ .closure = cl }));
     try testing.expect(p50StillRegistered(&vm, .{ .table = file_v.Table }));
 
-    // EXECUTE the iterator: "*l" strips the newline, "*L" keeps it.
-    var outs = [_]Value{ .Nil, .Nil };
-    try vm.builtinIoLinesIter(&.{objv}, outs[0..]);
-    try testing.expect(outs[0] == .String and std.mem.eql(u8, outs[0].String.bytes(), "l1"));
-    try testing.expect(outs[1] == .String and std.mem.eql(u8, outs[1].String.bytes(), "l2\n"));
+    // EXECUTE the iterator through the real C-call path (apiCall →
+    // runClosure → callCFunction → ioReadlineShim): "*l" strips the
+    // newline, "*L" keeps it; a truthy first result carries a trailing
+    // read-nil (PUC g_read's fail-to-nil tail).
+    {
+        const ret = try vm.apiCall(.nonyieldable, .{ .Closure = cl }, &.{});
+        defer vm.alloc.free(ret);
+        try testing.expectEqual(@as(usize, 2), ret.len);
+        try testing.expect(ret[0] == .String and std.mem.eql(u8, ret[0].String.bytes(), "l1"));
+        try testing.expect(ret[1] == .String and std.mem.eql(u8, ret[1].String.bytes(), "l2\n"));
+    }
+    {
+        const ret = try vm.apiCall(.nonyieldable, .{ .Closure = cl }, &.{});
+        defer vm.alloc.free(ret);
+        try testing.expectEqual(@as(usize, 2), ret.len);
+        try testing.expect(ret[0] == .String and std.mem.eql(u8, ret[0].String.bytes(), "l3"));
+        try testing.expect(ret[1] == .Nil);
+    }
 
     // Full-GC lifecycle, iterator rooted: everything survives and the
     // file stays OPEN — it was never white at a cycle's separation point,
@@ -73095,26 +73298,28 @@ fn r15b2EdgeIteration(path: []const u8, edge: usize, regular: bool) !bool {
     {
         var scope = try vm.openRootScope(1, 0);
         defer scope.close();
-        _ = scope.protectValueAssumeCapacity(objv);
+        _ = scope.protectValueAssumeCapacity(.{ .Closure = cl });
         try vm.gcCycleFull();
     }
-    try testing.expect(p50StillRegistered(&vm, .{ .table = obj }));
-    try testing.expect(p50StillRegistered(&vm, .{ .table = mt }));
-    try testing.expect(p50StillRegistered(&vm, .{ .table = fmts_tbl }));
+    try testing.expect(p50StillRegistered(&vm, .{ .closure = cl }));
     try testing.expect(p50StillRegistered(&vm, .{ .table = file_v.Table }));
     try testing.expect(vm.getManagedFile(file_v) != null);
-    var outs2 = [_]Value{ .Nil, .Nil };
-    try vm.builtinIoLinesIter(&.{objv}, outs2[0..]);
-    try testing.expect(outs2[0] == .String and std.mem.eql(u8, outs2[0].String.bytes(), "l3"));
-    try testing.expect(outs2[1] == .Nil);
+    {
+        // EOF on the first format: 0 values; toclose auto-closes (once).
+        const ret = try vm.apiCall(.nonyieldable, .{ .Closure = cl }, &.{});
+        defer vm.alloc.free(ret);
+        try testing.expectEqual(@as(usize, 0), ret.len);
+    }
+    try testing.expect(vm.getManagedFile(file_v) == null);
+    // The closed check precedes any read on every later call.
+    try testing.expectError(error.RuntimeError, vm.apiCall(.nonyieldable, .{ .Closure = cl }, &.{}));
 
-    // Drop the iterator: cycle 1 sweeps obj/mt/fmts_tbl and finalizes
-    // (closes) the file — which stays registered (two-cycle finalization
+    // Drop the iterator: cycle 1 sweeps the closure and finalizes the
+    // file table (the fd is already auto-closed — the finalizer's close
+    // is idempotent) — which stays registered (two-cycle finalization
     // contract) — cycle 2 frees it.
     try vm.gcCycleFull();
-    try testing.expect(!p50StillRegistered(&vm, .{ .table = obj }));
-    try testing.expect(!p50StillRegistered(&vm, .{ .table = mt }));
-    try testing.expect(!p50StillRegistered(&vm, .{ .table = fmts_tbl }));
+    try testing.expect(!p50StillRegistered(&vm, .{ .closure = cl }));
     try testing.expect(vm.getManagedFile(file_v) == null);
     try testing.expect(p50StillRegistered(&vm, .{ .table = file_v.Table }));
     try vm.gcCycleFull();
@@ -73128,7 +73333,7 @@ test "P16.50-review-15 BLOCKER 2: io.lines roots the fresh file and formats acro
 
     // Real temp file: the defect shape is io.lines(filename) — a FRESH
     // managed file held only in a Zig local (builtinIoLines' ioOpenPath
-    // result) across makeLinesIter's construction allocations. The
+    // result) across the iterator closure's construction allocations. The
     // iterator must read real lines back after every fired edge.
     const io = stdio.activeIo();
     var path_buf: [128]u8 = undefined;
@@ -73172,7 +73377,7 @@ test "P16.50-review-15 BLOCKER 2: io.lines roots the fresh file and formats acro
         var vm: Vm = .init(testing.allocator, false);
         defer vm.deinit();
         {
-            var warm = try vm.openRootScope(8, 8);
+            var warm = try vm.openRootScope(1 + Vm.max_line_formats, 0);
             defer warm.close();
         }
         const snap0 = try P50Snapshot.take(&vm, testing.allocator);
@@ -73187,17 +73392,20 @@ test "P16.50-review-15 BLOCKER 2: io.lines roots the fresh file and formats acro
                 .resize_fail_index = 0,
             });
             vm.alloc = failing.allocator();
-            const r = vm.makeLinesIter(file_v, true, fmts[0..]);
+            const r = vm.makeLinesClosure(file_v, true, fmts[0..]);
             vm.alloc = testing.allocator;
-            if (r) |objv| {
+            if (r) |cl| {
                 boundary = fi;
-                // The one success edge publishes a fully-wired iterator.
-                try testing.expect(objv == .Table);
+                // The one success edge publishes a fully-armed iterator
+                // (CClosure(3+2): file, n, toclose, formats).
+                try testing.expect(cl.proto == null and cl.c_func == &Vm.ioReadlineShim);
+                try testing.expectEqual(@as(usize, 5), cl.upvalues.len);
+                try testing.expect(cl.upvalues[0].value == .Table and cl.upvalues[0].value.Table == file_v.Table);
                 var scope = try vm.openRootScope(1, 0);
                 defer scope.close();
-                _ = scope.protectValueAssumeCapacity(objv);
+                _ = scope.protectValueAssumeCapacity(.{ .Closure = cl });
                 try vm.gcCycleFull();
-                try testing.expect(p50StillRegistered(&vm, .{ .table = objv.Table }));
+                try testing.expect(p50StillRegistered(&vm, .{ .closure = cl }));
                 break;
             } else |e| {
                 try testing.expect(e == error.OutOfMemory);

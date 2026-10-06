@@ -157,7 +157,7 @@ extern fn _setjmp(jb: *anyopaque) c_int;
 extern fn _longjmp(jb: *anyopaque, val: c_int) noreturn;
 
 /// Explicit `u8` tag so this enum can be embedded in `ltable.NodeKeyPayload`
-/// (an `extern union` requiring extern-compatible field layouts). 149
+/// (an `extern union` requiring extern-compatible field layouts). 171
 /// variants fit comfortably in u8 (max 256). PUC's analogous `lua_Cfunction`
 /// is a pointer; we use a small enum tag because our builtins are dispatched
 /// by ID rather than by C function pointer.
@@ -201,7 +201,6 @@ pub const BuiltinId = enum(u8) {
     debug_debug,
     pairs,
     ipairs,
-    pairs_iter,
     ipairs_iter,
     rawget,
     rawset,
@@ -217,7 +216,6 @@ pub const BuiltinId = enum(u8) {
     io_output,
     io_close,
     io_type,
-    io_stderr_write,
     file_close,
     file_meta_close,
     file_write,
@@ -391,7 +389,6 @@ pub const BuiltinId = enum(u8) {
             .debug_debug => "debug.debug",
             .pairs => "pairs",
             .ipairs => "ipairs",
-            .pairs_iter => "pairs_iter",
             .ipairs_iter => "ipairs_iter",
             .rawget => "rawget",
             .rawset => "rawset",
@@ -407,7 +404,6 @@ pub const BuiltinId = enum(u8) {
             .io_output => "io.output",
             .io_close => "io.close",
             .io_type => "io.type",
-            .io_stderr_write => "io.stderr:write",
             .file_close => "FILE*:close",
             .file_meta_close => "FILE*::__close",
             .file_write => "FILE*:write",
@@ -26818,11 +26814,10 @@ pub const Vm = struct {
             .debug_debug => try self.builtinDebugDebug(args, outs),
             .pairs => try self.builtinPairs(args, outs),
             .ipairs => try self.builtinIpairs(args, outs),
-            .pairs_iter => try self.builtinPairsIter(args, outs),
             .ipairs_iter => try self.builtinIpairsIter(args, outs),
             .rawget => try self.builtinRawget(args, outs),
             .rawset => try self.builtinRawset(args, outs),
-            .io_write => try self.builtinIoWrite(false, args, outs),
+            .io_write => try self.builtinIoWrite(args, outs),
             .io_open => try self.builtinIoOpen(args, outs),
             .io_popen => try self.builtinIoPopen(args, outs),
             .io_tmpfile => try self.builtinIoTmpfile(args, outs),
@@ -26834,7 +26829,6 @@ pub const Vm = struct {
             .io_output => try self.builtinIoOutput(args, outs),
             .io_close => try self.builtinIoClose(args, outs),
             .io_type => try self.builtinIoType(args, outs),
-            .io_stderr_write => try self.builtinIoWrite(true, args, outs),
             .file_close => try self.builtinFileClose(args, outs),
             .file_meta_close => try self.builtinFileMetaClose(args, outs),
             .file_write => try self.builtinFileWrite(args, outs),
@@ -40022,6 +40016,11 @@ pub const Vm = struct {
                 if (outs.len > 1) outs[1] = cl.upvalues[uidx].get(self);
                 self.last_builtin_out_count = 2;
             },
+            // Owner: the only .Builtin values reachable from Lua are the
+            // stateful/upvalue classes not yet migrated to light
+            // publications (math.random/randomseed, the gmatch/io.lines
+            // iterator products, testc_*). Their PUC classes are C closures
+            // with real upvalues; parity for this arm lands with those cuts.
             .Builtin => {
                 if (uidx != 0) return;
                 if (outs.len > 0) {
@@ -41269,36 +41268,6 @@ pub const Vm = struct {
         if (outs.len > 2) outs[2] = .{ .Int = 0 };
     }
 
-    fn builtinPairsIter(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
-        if (outs.len == 0) return;
-        if (args.len < 2) return self.fail("pairs iterator: expected state and control", .{});
-        const state = try self.expectTable(args[0]);
-        const keys_v = self.getFieldOpt(state, "__keys") orelse return self.fail("pairs iterator: missing keys", .{});
-        const target_v = self.getFieldOpt(state, "__target") orelse return self.fail("pairs iterator: missing target", .{});
-        const keys = try self.expectTable(keys_v);
-        const target = try self.expectTable(target_v);
-
-        var idx: isize = -1;
-        const control = args[1];
-        if (control != .Nil) {
-            for (keys.array, 0..) |k, i| {
-                if (valuesEqual(k, control)) {
-                    idx = @intCast(i);
-                    break;
-                }
-            }
-            if (idx < 0) return;
-        }
-
-        const next_idx: usize = @intCast(idx + 1);
-        if (next_idx >= keys.array.len) return;
-        const key = keys.array[next_idx];
-        const val = try self.tableGetValue(target, key);
-
-        outs[0] = key;
-        if (outs.len > 1) outs[1] = val;
-    }
-
     fn builtinIpairsIter(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         outs[0] = .Nil;
@@ -41795,13 +41764,13 @@ pub const Vm = struct {
         if (outs.len > 0) outs[0] = args[0];
     }
 
-    fn builtinIoWrite(self: *Vm, to_stderr: bool, args: []const Value, outs: []Value) DispatchError!void {
-        var out = if (to_stderr) stdio.stderr() else stdio.stdout();
+    fn builtinIoWrite(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        var out = stdio.stdout();
         var target_file_v: Value = .Nil;
         var i: usize = 0;
         var argn: usize = 0;
         var ret_file: Value = .Nil;
-        if (!to_stderr and args.len > 0 and asFileTable(self, args[0]) != null) {
+        if (args.len > 0 and asFileTable(self, args[0]) != null) {
             // Method call syntax: <file>:write(...). Handle stdout/stderr objects.
             const io_v = try self.getGlobal("io");
             if (io_v == .Table) {
@@ -41818,7 +41787,7 @@ pub const Vm = struct {
                 }
             }
             i = 1;
-        } else if (!to_stderr) {
+        } else {
             // io.write(...) writes to current default output stream.
             const io_v = try self.getGlobal("io");
             if (io_v == .Table) {
@@ -41837,11 +41806,10 @@ pub const Vm = struct {
         }
         while (i < args.len) : (i += 1) {
             // For method calls, first arg is the receiver (file object). Ignore it.
-            if (to_stderr and i == 0 and args[i] == .Table) continue;
             argn += 1;
             switch (args[i]) {
                 .String, .Int, .Num => {},
-                else => return self.fail("bad argument #{d} to '{s}' (string expected, got {s})", .{ argn, if (to_stderr) "io.stderr:write" else "io.write", self.valueTypeName(args[i]) }),
+                else => return self.fail("bad argument #{d} to 'io.write' (string expected, got {s})", .{ argn, self.valueTypeName(args[i]) }),
             }
             const s = try self.valueToStringAlloc(args[i]);
             if (target_file_v != .Nil) {
@@ -41851,13 +41819,9 @@ pub const Vm = struct {
             } else {
                 out.writeAll(s) catch |e| switch (e) {
                     error.BrokenPipe => return,
-                    else => return self.fail("{s} write error: {s}", .{ if (to_stderr) "stderr" else "stdout", @errorName(e) }),
+                    else => return self.fail("stdout write error: {s}", .{@errorName(e)}),
                 };
             }
-        }
-        if (to_stderr) {
-            const io_v = try self.getGlobal("io");
-            if (io_v == .Table) ret_file = self.getFieldOpt(io_v.Table, "stderr") orelse .Nil;
         }
         if (outs.len > 0 and ret_file != .Nil) outs[0] = ret_file;
     }
@@ -56460,7 +56424,6 @@ pub const Vm = struct {
         t[@intFromEnum(BuiltinId.@"error")] = 0;
         t[@intFromEnum(BuiltinId.os_exit)] = 0;
         t[@intFromEnum(BuiltinId.io_write)] = 1;
-        t[@intFromEnum(BuiltinId.io_stderr_write)] = 1;
         t[@intFromEnum(BuiltinId.io_close)] = 3;
         t[@intFromEnum(BuiltinId.file_close)] = 3;
         t[@intFromEnum(BuiltinId.io_open)] = 3;
@@ -56481,7 +56444,6 @@ pub const Vm = struct {
         t[@intFromEnum(BuiltinId.math_randomseed)] = 2;
         t[@intFromEnum(BuiltinId.pairs)] = 4;
         t[@intFromEnum(BuiltinId.ipairs)] = 3;
-        t[@intFromEnum(BuiltinId.pairs_iter)] = 2;
         t[@intFromEnum(BuiltinId.ipairs_iter)] = 2;
         t[@intFromEnum(BuiltinId.coroutine_running)] = 2;
         // P16.50-review-7 BLOCKER 4: pcall/xpcall return their EXACT

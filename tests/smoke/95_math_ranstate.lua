@@ -2,8 +2,11 @@
 -- RanState userdata (PUC setrandfunc shape). Lua-observable lanes: fixed-seed
 -- sequence parity for every argument form (including the 1-arg interval,
 -- which must use rejection sampling, not modulo), debug.getupvalue/setupvalue/
--- upvalueid over the real C closures, getinfo, the field set, and coroutine
--- bodies (suspend/resume across calls, upvalue identity from inside a body).
+-- upvalueid over the real C closures, getinfo, the field set, coroutine
+-- bodies (suspend/resume across calls, upvalue identity from inside a body),
+-- and luaL_checkinteger argument conversion parity (numeric strings incl.
+-- boundary forms, integral floats, PUC rejection classes, sequence after a
+-- failed call).
 -- The debug.setupvalue lanes only install a RanState userdata value;
 -- installing any other class into the slot is PUC UB and is not reproduced.
 
@@ -84,3 +87,40 @@ local co8 = coroutine.create(function()
   return n, type(v)
 end)
 print("v8:", coroutine.resume(co8))
+
+-- luaL_checkinteger conversion parity: numeric strings (decimal, hex,
+-- whitespace-padded, exponent forms), integral floats, and the PUC
+-- rejection classes (fractional, non-numeric, out-of-range, Zig-only
+-- numeral forms PUC rejects). pcall lanes keep the error-text function
+-- name byte-identical across runtimes.
+local function lane(...)
+  local r = table.pack(pcall(...))
+  print(table.unpack(r))
+end
+math.randomseed(42, 7)
+lane(math.random, "10")
+math.randomseed(42, 7)
+lane(math.random, " 0x2 ", "1e1")
+math.randomseed(42, 7)
+lane(math.random, " +10 ")
+math.randomseed(42, 7)
+lane(math.random, 1.0, 5.0)
+lane(math.random, 2.5)
+lane(math.random, "3.5")
+lane(math.random, "1e999")
+lane(math.random, "9223372036854775808")
+lane(math.random, "abc")
+lane(math.random, "inf")
+lane(math.random, "0b101")
+lane(math.random, "1_000")
+lane(math.random, true)
+lane(math.randomseed, "42", "7")
+lane(math.randomseed, 42, nil)
+lane(math.randomseed, "42")
+lane(math.randomseed, "42.5")
+lane(math.randomseed, "42", "abc")
+-- the draw happens before the argument check, so a failed call still
+-- advances the sequence; the next draw must agree
+math.randomseed(42, 7)
+lane(math.random, "abc")
+lane(math.random, 100)

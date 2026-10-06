@@ -24,7 +24,12 @@
  * allocator: every trial either succeeds with a usable iterator or fails
  * LUA_ERRMEM with a string object, survives a real GC, and the retry
  * succeeds; the per-runtime k-matrix is not a parity contract, so both
- * outcomes print the same normalized verdict). */
+ * outcomes print the same normalized verdict), plus the signed-hex
+ * read("n") conversion (PUC l_str2int recognizes 0x after the optional
+ * sign and wraps in lua_Unsigned: a signed hex token reads back as an
+ * integer with the exact value, hex floats/decimals keep their kinds,
+ * and a failed read leaves the look-ahead for the next read) through
+ * all three public paths: file:read, file:lines and io.read. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -332,6 +337,85 @@ int main(void) {
             lua_pop(Lc, 1);
         }
         lua_close(Lc);
+    }
+
+    /* --- P12: signed hex through read("n") keeps the integer kind (PUC
+     * l_str2int recognizes the 0x prefix after the optional sign and
+     * accumulates in lua_Unsigned with wrap). All three public paths
+     * share the one conversion: file:read here via the C API, file:lines
+     * and io.read (through io.input) in the chunk below. --- */
+    const char *SHEX = "/tmp/luazig_c52_shex.txt";
+    f = fopen(SHEX, "w");
+    fputs("+0x20000000000001 -0x10 +0x10 0X10 -0X10 0x10 "
+          "0xFFFFFFFFFFFFFFFF +0xFFFFFFFFFFFFFFFF -0xFFFFFFFFFFFFFFFF "
+          "+0x8000000000000000 -0x8000000000000000 0x10000000000000000 "
+          "0x1.8 -0x1p3 42 -3.5 0x10Z 42X tail\n", f);
+    fclose(f);
+
+    snprintf(chunk, sizeof(chunk), "return io.open('%s')", SHEX);
+    if (luaL_dostring(L, chunk)) return 1;
+    int sf = lua_gettop(L);
+    for (int i = 1; i <= 18; i++) {
+        lua_getfield(L, sf, "read");
+        lua_pushvalue(L, sf);
+        lua_pushliteral(L, "n");
+        st = lua_pcall(L, 2, 1, 0);
+        if (st != LUA_OK) {
+            printf("P12.f:read[%d]: error %s\n", i, lua_tostring(L, -1));
+            lua_pop(L, 1);
+            fails++;
+            break;
+        }
+        /* lua_tostring coerces numbers in situ (lua_tolstring), so print
+         * the value from a copy and query the original in a fixed order */
+        lua_pushvalue(L, -1);
+        const char *val = lua_tostring(L, -1);
+        printf("P12.f:read[%d]: type=%s isinteger=%d val=%s\n", i,
+               luaL_typename(L, -2), lua_isinteger(L, -2),
+               val ? val : "?");
+        lua_pop(L, 1);
+        if (i == 1) check(lua_isinteger(L, -1), "P12.signed.hex.int");
+        int stop = lua_isnil(L, -1);
+        lua_pop(L, 1);
+        if (stop) break;
+    }
+    lua_getfield(L, sf, "read");
+    lua_pushvalue(L, sf);
+    lua_pushliteral(L, "l");
+    st = lua_pcall(L, 2, 1, 0);
+    if (st != LUA_OK) {
+        printf("P12.f:read.rest: error %s\n", lua_tostring(L, -1));
+        fails++;
+        lua_pop(L, 1);
+    } else {
+        printf("P12.f:read.rest: %s\n",
+               lua_isstring(L, -1) ? lua_tostring(L, -1) : "?");
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);  /* the file */
+
+    char lchunk[640];
+    snprintf(lchunk, sizeof(lchunk),
+        "local f = assert(io.open('%s'))\n"
+        "local i = 0\n"
+        "for v in f:lines('n') do i = i + 1\n"
+        "  print('P12.lines ' .. i .. ' ' .. tostring(math.type(v)) .. ' ' .. tostring(v))\n"
+        "end\n"
+        "print('P12.lines.count ' .. i)\n"
+        "print('P12.lines.rest ' .. tostring(f:read('l')))\n"
+        "f:close()\n"
+        "local g = assert(io.open('%s'))\n"
+        "io.input(g)\n"
+        "for j = 1, 18 do\n"
+        "  local v = io.read('n')\n"
+        "  print('P12.io.read ' .. j .. ' ' .. tostring(math.type(v)) .. ' ' .. tostring(v))\n"
+        "  if v == nil then break end\n"
+        "end\n"
+        "print('P12.io.read.rest ' .. tostring(io.read('l')))\n"
+        "io.input():close()\n", SHEX, SHEX);
+    if (luaL_dostring(L, lchunk)) {
+        printf("P12: dostring error: %s\n", lua_tostring(L, -1));
+        return 1;
     }
 
     printf("fails:%d\n", fails);

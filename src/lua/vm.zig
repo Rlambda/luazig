@@ -42501,7 +42501,11 @@ pub const Vm = struct {
             if (!valid or bn == 0) return .Nil;
             const s = buff[0..bn];
             var parsed: ?Value = null;
-            if (s.len >= 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X')) {
+            // PUC l_str2int recognizes the hex prefix after the optional
+            // sign, so a signed hex token converts as an integer (with
+            // two's-complement wrap), never as a float.
+            const s_hex = if (s.len > 0 and (s[0] == '-' or s[0] == '+')) s[1..] else s;
+            if (s_hex.len >= 2 and s_hex[0] == '0' and (s_hex[1] == 'x' or s_hex[1] == 'X')) {
                 if (parseHexStringIntWrap(s)) |iv| {
                     parsed = .{ .Int = iv };
                 } else if (std.fmt.parseFloat(f64, s)) |n| {
@@ -56818,11 +56822,11 @@ pub const Vm = struct {
         const table = comptime blk: {
             var t = [_]bool{false} ** 256;
             for ([_]BuiltinId{
-                .coroutine_close, .utf8_codepoint, .io_read,
-                .file_read,       .file_close,     .io_close,        .io_popen,
-                .os_execute,      .io_lines,       .debug_getupvalue,
-                .string_find,     .string_match,   .package_loadlib,
-                .io_open,         .io_tmpfile,
+                .coroutine_close,  .utf8_codepoint, .io_read,
+                .file_read,        .file_close,     .io_close,
+                .io_popen,         .os_execute,     .io_lines,
+                .debug_getupvalue, .string_find,    .string_match,
+                .package_loadlib,  .io_open,        .io_tmpfile,
             }) |d| t[@intFromEnum(d)] = true;
             break :blk t;
         };
@@ -56925,10 +56929,11 @@ pub const Vm = struct {
         var t = [_]?u16{1} ** @typeInfo(BuiltinId).@"enum".fields.len;
         // Argument-dependent (dynamic) out-counts — builtinOutLenDynamic.
         for ([_]BuiltinId{
-            .io_lines,        .assert,       .select,
-            .string_byte,     .string_find,  .string_match, .utf8_codepoint,
-            .string_unpack,   .table_unpack, .io_read,      .file_read,
-            .package_loadlib, .io_open,      .io_tmpfile,
+            .io_lines,       .assert,        .select,
+            .string_byte,    .string_find,   .string_match,
+            .utf8_codepoint, .string_unpack, .table_unpack,
+            .io_read,        .file_read,     .package_loadlib,
+            .io_open,        .io_tmpfile,
         }) |dyn_id| t[@intFromEnum(dyn_id)] = null;
         // Fixed out-counts (moved verbatim from the old switch).
         t[@intFromEnum(BuiltinId.print)] = 0;

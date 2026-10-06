@@ -15,6 +15,12 @@
 -- pcall: the immediate caller is a C function), debug.setupvalue on the
 -- file upvalue (swapping the handle changes what the iterator reads), and
 -- statefulness across a full GC and across coroutine suspension.
+-- Plus the signed-hex read("n") conversion (PUC l_str2int recognizes 0x
+-- after the optional sign and wraps in lua_Unsigned): a signed hex token
+-- reads back as an integer with the exact value (even beyond binary64
+-- precision), hex floats/decimals keep their PUC kinds, and a failed
+-- read leaves the look-ahead for the next read — on all three public
+-- paths: file:read, file:lines and io.read.
 
 local P = "/tmp/luazig_s98_lines.txt"
 local N = "/tmp/luazig_s98_nums.txt"
@@ -122,3 +128,48 @@ end)
 print("coro.1:", co())
 print("coro.2:", co())
 print("coro.3:", co())
+
+-- signed hex through read("n") on all three public paths
+local SX = "/tmp/luazig_s98_shex.txt"
+local sx = assert(io.open(SX, "w"))
+sx:write("+0x20000000000001 -0x10 +0x10 0X10 -0X10 0x10 0xFFFFFFFFFFFFFFFF"
+  .. " +0xFFFFFFFFFFFFFFFF -0xFFFFFFFFFFFFFFFF +0x8000000000000000"
+  .. " -0x8000000000000000 0x10000000000000000 0x1.8 -0x1p3 42 -3.5"
+  .. " 0x10Z 42X tail\n")
+sx:close()
+local function kindval(v) return tostring(math.type(v)), tostring(v) end
+
+do
+  local f = assert(io.open(SX))
+  for i = 1, 18 do
+    local v = f:read("n")
+    print("shex.f:read:", i, kindval(v))
+    if v == nil then break end
+  end
+  print("shex.f:read.rest:", f:read("l"))
+  f:close()
+end
+
+do
+  local f = assert(io.open(SX))
+  local n = 0
+  for v in f:lines("n") do
+    n = n + 1
+    print("shex.lines:", n, kindval(v))
+  end
+  print("shex.lines.count:", n)
+  print("shex.lines.rest:", f:read("l"))
+  f:close()
+end
+
+do
+  local f = assert(io.open(SX))
+  io.input(f)
+  for i = 1, 18 do
+    local v = io.read("n")
+    print("shex.io.read:", i, kindval(v))
+    if v == nil then break end
+  end
+  print("shex.io.read.rest:", io.read("l"))
+  io.input():close()
+end

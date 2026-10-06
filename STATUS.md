@@ -45,48 +45,35 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
-- [ ] **P3(math.random) research correction: RanState CClosure-миграция
-  ещё не готова к implementation.** Target: RanState
-  userdata upvalue CClosure(1) на каждое открытие; удалить Vm.rng_state
-  и BuiltinId.math_random* arms; project() rejection-путь в acceptance.
-  REVIEW 2026-10-06: **CORRECT** для исследовательского handoff.
-  Throwaway prototype заменил `os.tmpname` RNG на `makeRandomSeed()`;
-  два последовательных вызова в одну секунду возвращают одинаковое имя
-  (PUC и baseline luazig дают разные). Это внесённая предлагаемым
-  дизайном наблюдаемая регрессия, затрагивающая сохранность данных при
-  использовании временных имён; нужен независимый stateful producer и
-  доказательство отсутствия влияния на math RanState. Чистая валидная
-  coroutine-body проба с seed(42,7) даёт `true 49 dead` и в PUC, и в
-  prototype; `p3res_dbg.lua` сначала заменяет RanState upvalue числом,
-  поэтому поздний сбой — PUC UB, а не доказанный дефект coroutine lane.
-  C-проба 18/18, OOM k=1..12 и fixed-seed trail остаются полезным
-  evidence только для проверенных осей; perf ~1.85–2.05x раскрыт.
-  Correction scope — `prompt.md`; не выдавать implementation handoff
-  R2 VERDICT (p3r2, 2026-10-05; отчёт /tmp/opencode/p3r2_report.md,
-  артефакты /tmp/opencode/p3r2_*): first-wrong-op подтверждён
-  (makeRandomSeed: секунды+адрес локала совпадают на последовательных
-  вызовах -> коллизия os.tmpname()x2, координатор воспроизвёл лично).
-  Выбран T1 — STATELESS producer: Zig-нативный std.Io.Dir.createFile(
-  .exclusive) (O_EXCL) + std.Io.random, PUC-шаблон /tmp/lua_XXXXXX,
-  файл создаётся+закрывается (0600), hard-fail -> PUC-текст ошибки;
-  ВЛАДЕЛЬЦА СОСТОЯНИЯ НЕТ — Vm.rng_state удаляется без преемника.
-  Отвергнуты: per-VM counter (2-й mutable owner), makeRandomSeed
-  (доказанная коллизия), createFileAtomic (не mkstemp-семантика).
-  Evidence (координатор сверил артефакты лично: coro2/tmp2 IDENTICAL):
-  positive 13/13 байт-идентично (1000 уникальных имён, shape, файлы,
-  изоляция math, post-GC, two-states), C-проба 10/10, чистые
-  coroutine-пробы v1-v6,v8 + второй luaopen_math на coroutine handle
-  byte-identical; FI fd-exhaustion (catchable, байт-идентично с
-  traceback) и OOM-transport идентичны; KEEP-lanes переподтверждены
-  (18/18, OOM k=1..12, fixed-seed). ВЕРДИКТ: P3 MIGRATION-READY —
-  cut = p3res §5.1 items 1,2,4,5,6 + T1 вместо item 3. Perf: T1 ~2x
-  только cold syscall-bound tmpname; math 1.85-2.05x без изменений
-  (диагностические; paired A/B-план сохранён). Findings: F3 MEDIUM
-  pre-existing (argerror call-site имена 'random' vs 'math.random');
-  F8 build-note (repo liblua.so без LUA_USE_POSIX); F9 disclosure
-  (случайно удалён /tmp/luazig_p2f_review_test.log при очистке по
-  паттерну; фаза P2 закрыта, дескрипторов нет).
-  до независимого tmpname owner и clean coroutine oracle.
+- [ ] **P3(math.random) implementation ready: RanState CClosure-миграция.**
+  Утверждённый A-full target: свежий RanState userdata как общий upvalue
+  двух CClosure(1) на каждое `luaopen_math`; удалить `Vm.rng_state` и
+  `BuiltinId.math_random*`, включить 1-arg `project()` rejection-путь.
+  Первое исследование (`e666b53`) отклонено: его `os.tmpname` producer
+  через `makeRandomSeed()` возвращал одинаковые имена подряд; поздняя
+  coroutine-ошибка следовала за недопустимой подменой upvalue, а чистый
+  вызов даёт `true 49 dead` в PUC и prototype.
+  REVIEW 2026-10-06: **ACCEPT + RECORD** research correction `cde439d`/
+  `b407d89` (`/tmp/opencode/p3r2_report.md`). Независимо повторена
+  1000-вызовная проба: 1000 уникальных имён, 1000 созданных и удалённых
+  файлов, независимость от `math.randomseed`, работа после GC; чистые
+  coroutine-вызовы совпали с PUC. C-пробы двух states и повторного
+  `luaopen_math` совпадают по сохранённым raw outputs. Выбран T1:
+  `std.Io.random` + exclusive create с retry, форма `/tmp/lua_XXXXXX`,
+  mode 0600, закрытый fd; uniqueness принадлежит filesystem, второго
+  VM RNG-owner нет. Repo `liblua.so` без `LUA_USE_POSIX`; tmpname C-oracle
+  требует POSIX-сборки, как в research.
+  RECORD: OOM matrix `tmpname` не побайтово одинакова целиком: PUC
+  ошибается при k=1, prototype при k=1,2 из-за второй аллокации;
+  падающие случаи сохраняют ERRMEM/string, GC и повторное использование.
+  `pcall` hard-fail prototype добавляет позиционный prefix (известный
+  fail()-family gap); direct форма и текст ошибки совпадают. Prototype
+  сохранил ранний `outs.len == 0` return: implementation обязана проверить
+  PUC-side effect создания файла и при игнорируемом результате. Это
+  MEDIUM evidence gap, не новая неопределённость owner-дизайна.
+  Cut: p3res §5.1 items 1,2,4,5,6 + T1 вместо item 3, с gates нового
+  `prompt.md`. Prototype perf: math.random ~1.85–2.05x и tmpname ~2x
+  медленнее в отдельных микропробах; финального paired измерения ещё нет.
 
 - [ ] **debug.setupvalue(f, n, g()) multret-tail: zig устанавливает
   args[2] вместо top-of-stack (BLOCKER-класс, pre-existing; найден

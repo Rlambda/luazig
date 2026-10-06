@@ -1150,16 +1150,40 @@ pub const State = struct {
         return self.loadbuffer(source.bytes, source.name);
     }
 
+    /// PUC luaD_pcall's error publication (ldo.c:1090-1095) for a failure of
+    /// the call's own marshalling/poscall steps while the boundary is
+    /// already armed: close every TBC mark above the pcall entry with the
+    /// in-flight error, restore the stack to the callee's func level,
+    /// install the error object at the func slot (luaD_seterrorobj), and
+    /// return the raw status. Allocation-free by construction: the object
+    /// comes from the armed err state (OOM installs the fixed
+    /// "not enough memory" literal), and the push lands inside the pre-call
+    /// window capacity (func_slot + 1 was occupied by the callee before the
+    /// call), so the publication itself cannot fail under the same
+    /// exhausted allocator.
+    fn pcallPublishBoundaryError(
+        self: *State,
+        th: *vm_mod.Thread,
+        act: *vm_mod.Thread,
+        tbc_base: usize,
+        func_slot: usize,
+        e: anyerror,
+    ) Status {
+        self.vm.apiCloseConventionalPcallBoundary(act, tbc_base);
+        th.top = func_slot;
+        if (e == error.OutOfMemory) self.vm.setOutOfMemoryError();
+        const errval: vm_mod.Value = if (act.err_has_obj) act.err_obj else .Nil;
+        self.vm.cWindowPush(th, errval) catch return .memory_error;
+        return if (e == error.OutOfMemory)
+            .memory_error
+        else if (act.err_is_errerr) .error_handler_error else .runtime_error;
+    }
+
     pub fn pcall(self: *State, nargs: usize, nresults: i32) error{ MainDestined, YieldAbsorbed }!Status {
         const th = self.curThread();
         if (self.count() < nargs + 1) return .runtime_error;
         const func_slot = th.top - nargs - 1;
         const callee = th.stack[func_slot];
-        // The argument slice would alias th.stack, which the nested
-        // execution may grow (realloc) — dupe it across the apiCall
-        // boundary (PUC precall reads the args in place on the one stack).
-        const args = self.vm.alloc.dupe(vm_mod.Value, th.stack[func_slot + 1 .. th.top]) catch return .memory_error;
-        defer self.vm.alloc.free(args);
         // P16.31 Cut 1 (PUC lapi.c:1095-1097 + ldo.c f_call): every caller of
         // this method is a CONVENTIONAL pcall — lua_pcallk's `k == NULL ||
         // !yieldable(L)` branch (c_api lua_pcallk, the lua_pcall macro,
@@ -1191,11 +1215,26 @@ pub const State = struct {
         // catch below restores the frame level itself, exactly like PUC's
         // `L->ci = old_ci`.
         const saved_frame_count = act.call_frames.len();
-        // PUC luaD_pcall arms the thread's own boundary for the call's
-        // extent (protected_depth — the errorJmp-armed fact a cross-thread
-        // close on THIS thread branches on at its raise).
+        // PUC luaD_pcall arms the thread's own boundary BEFORE f_call runs
+        // (protected_depth — the errorJmp-armed fact a cross-thread close on
+        // THIS thread branches on at its raise): the call's WHOLE extent —
+        // including this port's own argument marshalling below — executes
+        // inside the protected boundary, and every failure in it publishes
+        // through the boundary (region close, old_top restore, seterrorobj),
+        // never as a bare status with the caller's window untouched. PUC
+        // itself needs no marshalling (precall reads the args in place on
+        // the one stack); the dupe is this port's cross-boundary copy, so
+        // its OOM takes the same publication path as any other failure in
+        // the call.
         th.protected_depth += 1;
         defer th.protected_depth -= 1;
+        // The argument slice would alias th.stack, which the nested
+        // execution may grow (realloc) — dupe it across the apiCall
+        // boundary (PUC precall reads the args in place on the one stack).
+        const args = self.vm.alloc.dupe(vm_mod.Value, th.stack[func_slot + 1 .. th.top]) catch {
+            return self.pcallPublishBoundaryError(th, act, tbc_base, func_slot, error.OutOfMemory);
+        };
+        defer self.vm.alloc.free(args);
         const ret = self.vm.apiCall(.nonyieldable, callee, args) catch |e| {
             // PUC luaD_pcall with status LUA_OK (the unarmed raw-yield
             // rethrow absorbed here): NO recovery — the abandoned callee
@@ -1278,8 +1317,14 @@ pub const State = struct {
 
         // PUC poscall moveresults to the callee's func slot: honors the
         // fixed-nresults promise with nil-fill (class 3), MULTRET copies
-        // all, 0 drops all.
-        self.vm.cWindowMoveResults(th, func_slot, ret, nresults) catch return .memory_error;
+        // all, 0 drops all. PUC's moveresults runs inside f_call, i.e.
+        // inside the protected boundary: an OOM/overflow failure here
+        // publishes through the boundary like any other failure in the
+        // call (the publication is allocation-free — see
+        // pcallPublishBoundaryError).
+        self.vm.cWindowMoveResults(th, func_slot, ret, nresults) catch |e| {
+            return self.pcallPublishBoundaryError(th, act, tbc_base, func_slot, e);
+        };
         return .ok;
     }
 

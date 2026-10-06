@@ -478,31 +478,42 @@ int main(void) {
     /* --- P5d: allocation failure during error-message formatting ---
      * A warmup call with the same shape (valid argument) runs before the
      * countdown is armed, so k can only hit allocations of the protected
-     * call and the raise itself, not one-time stack/frame growth. Verdict
-     * classes (normalized like the suite 49/50 OOM lanes — the per-runtime
-     * allocation structure is not a parity contract; every text inside a
-     * class is checked exactly):
-     *   clean-full       the freeze never hit the raise: ERRRUN with the
-     *                    exact full PUC message;
-     *   degraded-recovered  the freeze hit the protected call or the
-     *                    raise's message construction. Accepted shapes:
-     *                    LUA_ERRMEM with the fixed "not enough memory"
-     *                    string object (PUC luaM_error replaces the
-     *                    original error — never a degraded RuntimeError);
-     *                    LUA_ERRMEM from the call's own argument
-     *                    marshalling (luazig allocates there and fails
-     *                    before consuming anything — no error object, a
-     *                    known separate C-API item); or the oracle's
-     *                    staged-assembly artifact (PUC builds
-     *                    luaL_argerror through the stack —
-     *                    pushglobalfuncname pushes the resolved name,
-     *                    luaL_error concats the pieces — so a freeze
-     *                    hitting the final assembly surfaces the
-     *                    half-assembled context as an ERRRUN object).
-     *                    Every shape must fully recover: the retried call
-     *                    raises the exact full message and the VM stays
-     *                    usable. Aggregates (full-seen/errmem-seen) keep
-     *                    the matrix non-vacuous on both runtimes. */
+     * call and the raise itself, not one-time stack/frame growth. The
+     * armed window also contains this port's own argument marshalling
+     * (luazig dupes the args across the call boundary; PUC reads them in
+     * place and has no such step) — after the boundary-publication fix a
+     * marshalling OOM is observably identical to any other in-call OOM.
+     *
+     * The verdict is computed from the RAW post-call state — no stack
+     * restoration happens before it: a conforming lua_pcall leaves exactly
+     * the callee's func slot + 1 value on the stack (the error object, or
+     * the single result) for EVERY outcome, having consumed the callee and
+     * its arguments. Verdict classes (which k lands in which class is the
+     * per-runtime allocation structure, not a parity contract; every
+     * status/object/text inside a class is checked exactly):
+     *   clean-full      st==LUA_ERRRUN and the object is the EXACT full
+     *                   PUC message (the freeze missed the raise's message
+     *                   assembly, or hit only after the object existed);
+     *   oom-recovered   the freeze hit the protected call or the raise's
+     *                   message assembly. Accepted shapes, each exact:
+     *                   LUA_ERRMEM with the fixed "not enough memory"
+     *                   string object (PUC luaD_seterrorobj(ERRMEM) —
+     *                   luazig answers every assembly edge this way), or
+     *                   the oracle's staged-assembly artifact: PUC 5.5
+     *                   builds luaL_argerror through the stack, and a
+     *                   freeze hitting luaL_error's final pushvfstring
+     *                   leaves pushglobalfuncname's "math.random" piece as
+     *                   the top value (addstr2buff records the failure
+     *                   without throwing; clearbuff's rawrunprotected
+     *                   swallows pushbuff's ERRMEM throw, so nothing is
+     *                   pushed; lua_concat over luaL_where's "" then keeps
+     *                   the piece and lua_error raises it) — accepted only
+     *                   as the EXACT "math.random" string, never as an
+     *                   arbitrary non-empty message.
+     * Every accepted edge must fully recover: a full GC cycle, the retried
+     * call raising the exact full message at the exact func-slot+1 top,
+     * and a usable VM. Aggregates (full-seen/errmem-seen) keep the matrix
+     * non-vacuous on both runtimes. */
     build_expect_full();
     int full_seen = 0, errmem_seen = 0;
     for (int k = 1; k <= 8; k++) {
@@ -539,53 +550,51 @@ int main(void) {
         lua_pushvalue(L, mt);
         int st = lua_pcall(L, 1, 1, 0);
         countdown = -1; frozen = 0;
+        /* RAW verdict: the post-call window is inspected before ANY
+         * cleanup — func slot + 1 value, whatever the outcome was */
         const char *verdict;
-        int need_recovery = 0;
-        if (st == LUA_OK) {
+        int accepted = 0;
+        if (lua_gettop(L) != pre_top + 2) {
+            verdict = "VIOLATION(top)";
+        } else if (st == LUA_OK) {
             verdict = "VIOLATION(noerror)";
-            lua_pop(L, 1);
-        } else if (st == LUA_ERRRUN) {
-            const char *msg = lua_tostring(L, -1);
-            if (msg != NULL && strcmp(msg, expect_full) == 0) {
-                verdict = "clean-full";
-                full_seen = 1;
-            } else if (msg != NULL && msg[0] != '\0') {
-                /* the oracle's staged-assembly artifact (see above) */
-                verdict = "degraded-recovered";
-                need_recovery = 1;
-            } else {
-                verdict = "VIOLATION(msg)";
-            }
-            lua_pop(L, 1);
         } else if (st == LUA_ERRMEM) {
-            if (lua_type(L, -1) == LUA_TSTRING) {
-                const char *m = lua_tostring(L, -1);
-                if (m == NULL || strcmp(m, "not enough memory") != 0) {
-                    verdict = "VIOLATION(errtype)";
-                } else {
-                    verdict = "degraded-recovered";
-                    errmem_seen = 1;
-                }
-                lua_pop(L, 1);
+            const char *m = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : NULL;
+            if (m != NULL && strcmp(m, "not enough memory") == 0) {
+                verdict = "oom-recovered";
+                accepted = 1;
+                errmem_seen = 1;
             } else {
-                /* the argument-marshalling shape: the call consumed
-                 * nothing and pushed no object (see above) */
-                verdict = "degraded-recovered";
-                lua_settop(L, pre_top);   /* undo the unconsumed call setup */
+                verdict = "VIOLATION(errmem-object)";
             }
-            need_recovery = 1;
+        } else if (st == LUA_ERRRUN) {
+            const char *m = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : NULL;
+            if (m != NULL && strcmp(m, expect_full) == 0) {
+                verdict = "clean-full";
+                accepted = 1;
+                full_seen = 1;
+            } else if (m != NULL && strcmp(m, "math.random") == 0) {
+                /* the oracle's staged-assembly artifact (see above) */
+                verdict = "oom-recovered";
+                accepted = 1;
+            } else {
+                verdict = "VIOLATION(errrun-object)";
+            }
         } else {
             verdict = "VIOLATION(status)";
-            lua_pop(L, 1);
         }
-        if (need_recovery) {
+        /* cleanup and recovery run only AFTER the verdict was fixed, and
+         * cannot influence it: pop the error object down to the math
+         * table (the C client's ordinary pop of a conforming window) */
+        if (accepted) {
+            lua_pop(L, 1);
             lua_gc(L, LUA_GCCOLLECT, 0);
-            /* recovery + VM reuse after the failure: the same call must
-             * raise the full message, and the state must stay usable */
+            /* the same call must raise the exact full message at the
+             * exact func-slot+1 top */
             lua_getfield(L, -1, "random");
             lua_pushvalue(L, mt);
             int st2 = lua_pcall(L, 1, 1, 0);
-            if (st2 != LUA_ERRRUN) {
+            if (st2 != LUA_ERRRUN || lua_gettop(L) != pre_top + 2) {
                 verdict = "VIOLATION(retry-status)";
                 lua_pop(L, 1);
             } else {
@@ -594,6 +603,7 @@ int main(void) {
                     verdict = "VIOLATION(retry-msg)";
                 lua_pop(L, 1);
             }
+            /* VM reuse after the failure: reseed + draw must work */
             lua_getfield(L, -1, "randomseed");
             lua_pushinteger(L, 42); lua_pushinteger(L, 7);
             int st3 = lua_pcall(L, 2, 0, 0);

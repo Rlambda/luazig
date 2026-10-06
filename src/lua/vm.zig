@@ -1,6 +1,5 @@
 const std = @import("std");
 
-/// TEMPORARY debug gate for the P2b crash diagnosis; removed before handoff.
 const LuaSource = @import("source.zig").Source;
 const LuaLexer = @import("lexer.zig").Lexer;
 const LuaParser = @import("parser.zig").Parser;
@@ -217,7 +216,6 @@ pub const BuiltinId = enum(u8) {
     io_close,
     io_type,
     file_close,
-    file_meta_close,
     file_write,
     file_read,
     file_seek,
@@ -405,7 +403,6 @@ pub const BuiltinId = enum(u8) {
             .io_close => "io.close",
             .io_type => "io.type",
             .file_close => "FILE*:close",
-            .file_meta_close => "FILE*::__close",
             .file_write => "FILE*:write",
             .file_read => "FILE*:read",
             .file_seek => "FILE*:seek",
@@ -12844,6 +12841,15 @@ pub const Vm = struct {
             // the flag keeps this defer from reading the destroyed state.
             var ccall_unit_held = true;
             defer if (ccall_unit_held) state.owner_thread.ccallExit(ccall_mode);
+            // PUC funcnamefromcode (ldebug.c): OP_CLOSE and OP_RETURN map
+            // to TM_CLOSE — the __close callee's call-site name is "close".
+            // The error-unwind post (.unwind_frame) keeps the closing
+            // frame's pc at the error point, where funcnamefromcode has no
+            // TM_CLOSE case, and .retry_tailcall reads OP_TAILCALL (the
+            // tail-callee's own name) — neither gets the close name.
+            if (state.post == .advance_instruction or state.post == .return_frame) {
+                self.setDebugName(exec_frames.getPtr(parent_index), "metamethod", "close");
+            }
             self.runCloseMetamethod(obj, state.current_err) catch |close_err| switch (close_err) {
                 error.RuntimeError => {
                     // Policy split as the arms above: yieldable aborts the
@@ -26830,7 +26836,6 @@ pub const Vm = struct {
             .io_close => try self.builtinIoClose(args, outs),
             .io_type => try self.builtinIoType(args, outs),
             .file_close => try self.builtinFileClose(args, outs),
-            .file_meta_close => try self.builtinFileMetaClose(args, outs),
             .file_write => try self.builtinFileWrite(args, outs),
             .file_read => try self.builtinFileRead(args, outs),
             .file_seek => try self.builtinFileSeek(args, outs),
@@ -27564,10 +27569,11 @@ pub const Vm = struct {
         const file_mt = try self.allocTableNoGc();
         try self.setField(file_mt, "__name", .{ .String = try self.internStr("FILE*") });
         // PUC liolib.c metameth[]: __index is the method table (set on the
-        // file objects below), __gc/__close/__tostring are light C functions
-        // (nup=0) — canonical light values.
+        // file objects below), __tostring is a light C function (nup=0) —
+        // canonical light values. __gc and __close are the SAME f_gc light
+        // value (liolib.c publishes one f_gc pointer in both fields).
         try self.setField(file_mt, "__gc", lightBuiltinValue(.file_gc));
-        try self.setField(file_mt, "__close", lightBuiltinValue(.file_meta_close));
+        try self.setField(file_mt, "__close", lightBuiltinValue(.file_gc));
         try self.setField(file_mt, "__tostring", lightBuiltinValue(.file_tostring));
         self.file_metatable = file_mt;
 
@@ -42831,18 +42837,6 @@ pub const Vm = struct {
         try self.writeManagedCloseResult(self.closeManagedFile(file_tbl), outs);
     }
 
-    fn builtinFileMetaClose(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
-        if (args.len == 0) return;
-        const file_tbl = asFileTable(self, args[0]) orelse return;
-        if (try self.isStdFile(args[0])) return;
-        if (self.getFieldOpt(file_tbl, "__closed")) |v| {
-            if (v == .Bool and v.Bool) return;
-        }
-        try self.setField(file_tbl, "__closed", .{ .Bool = true });
-        _ = self.closeManagedFile(file_tbl);
-        if (outs.len > 0) outs[0] = .{ .Bool = true };
-    }
-
     fn builtinFileWrite(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) return self.fail("bad argument #1 to 'write' (FILE* expected)", .{});
         const file_v = args[0];
@@ -43064,16 +43058,27 @@ pub const Vm = struct {
         outs[0] = .{ .String = istr2 };
     }
 
+    /// PUC f_gc (liolib.c) — the ONE finalizer body published as both the
+    /// FILE* metatable `__gc` and `__close` metamethods. tolstream is
+    /// luaL_checkudata: a missing or non-file argument raises the argerror.
+    /// An open regular file is closed (aux_close -> io_fclose); standard
+    /// streams stay open (their closef is io_noclose); an already-closed
+    /// file is ignored. Always 0 results.
     fn builtinFileGc(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = outs;
-        if (args.len == 0) return self.fail("no value", .{});
-        const file_tbl = asFileTable(self, args[0]) orelse return;
+        if (args.len == 0) {
+            return self.fileGcArgError("no value");
+        }
+        const file_tbl = asFileTable(self, args[0]) orelse {
+            return self.fileGcArgError(self.valueTypeName(args[0]));
+        };
 
         // Standard streams are long-lived (referenced from `io.stdin`/
         // `io.stdout`/`io.stderr`) and must never be closed by GC, matching
-        // PUC Lua where `io.stdin`/`io.stdout`/`io.stderr` are never finalized.
+        // PUC Lua where `io.stdin`/`io.stdout`/`io.stderr` are never finalized
+        // (io_noclose keeps them open).
         if (try self.isStdFile(args[0])) return;
-        // PUC f_gc (liolib.c:234-238): ignore already-closed files.
+        // PUC f_gc (liolib.c): ignore already-closed files.
         // `isclosed(p)` checks `closef == NULL`; our equivalent is the
         // `__closed` field set by explicit close / __close / auto-close.
         if (self.getFieldOpt(file_tbl, "__closed")) |v| {
@@ -43081,6 +43086,31 @@ pub const Vm = struct {
         }
         _ = self.closeManagedFile(file_tbl);
         _ = self.setField(file_tbl, "__closed", .{ .Bool = true }) catch {};
+    }
+
+    /// PUC tolstream's luaL_checkudata argerror (lauxlib.c luaL_argerror):
+    /// the function name in the message is derived from the raising C
+    /// function's caller (getinfo "n" -> funcnamefromcall ->
+    /// funcnamefromcode), with a pushglobalfuncname fallback and '?'. The
+    /// shared f_gc body is published as both `__gc` and `__close`, so no
+    /// fixed name can match PUC — the name follows the call site ('__gc',
+    /// '__close', a local alias, 'close' at OP_CLOSE, '?' behind C callers).
+    fn fileGcArgError(self: *Vm, got: []const u8) Error {
+        const th = self.activeBytecodeThread();
+        var nm: []const u8 = "?";
+        if (th.call_frames.len() >= 2) {
+            const top = th.call_frames.len() - 1;
+            if (th.call_frames.getConstPtr(top).isC()) {
+                if (self.getFuncNameForFrame(th, top)) |dn| {
+                    if (dn.name) |n| nm = n;
+                }
+            }
+        }
+        if (std.mem.eql(u8, nm, "?")) {
+            var buf: [128]u8 = undefined;
+            if (self.pushGlobalFuncName(buf[0..], .{ .Builtin = .file_gc })) |n| nm = n;
+        }
+        return self.failArgerror("bad argument #1 to '{s}' (FILE* expected, got {s})", .{ nm, got });
     }
 
     /// PUC f_tostring (liolib.c): tolstream is luaL_checkudata — a non-file
@@ -47418,79 +47448,78 @@ pub const Vm = struct {
     /// CClosure(3+n)) — those stay on their existing lanes.
     const light_builtin_ids = [_]BuiltinId{
         // base (lbaselib.c base_funcs, nup=0)
-        .print,              .warn,               .tostring,
-        .tonumber,           .@"error",           .assert,
-        .select,             .rawlen,             .rawequal,
-        .type,               .collectgarbage,     .pcall,
-        .xpcall,             .next,               .dofile,
-        .loadfile,           .load,               .setmetatable,
-        .getmetatable,       .pairs,              .ipairs,
+        .print,              .warn,                  .tostring,
+        .tonumber,           .@"error",              .assert,
+        .select,             .rawlen,                .rawequal,
+        .type,               .collectgarbage,        .pcall,
+        .xpcall,             .next,                  .dofile,
+        .loadfile,           .load,                  .setmetatable,
+        .getmetatable,       .pairs,                 .ipairs,
         .rawget,             .rawset,
         // string (lstrlib.c string_funcs, nup=0)
-                    .string_format,
-        .string_pack,        .string_packsize,    .string_unpack,
-        .string_dump,        .string_len,         .string_byte,
-        .string_char,        .string_upper,       .string_lower,
-        .string_reverse,     .string_sub,         .string_find,
-        .string_match,       .string_gmatch,      .string_gsub,
+                       .string_format,
+        .string_pack,        .string_packsize,       .string_unpack,
+        .string_dump,        .string_len,            .string_byte,
+        .string_char,        .string_upper,          .string_lower,
+        .string_reverse,     .string_sub,            .string_find,
+        .string_match,       .string_gmatch,         .string_gsub,
         .string_rep,
         // string metatable arithmetic (lstrlib.c stringmetamethods, nup=0)
-                .str_arith_add,      .str_arith_sub,
-        .str_arith_mul,      .str_arith_mod,      .str_arith_pow,
-        .str_arith_div,      .str_arith_idiv,     .str_arith_unm,
+                .str_arith_add,         .str_arith_sub,
+        .str_arith_mul,      .str_arith_mod,         .str_arith_pow,
+        .str_arith_div,      .str_arith_idiv,        .str_arith_unm,
         // table (ltablib.c tab_funcs, nup=0)
-        .table_pack,         .table_create,       .table_move,
-        .table_concat,       .table_insert,       .table_unpack,
+        .table_pack,         .table_create,          .table_move,
+        .table_concat,       .table_insert,          .table_unpack,
         .table_remove,       .table_sort,
         // math minus random/randomseed (lmathlib.c math_funcs, nup=0)
-                .math_tointeger,
-        .math_sin,           .math_cos,           .math_tan,
-        .math_asin,          .math_acos,          .math_atan,
-        .math_deg,           .math_rad,           .math_abs,
-        .math_sqrt,          .math_exp,           .math_ldexp,
-        .math_frexp,         .math_ceil,          .math_ult,
-        .math_modf,          .math_log,           .math_fmod,
-        .math_floor,         .math_type,          .math_min,
+                   .math_tointeger,
+        .math_sin,           .math_cos,              .math_tan,
+        .math_asin,          .math_acos,             .math_atan,
+        .math_deg,           .math_rad,              .math_abs,
+        .math_sqrt,          .math_exp,              .math_ldexp,
+        .math_frexp,         .math_ceil,             .math_ult,
+        .math_modf,          .math_log,              .math_fmod,
+        .math_floor,         .math_type,             .math_min,
         .math_max,
         // utf8 (lutf8lib.c funcs, nup=0) + the codes iterator products
-                  .utf8_char,          .utf8_codepoint,
-        .utf8_len,           .utf8_offset,        .utf8_codes,
+                  .utf8_char,             .utf8_codepoint,
+        .utf8_len,           .utf8_offset,           .utf8_codes,
         .utf8_codes_iter,    .utf8_codes_iter_ns,
         // io (liolib.c io_funcs, nup=0)
-        .io_write,
-        .io_open,            .io_popen,           .io_tmpfile,
-        .io_read,            .io_lines,           .io_flush,
-        .io_input,           .io_output,          .io_close,
+           .io_write,
+        .io_open,            .io_popen,              .io_tmpfile,
+        .io_read,            .io_lines,              .io_flush,
+        .io_input,           .io_output,             .io_close,
         .io_type,
         // file methods (liolib.c meth, published via the file metatable)
-                   .file_close,         .file_write,
-        .file_read,          .file_seek,          .file_flush,
+                   .file_close,            .file_write,
+        .file_read,          .file_seek,             .file_flush,
         .file_lines,         .file_setvbuf,
-        // file metatable metamethods (liolib.c metameth, nup=0)
-              .file_gc,
-        .file_meta_close,    .file_tostring,
+        // file metatable metamethods (liolib.c metameth, nup=0; __gc is
+        // published as both __gc and __close, like PUC f_gc)
+                 .file_gc,
+        .file_tostring,
         // os (loslib.c syslib, nup=0)
-             .os_execute,
-        .os_exit,            .os_clock,           .os_date,
-        .os_time,            .os_difftime,        .os_getenv,
-        .os_tmpname,         .os_remove,          .os_rename,
-        .os_setlocale,
+             .os_execute,            .os_exit,
+        .os_clock,           .os_date,               .os_time,
+        .os_difftime,        .os_getenv,             .os_tmpname,
+        .os_remove,          .os_rename,             .os_setlocale,
         // debug (ldblib.c db_lib, nup=0)
-              .debug_getinfo,      .debug_getlocal,
-        .debug_setlocal,     .debug_getupvalue,   .debug_setupvalue,
-        .debug_upvalueid,    .debug_upvaluejoin,  .debug_gethook,
-        .debug_sethook,      .debug_getregistry,  .debug_traceback,
-        .debug_getmetatable, .debug_setmetatable, .debug_getuservalue,
-        .debug_setuservalue, .debug_debug,
+        .debug_getinfo,      .debug_getlocal,        .debug_setlocal,
+        .debug_getupvalue,   .debug_setupvalue,      .debug_upvalueid,
+        .debug_upvaluejoin,  .debug_gethook,         .debug_sethook,
+        .debug_getregistry,  .debug_traceback,       .debug_getmetatable,
+        .debug_setmetatable, .debug_getuservalue,    .debug_setuservalue,
+        .debug_debug,
         // coroutine (lcorolib.c co_funcs, nup=0)
-               .coroutine_create,
-        .coroutine_wrap,     .coroutine_resume,   .coroutine_yield,
-        .coroutine_status,   .coroutine_running,  .coroutine_isyieldable,
-        .coroutine_close,
+               .coroutine_create,      .coroutine_wrap,
+        .coroutine_resume,   .coroutine_yield,       .coroutine_status,
+        .coroutine_running,  .coroutine_isyieldable, .coroutine_close,
         // package (loadlib.c ll_funcs' light entries, nup=0)
-           .package_searchpath, .package_loadlib,
+        .package_searchpath, .package_loadlib,
         // internal-only iterator products (never table-published)
-        .ipairs_iter,
+              .ipairs_iter,
     };
 
     /// Distinct C-ABI trampoline per id: one generic instantiation, so every

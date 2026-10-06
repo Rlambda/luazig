@@ -22,11 +22,22 @@
  *     pre-reserved stack space succeeds under a frozen allocator (the
  *     result window is stack-staged, not heap-staged), the VM stays
  *     usable afterwards, a full GC cycle runs, and a real heap C
- *     closure under the same freeze fails with LUA_ERRMEM (control).
+ *     closure under the same freeze fails with LUA_ERRMEM (control);
+ *   - part 6: the shared FILE* finalizer — the metatable __gc and
+ *     __close fields are ONE function value (PUC liolib.c publishes a
+ *     single f_gc pointer in both): rawequal/tocfunction/table-key
+ *     interchange identity, direct-call result counts on open/closed
+ *     files and std streams, wrong-argument error status/type, the
+ *     coroutine-body lane, TBC close (normal exit, error transport,
+ *     std stream), GC finalization, republish, and a second state.
  *
  * Divergence policy: no addresses, no timings, no locale-dependent
  * output. Every printed line must be byte-identical between PUC Lua 5.5
- * and luazig. Exit code is non-zero on any failed check.
+ * and luazig — EXCEPT the two known F1 residual lines in part 5
+ * (P5.light-pcall-allocs, P5.frozen-light-pcall-status: the pre-existing
+ * frozen-allocator C-lane divergence family, see report afp2b §7); the
+ * suite is NOT byte-identical while they exist. Exit code is non-zero on
+ * any failed check.
  */
 
 #include <stdio.h>
@@ -218,10 +229,10 @@ static void part_identity(void) {
         }
     }
     check(all_ok, "P1.identity-matrix");
-    /* OBSERVATION: distinct-pointer count. PUC 5.5 shares one C function
-     * between the file __gc and __close metamethods (liolib f_close), so
-     * PUC reports NENTRIES-1 here while luazig publishes distinct
-     * trampolines per registry id — a benign, documented divergence. */
+    /* PUC 5.5 shares one C function between the file __gc and __close
+     * metamethods (liolib.c metameth[] publishes f_gc in both fields) —
+     * exactly one duplicate pointer across the entry list, in BOTH
+     * engines. */
     {
         int distinct = 0;
         for (int i = 0; i < NENTRIES; i++) {
@@ -230,7 +241,7 @@ static void part_identity(void) {
                 if (seen[j] == seen[i]) dup = 1;
             if (!dup) distinct++;
         }
-        printf("P1.distinct-count:%d\n", distinct);
+        check(distinct == NENTRIES - 1, "P1.distinct-count");
     }
     (void)all_distinct;
 
@@ -253,10 +264,10 @@ static void part_tablekeys(void) {
     luaL_openlibs(L);
 
     /* one key table holding EVERY entry, then a full GC cycle.
-     * Two entry NAMES may resolve to the SAME light function (PUC shares
-     * one C function between the file __gc and __close metamethods): a
-     * duplicated pointer inserts one key, so deduplicated entries read
-     * back the value of their first occurrence. */
+     * Two entry NAMES resolve to the SAME light function in BOTH engines
+     * (PUC liolib.c shares one f_gc C function between the file __gc and
+     * __close metamethods): a duplicated pointer inserts one key, so the
+     * deduplicated entries read back the value of their first occurrence. */
     const void *key_ptr[NENTRIES];
     long key_val[NENTRIES];
     lua_newtable(L);                      /* [t] */
@@ -706,6 +717,226 @@ static void part_frozen(void) {
     lua_close(L);
 }
 
+/* ---------------- part 6: the shared FILE* finalizer ---------------- */
+
+#define FIN_PATH "/tmp/luazig_46_shared_finalizer.txt"
+
+/* Push the file metatable's named metamethod (mt = getmetatable(io.stdout)). */
+static void push_filemt(lua_State *L, const char *name) {
+    lua_getglobal(L, "io");
+    lua_getfield(L, -1, "stdout");
+    lua_getmetatable(L, -1);          /* [io, stdout, mt] */
+    lua_getfield(L, -1, name);        /* [io, stdout, mt, f] */
+    lua_remove(L, -2);
+    lua_remove(L, -2);
+    lua_remove(L, -2);
+}
+
+/* Call the function on top (n args below it) with LUA_MULTRET and check
+ * it succeeds publishing exactly nres results. */
+static void call_count(lua_State *L, int nargs, int nres, const char *label) {
+    int base = lua_gettop(L) - nargs - 1;
+    if (lua_pcall(L, nargs, LUA_MULTRET, 0) != LUA_OK) {
+        printf("%s.ERROR:%s\n", label, lua_tostring(L, -1));
+        fails++;
+        lua_settop(L, base);
+        return;
+    }
+    check(lua_gettop(L) - base == nres, label);
+    lua_settop(L, base);
+}
+
+/* Replace the value on top with io.type(value)'s string result. */
+static void replace_with_iotype(lua_State *L) {
+    lua_getglobal(L, "io");
+    lua_getfield(L, -1, "type");
+    lua_remove(L, -2);                /* [v, io.type] */
+    lua_pushvalue(L, -2);             /* [v, io.type, v] */
+    lua_call(L, 1, 1);                /* [v, result] */
+    lua_replace(L, -2);               /* [result] */
+}
+
+static void part_shared_finalizer(void) {
+    lua_State *L = luaL_newstate();
+    luaL_openlibs(L);
+
+    /* identity: __gc and __close are ONE function value */
+    push_filemt(L, "__gc");           /* [gc] */
+    push_filemt(L, "__close");        /* [gc, close] */
+    check(lua_rawequal(L, -1, -2), "P6.gc-close-rawequal");
+    check(lua_tocfunction(L, -1) == lua_tocfunction(L, -2),
+          "P6.gc-close-tocfunction");
+    check(lua_topointer(L, -1) == lua_tocfunction(L, -1),
+          "P6.close-topointer");
+    lua_CFunction fptr = lua_tocfunction(L, -1);
+    lua_pop(L, 2);
+
+    /* table-key interchange: one insertion, both metamethods read it */
+    lua_newtable(L);                  /* [t] */
+    push_filemt(L, "__gc");           /* [t, gc] */
+    lua_pushinteger(L, 42);
+    lua_rawset(L, -3);                /* [t] */
+    push_filemt(L, "__close");        /* [t, close] */
+    lua_rawget(L, -2);                /* [t, v] */
+    check(lua_isinteger(L, -1) && lua_tointeger(L, -1) == 42,
+          "P6.key-interchange");
+    lua_pop(L, 2);
+
+    /* direct call on an OPEN regular file: 0 results, file really closed;
+     * the file value stays on the stack across all the close lanes */
+    lua_getglobal(L, "io");
+    lua_getfield(L, -1, "open");
+    lua_remove(L, -2);
+    lua_pushstring(L, FIN_PATH);
+    lua_pushliteral(L, "w");
+    lua_call(L, 2, 1);                /* [f] */
+    push_filemt(L, "__gc");           /* [f, gc] */
+    lua_pushvalue(L, -2);             /* [f, gc, f] */
+    call_count(L, 1, 0, "P6.open-gc-count");
+    /* [f] */
+    lua_pushvalue(L, -1);             /* [f, f] */
+    replace_with_iotype(L);           /* [f, result] */
+    check(lua_isstring(L, -1) &&
+          strcmp(lua_tostring(L, -1), "closed file") == 0,
+          "P6.open-gc-closed");
+    lua_pop(L, 1);
+    /* already-closed file: __close is the same body — ignored, 0 results */
+    push_filemt(L, "__close");        /* [f, close] */
+    lua_pushvalue(L, -2);             /* [f, close, f] */
+    call_count(L, 1, 0, "P6.closed-close-count");
+    lua_pushvalue(L, -1);             /* [f, f] */
+    replace_with_iotype(L);           /* [f, result] */
+    check(lua_isstring(L, -1) &&
+          strcmp(lua_tostring(L, -1), "closed file") == 0,
+          "P6.closed-close-still-closed");
+    lua_pop(L, 1);
+    /* fixed nresults=1: the 0-result body nil-fills the wanted slot */
+    push_filemt(L, "__gc");           /* [f, gc] */
+    lua_pushvalue(L, -2);             /* [f, gc, f] */
+    {
+        int base = lua_gettop(L) - 2;
+        check(lua_pcall(L, 1, 1, 0) == LUA_OK, "P6.fixed-nres-status");
+        check(lua_gettop(L) - base == 1 && lua_isnil(L, -1),
+              "P6.fixed-nres-nilfill");
+        lua_settop(L, base);
+    }
+    lua_pop(L, 1);                    /* the file object */
+
+    /* std stream: 0 results from both metamethods, stays open */
+    {
+        static const char *const which[2] = {"__gc", "__close"};
+        for (int k = 0; k < 2; k++) {
+            push_filemt(L, which[k]); /* [fn] */
+            lua_getglobal(L, "io");
+            lua_getfield(L, -1, "stdout");
+            lua_remove(L, -2);        /* [fn, stdout] */
+            call_count(L, 1, 0, k == 0 ?
+                       "P6.std-gc-count" : "P6.std-close-count");
+            lua_getglobal(L, "io");
+            lua_getfield(L, -1, "stdout");
+            lua_remove(L, -2);        /* [stdout] */
+            replace_with_iotype(L);
+            check(lua_isstring(L, -1) &&
+                  strcmp(lua_tostring(L, -1), "file") == 0,
+                  k == 0 ? "P6.std-gc-open" : "P6.std-close-open");
+            lua_pop(L, 1);
+        }
+    }
+
+    /* wrong argument: error status + string error object (text carries a
+     * call-site-derived function name — status/type is the contract) */
+    push_filemt(L, "__gc");
+    check(lua_pcall(L, 0, 0, 0) == LUA_ERRRUN, "P6.noarg-status");
+    check(lua_type(L, -1) == LUA_TSTRING, "P6.noarg-errtype");
+    lua_pop(L, 1);
+    push_filemt(L, "__close");
+    lua_pushinteger(L, 42);
+    check(lua_pcall(L, 1, 0, 0) == LUA_ERRRUN, "P6.badarg-status");
+    check(lua_type(L, -1) == LUA_TSTRING, "P6.badarg-errtype");
+    lua_pop(L, 1);
+
+    /* coroutine-body lane: the shared finalizer as a coroutine body */
+    dostr(L,
+        "local mt = getmetatable(io.stdout)\n"
+        "local f = io.open('" FIN_PATH "', 'w')\n"
+        "f:write('coro')\n"
+        "local co = coroutine.create(mt.__gc)\n"
+        "print('P6.coro-resume', coroutine.resume(co, f))\n"
+        "print('P6.coro-status', coroutine.status(co))\n"
+        "print('P6.coro-type', io.type(f))\n"
+        "local co2 = coroutine.create(mt.__close)\n"
+        "print('P6.coro-badarg', (select(1, coroutine.resume(co2, 42))))\n"
+        "print('P6.coro-badarg-type',"
+        " type((select(2, coroutine.resume(co2, 42)))))\n",
+        "P6");
+
+    /* TBC close: normal scope exit, error transport, std stream */
+    dostr(L,
+        "local h\n"
+        "do\n"
+        "  local x <close> = io.open('" FIN_PATH "', 'w')\n"
+        "  x:write('tbc')\n"
+        "  h = x\n"
+        "end\n"
+        "print('P6.tbc-type', io.type(h))\n"
+        "local y2\n"
+        "local ok, e = pcall(function()\n"
+        "  local y <close> = io.open('" FIN_PATH "', 'w')\n"
+        "  y:write('err')\n"
+        "  y2 = y\n"
+        "  error('boom', 0)\n"
+        "end)\n"
+        "print('P6.tbc-err', ok, e, io.type(y2))\n"
+        "do\n"
+        "  local s <close> = io.stdout\n"
+        "end\n"
+        "print('P6.tbc-std-open', io.type(io.stdout))\n",
+        "P6");
+
+    /* GC finalization: the dropped handle is closed and flushed by __gc */
+    dostr(L,
+        "local f = io.open('" FIN_PATH "', 'w')\n"
+        "f:write('gc')\n"
+        "f = nil\n"
+        "collectgarbage('collect')\n"
+        "collectgarbage('collect')\n"
+        "local r = io.open('" FIN_PATH "', 'r')\n"
+        "print('P6.gc-finalized', r:read('a'))\n"
+        "r:close()\n"
+        "os.remove('" FIN_PATH "')\n",
+        "P6");
+
+    /* republish: io reopened through luaL_requiref keeps the shared
+     * process-global pointer in both metamethod fields */
+    luaL_requiref(L, "io", luaopen_io, 0);
+    lua_pop(L, 1);
+    push_filemt(L, "__gc");           /* [gc] */
+    push_filemt(L, "__close");        /* [gc, close] */
+    check(lua_rawequal(L, -1, -2), "P6.reopen-rawequal");
+    check(lua_tocfunction(L, -2) == fptr, "P6.reopen-gc-ptr");
+    check(lua_tocfunction(L, -1) == fptr, "P6.reopen-close-ptr");
+    lua_pop(L, 2);
+
+    /* second independent state: same shared pointer, stays callable */
+    {
+        lua_State *L2 = luaL_newstate();
+        luaL_openlibs(L2);
+        push_filemt(L2, "__gc");      /* [gc] */
+        push_filemt(L2, "__close");   /* [gc, close] */
+        check(lua_rawequal(L2, -1, -2), "P6.second-state-rawequal");
+        check(lua_tocfunction(L2, -1) == fptr, "P6.second-state-ptr");
+        lua_pop(L2, 2);
+        push_filemt(L2, "__gc");      /* [gc] */
+        lua_getglobal(L2, "io");
+        lua_getfield(L2, -1, "stdout");
+        lua_remove(L2, -2);           /* [gc, stdout] */
+        call_count(L2, 1, 0, "P6.second-state-call");
+        lua_close(L2);
+    }
+
+    lua_close(L);
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     part_identity();
@@ -713,6 +944,7 @@ int main(void) {
     part_calls();
     part_republish();
     part_frozen();
+    part_shared_finalizer();
     printf("LIGHT_SWEEP: %d failures\n", fails);
     return fails ? 1 : 0;
 }

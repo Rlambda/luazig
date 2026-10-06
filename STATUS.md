@@ -116,6 +116,8 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   math shim отвергает строку. Разрыв существовал до P3, но новый
   `mathCheckInt` закрепил неверный input contract в мигрированном
   пути. BLOCKER по семантике валидной программы, FIX-NOW в P3
+  correction; не расширять в другие math functions. Предыдущее
+  IMPLEMENTED/closed заявление выше историческое, не финальный вердикт.
   CORRECTION CLOSED (`1225b5b`, 2026-10-06): (1) suite 50 —
   snapshot/clean_new и всё /tmp-перечисление УДАЛЕНЫ (только
   /proc/self/fd; каждый remove() нацелен на имя СВОЕГО вызова;
@@ -138,10 +140,45 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   не обновлён). Findings вне scope (ORDINARY-BACKLOG): tonumber(s,
   base) trim/'_' остатки; luaStrToNum float в for-loop preparation.
   P3 verdict: READY FOR REVIEW.
-  correction; не расширять в другие math functions. Предыдущее
-  IMPLEMENTED/closed заявление выше историческое, не финальный вердикт.
+  REVIEW 2026-10-06: **CORRECT** (`1225b5b`/`15f4860`/`dfc4bdb`).
+  Удаление чужих `/tmp/lua_*` закрыто: suite 50 больше не перечисляет
+  `/tmp`, и все `remove()` используют имена своих вызовов; новая
+  fd-exhaustion проба различает no-result вызов и ранний выход на
+  C API и bytecode путях. Numeric-string acceptance, optinteger nil и
+  sequence-after-error совпали с PUC в независимом suite 48 прогоне.
+  Однако новый `mathTagError` пишет `number expected, got {__name}`
+  в `buf: [64]u8` и при длинном допустимом `__name` подменяет полное
+  сообщение на `number expected`. Независимый `pcall(math.random,
+  setmetatable({}, {__name=string.rep("A",100)}))`: PUC сохраняет 100
+  `A` в error object, Zig их теряет. Это внесённое изменение error
+  object валидной программы, BLOCKER/FIX-NOW; исправить fallible
+  форматирование без truncation/fallback и сохранить error kind/OOM.
+  Дополнительный harness failure edge: `exhaust_fds()` может вернуть
+  -1 до инициализации `rl_old`, а caller вызывает `restore_fds` с
+  неинициализированным limit; исправить в том же bounded correction.
 - [ ] **debug.setupvalue(f, n, g()) multret-tail: zig устанавливает
   args[2] вместо top-of-stack (BLOCKER-класс, pre-existing; найден
+  CORRECTION CLOSED (`1ef6fc1`, 2026-10-06): mathTagError — текст
+  тега теперь течёт в failArgerror как format-args (форма
+  failTabArgerror), а общий второй предел failWithPosFrame [2048]u8
+  c "runtime error" fallback заменён unbounded heap allocPrint с
+  ERRMEM-on-OOM (error object никогда не деградирует; OOM остаётся
+  ERRMEM через protected boundary). exhaust_fds публикует rl_old
+  только после применения limit, полностью откатывает своё состояние
+  на каждом failure-пути; все три gated-секции условны
+  (getrlimit-fail -> setrlimit не вызывается; setrlimit-fail -> без
+  restore, явный failure-exit; успех -> restores с истинными
+  limit'ами, нулевой fd-leak) — доказано fault injection.
+  Координатор верифицировал лично: минимальный контрпример (100 A)
+  byte-identical PUC; suites 48 IDENTICAL / 50 IDENTICAL vs POSIX
+  PUC oracle D+RF; 377/377 D; smoke PASS; matrix zig_fail=0; fmt.
+  Baseline-сборки падают на новых lanes ровно в классе дефекта
+  (48 fails:9; smoke-95 длина 50 vs 3056). Perf: error-path-only,
+  контроли в шуме. Pre-existing battery findings (не этой правкой;
+  координатор воспроизвёл на базовом бинаре): 14_state_handles
+  (:787 lua_gettop mismatch, PUC проходит); 29 denied=3 vs 2 и
+  46_light_sweep — стабильные, byte-identical с/без правки. P3
+  verdict: READY FOR REVIEW.
   p3res 2026-10-05).** Ортогонален P3; нужен отдельный PUC-дифференциал
   и fix; p3res_dbg.lua воспроизводит (PUC на форме умирает rc=139 —
   UB, zig-прототип продолжает с args[2]).

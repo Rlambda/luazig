@@ -62,6 +62,30 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   C-проба 18/18, OOM k=1..12 и fixed-seed trail остаются полезным
   evidence только для проверенных осей; perf ~1.85–2.05x раскрыт.
   Correction scope — `prompt.md`; не выдавать implementation handoff
+  R2 VERDICT (p3r2, 2026-10-05; отчёт /tmp/opencode/p3r2_report.md,
+  артефакты /tmp/opencode/p3r2_*): first-wrong-op подтверждён
+  (makeRandomSeed: секунды+адрес локала совпадают на последовательных
+  вызовах -> коллизия os.tmpname()x2, координатор воспроизвёл лично).
+  Выбран T1 — STATELESS producer: Zig-нативный std.Io.Dir.createFile(
+  .exclusive) (O_EXCL) + std.Io.random, PUC-шаблон /tmp/lua_XXXXXX,
+  файл создаётся+закрывается (0600), hard-fail -> PUC-текст ошибки;
+  ВЛАДЕЛЬЦА СОСТОЯНИЯ НЕТ — Vm.rng_state удаляется без преемника.
+  Отвергнуты: per-VM counter (2-й mutable owner), makeRandomSeed
+  (доказанная коллизия), createFileAtomic (не mkstemp-семантика).
+  Evidence (координатор сверил артефакты лично: coro2/tmp2 IDENTICAL):
+  positive 13/13 байт-идентично (1000 уникальных имён, shape, файлы,
+  изоляция math, post-GC, two-states), C-проба 10/10, чистые
+  coroutine-пробы v1-v6,v8 + второй luaopen_math на coroutine handle
+  byte-identical; FI fd-exhaustion (catchable, байт-идентично с
+  traceback) и OOM-transport идентичны; KEEP-lanes переподтверждены
+  (18/18, OOM k=1..12, fixed-seed). ВЕРДИКТ: P3 MIGRATION-READY —
+  cut = p3res §5.1 items 1,2,4,5,6 + T1 вместо item 3. Perf: T1 ~2x
+  только cold syscall-bound tmpname; math 1.85-2.05x без изменений
+  (диагностические; paired A/B-план сохранён). Findings: F3 MEDIUM
+  pre-existing (argerror call-site имена 'random' vs 'math.random');
+  F8 build-note (repo liblua.so без LUA_USE_POSIX); F9 disclosure
+  (случайно удалён /tmp/luazig_p2f_review_test.log при очистке по
+  паттерну; фаза P2 закрыта, дескрипторов нет).
   до независимого tmpname owner и clean coroutine oracle.
 
 - [ ] **debug.setupvalue(f, n, g()) multret-tail: zig устанавливает

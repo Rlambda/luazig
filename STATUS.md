@@ -45,6 +45,36 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
+- [x] **P4 review correction: signed hex integer read becomes float
+  (BLOCKER, FIX-NOW, introduced by `ee1ba04`).** In the new shared
+  `readOneFormat` number reader, conversion recognizes `0x` only at
+  `s[0..2]`; an optional `+`/`-` makes it fall through to
+  `parseFloat`. PUC `read_number` calls `lua_stringtonumber` and returns
+  an integer for a signed integral hex token. Fresh final-source Debug
+  build: `+0x20000000000001` through `io.read("n")`, `file:read("n")`
+  and `file:lines("n")` is PUC integer `9007199254740993`, Zig float
+  `9007199254740992.0` (precision lost). Pre-cut reader stripped the
+  sign before hex detection and `parseHexStringIntWrap` already accepts
+  it. New suite 52 passes despite the defect: add a permanent focused
+  PUC differential covering status/type/value and these three callers.
+  P4 milestone verdict is CORRECT until this product regression is fixed.
+  CLOSED (P4 correction, `3dca2eb`, 2026-10-06): hex-префикс-проверка
+  пропускает optional sign (PUC l_str2int shape); sign-aware
+  parseHexStringIntWrap ведёт integer-lane с u64 wrap; изменение в
+  ОДНОМ общем helper → все три публичных пути (io.read/file:read/
+  file:lines "n") исправлены вместе; decimal/float lanes и strTonum
+  не тронуты. Suite 52 расширен (P12: C-API file:read + dostring
+  file:lines/io.read lanes) и smoke 98 — те же три пути, math.type +
+  точное значение + следующий read. Mutation-sensitive: оба падают
+  на pre-fix (52 rc=1 isinteger=0 val=...992.0; smoke 48 diff-строк)
+  и проходят byte-identical после. Координатор верифицировал лично:
+  three-lane проба integer/-16/integer integer 3.5 integer = PUC;
+  52 + smoke 98 byte-identical PUC D+RF; 51/97 нетронуты; 378/378
+  D+RF; smoke 98/98; matrix zig_fail=0; files.lua rc=0; fmt. Edge
+  sweep byte-identical кроме pre-existing read-independent
+  float-tostring расхождения (1e+20; ORDINARY-BACKLOG, не тот
+  invariant). Perf: numeric-read контроли в шуме (instructions
+  +0.56% при ±1.9% спреде).
 - [x] **io.input/io.output закрывают заменяемый default file (BLOCKER,
   pre-existing; найден p4res 2026-10-06).** PUC НЕ закрывает старый
   default file при io.input(new) — живой итератор по нему продолжает
@@ -1571,6 +1601,13 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   Suite 52 + smoke 98 byte-identical PUC D+RF; unit 378/378; matrix
   33 pass (exit parity, было 31/32); perf: gmatch −12%, io.lines
   0.94–0.98. П4 MILESTONE COMPLETE.
+  REVIEW 2026-10-06: **CORRECT**. Предыдущее COMPLETE — заявление
+  имплементера, не принятый вердикт. Независимая пересборка и PUC
+  дифференциал нашли внесённую `ee1ba04` потерю integer kind и точности
+  в общем `readOneFormat` для signed hex; обязательный focused gate
+  не включает этот вход. Исправление и новый регрессионный тест —
+  отдельный открытый пункт выше; подтверждённые CClosure формы
+  сохраняются.
 
 - [ ] **edge_a4: stale `bytecode_inplace_suspended` на trampoline-пути —
   Debug panic / RF segfault на ВАЛИДНОЙ pcallk+toclose форме

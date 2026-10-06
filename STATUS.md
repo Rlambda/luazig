@@ -45,6 +45,22 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
+- [ ] **P3(math.random) ready-to-implement: RanState CClosure-миграция
+  (research p3res принят; дизайн доказан прототипом).** Target: RanState
+  userdata upvalue CClosure(1) на каждое открытие; удалить Vm.rng_state
+  и BuiltinId.math_random* arms; project() rejection-путь в acceptance.
+  ОБЯЗАТЕЛЬНЫЙ gate (координаторская верификация): починить
+  coroutine-body lane прототипа (coroutine.resume тела с math.random
+  падает "missing RanState upvalue"; скрыто PUC-UB ранним вылетом
+  p3res_dbg). Perf ~1.85-2.05x микропетли — цена C-call механизма,
+  раскрыта; отчёт /tmp/opencode/p3res_report.md.
+
+- [ ] **debug.setupvalue(f, n, g()) multret-tail: zig устанавливает
+  args[2] вместо top-of-stack (BLOCKER-класс, pre-existing; найден
+  p3res 2026-10-05).** Ортогонален P3; нужен отдельный PUC-дифференциал
+  и fix; p3res_dbg.lua воспроизводит (PUC на форме умирает rc=139 —
+  UB, zig-прототип продолжает с args[2]).
+
 - [ ] **F4(syo, LOW/MEDIUM residual): защитный ensureThreadApiHandle
   OOM-arm в closeThreadRegionsOnClosedThread (2026-10-05).** Практически
   недостижим (handle уже существует); при достижении marks выживают,
@@ -876,6 +892,34 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   использует переданный lua_State и P1 transport. Исключения: require/
   searchers (CClosure — верный класс), math.random/randomseed (P3
   CClosure(1) RanState — пункт открыт), gmatch/io.lines products (P4),
+  P3 RESEARCH VERDICT (p3res, 2026-10-05, к `bf4d24e`; отчёт
+  /tmp/opencode/p3res_report.md, прототип /tmp/opencode/p3res_proto):
+  дизайн подтверждён throwaway-прототипом — RanState как userdata
+  upvalue CClosure(1) на каждое открытие (PUC setrandfunc форма);
+  Vm.rng_state и BuiltinId.math_random* arms удаляются; openMath
+  Library() в стиле luaopen_package; os.tmpname -> makeRandomSeed;
+  debugUpvalueName "" фикс; 1-arg project() rejection-путь (pre-existing
+  semantic gap % span) исправлен в прототипе — включить в P3
+  acceptance. C-проба 18 проверок byte-identical PUC D+RF
+  (probe-proto/probe-puc — координатор сверил лично); OOM-проба
+  k=1..12 byte-identical; fixed-seed trails byte-identical. Perf
+  (раскрыто): ~1.85-2.05x на чистых math.random микропетлях —
+  атрибуция общему C-call механизму (dupe/free ~15%, root scope 6%,
+  pending-call ~10%, C-frame 4%); mathShimPush оптимизация 0.45->0.37c;
+  дальнейшие варианты в отчёте. КООРДИНАТОРСКОЕ УТОЧНЕНИЕ (верификация
+  p3res_dbg): прототип НЕ завершён — Lua-уровень coroutine-body lane
+  ПАДАЕТ (coroutine.resume(co), тело зовёт math.random -> "math.random:
+  missing RanState upvalue"; PUC на этой пробе умирает РАНЬШЕ от UB
+  setupvalue-формы rc=139, поэтому расхождение скрыто в отчёте).
+  ОБЯЗАТЕЛЬНЫЙ P3 gate: починить coroutine-body вызов CClosure-upvalue
+  шима. Подтверждённые findings: (1) BLOCKER-класс pre-existing:
+  debug.setupvalue(f,n,g()) multret-tail устанавливает args[2] вместо
+  top-of-stack PUC (ортогонально, отдельный пункт ниже); (2) %.17g
+  shortest-repr семейство (без изменений); (3) dead-upvalue: PUC UB
+  rc=139, прототип чистая ошибка — осознанное расхождение (не
+  реплицировать UB). Повторное luaopen_math создаёт новый table+state
+  (PUC-форма), старые closures продолжают работать со своим state —
+  counterexample к singleton-подходу не требуется.
   file mt f_close-sharing и F1 frozen C-lane staging (3
   документированных наблюдения suite 46). Suites 45_utf8_light /
   46_light_sweep / 47_light_yield постоянные. Гейты (координатор

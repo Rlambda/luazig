@@ -45,7 +45,13 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
-- [ ] **P3(math.random) implementation review correction: RanState CClosure-миграция.**
+- [ ] **io.input/io.output закрывают заменяемый default file (HIGH,
+  pre-existing; найден p4res 2026-10-06).** PUC НЕ закрывает старый
+  default file при io.input(new) — живой итератор по нему продолжает
+  работать; zig закрывает → поломка наблюдаемого контракта.
+  Отдельный cut в рамках P4 (см. p4res_report findings).
+
+- [x] **P3(math.random) implementation review correction: RanState CClosure-миграция.**
   Утверждённый A-full target: свежий RanState userdata как общий upvalue
   двух CClosure(1) на каждое `luaopen_math`; удалить `Vm.rng_state` и
   `BuiltinId.math_random*`, включить 1-arg `project()` rejection-путь.
@@ -186,6 +192,10 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   `lua_settop(pre_top)` и также считает исход успешным. Эти ветви
   маскируют неверный error kind/object и исправляют product stack
   внутри harness; после такого verdict нельзя считать OOM gate
+  достоверным. BLOCKER/FIX-NOW для P3 verification; нужен raw
+  per-edge статус/объект и mutation-sensitive test без нормализации
+  запрещённого класса. Pre-existing `api.State.pcall/call` args-dupe
+  gap выделен отдельным пунктом ниже, его не скрывать P5d.
   CORRECTION CLOSED (`ae9edf1`, 2026-10-06): мутации доказали
   недостоверность старого P5d (обе — rc=0: произвольный непустой
   ERRRUN и ERRMEM-без-объекта); новый gate отклоняет ОБЕ (rc=1,
@@ -210,10 +220,12 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   clean-full обе машины); 377/377 D; smoke; matrix zig_fail=0; fmt;
   29/46 byte-неизменны vs pristine. Perf: контроли в шуме
   (lua_calls −0.3%, error-path-only). P3 verdict: READY FOR REVIEW.
-  достоверным. BLOCKER/FIX-NOW для P3 verification; нужен raw
-  per-edge статус/объект и mutation-sensitive test без нормализации
-  запрещённого класса. Pre-existing `api.State.pcall/call` args-dupe
-  gap выделен отдельным пунктом ниже, его не скрывать P5d.
+  REVIEW 2026-10-06: **ACCEPT** (`ae9edf1`/`0a213f7`/`84f7f69`).
+  Ревьювер независимо повторил suite 48 на Zig и PUC: byte-identical,
+  `fails:0`, все P5d k=1..8 совпадают; проверил полный product/gate
+  diff, путь args-dupe OOM через protected boundary и публикацию в
+  прежнем stack slot. P3 закрыт. Pre-existing 14_state_handles,
+  29/46 и debug.setupvalue остаются отдельным backlog.
 
 - [x] **C API lua_pcall/lua_call args-dupe OOM теряет error object
   (BLOCKER, pre-existing; найден p3c2).** При freeze на
@@ -1501,6 +1513,32 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   `/tmp/reviewer_langfull2.lua`: два чередующихся итератора дают
   PUC `a,1,b,2`, Zig `1,2,nil,nil`. Нужен per-iterator owner с GC roots
   и корректной жизнью при coroutine/re-entry; см. радар.
+  P4 RESEARCH VERDICT (p4res, 2026-10-06, к `84f7f69`; отчёт
+  /tmp/opencode/p4res_report.md, артефакты /tmp/opencode/p4res_*):
+  PUC-контракты пиннингированы (source 5.5.0 + runtime; координатор
+  сверил C-probe лично: zig gmatch iscfunction=0/no-upvalues vs PUC
+  CClosure(3) [string,pattern,GMatchState-ud] с точными multret-
+  количествами; ^ в gmatch — ЛИТЕРАЛ, не якорь; io.lines(fn) ->
+  4 значения [iter,nil,nil,file], io.lines() -> ровно 1, file:lines
+  -> 1; итератор CClosure(3+n) [file,n,toclose,fmts...];
+  utf8.codes/ipairs в 5.5 stateless — light lane корректен, scope
+  подтверждён). 13 findings: 7 BLOCKER (известная gmatch-коррупция +
+  6 НОВЫХ: контракт shared-Builtin, multret=10, ^-якорь,
+  Table-as-iterator, return-формы 4/1/1, silent-after-close), 2 HIGH
+  (trailing-nil truncation; НОВОЕ: io.input ЗАКРЫВАЕТ заменённый
+  default file — PUC нет, ломает живой итератор; пункт ниже), F5
+  prefix-family и UB-lane — pre-existing. Рекомендация: Variant A
+  (прямая PUC-форма: per-iterator allocCclosure + shim по P3-math
+  паттерну); INTERFACE BLOCKER ОТСУТСТВУЕТ — инфраструктура P3 уже
+  поддерживает форму; каскад удалений: Vm.gmatch_state, оба GC-сайта,
+  2 BuiltinId, fake nups, makeLinesIter. 2 независимо-зелёных cut'а
+  + обязательные gates (новые c_api 51/52 + smoke 97/98;
+  negative-before зафиксирован пробами; OOM/GC edge-matrix;
+  lane-split по pre-existing 14/29/46) и perf-план (ожидаемо ~+62
+  ns/call C-boundary, измерить A/B; текущий zig gmatch 5.6x,
+  io.lines 27x медленнее PUC — pre-existing backlog). STOP не
+  сработал: новый глобальный owner не нужен. Пункт остаётся открытым
+  до implementation.
 
 - [ ] **edge_a4: stale `bytecode_inplace_suspended` на trampoline-пути —
   Debug panic / RF segfault на ВАЛИДНОЙ pcallk+toclose форме

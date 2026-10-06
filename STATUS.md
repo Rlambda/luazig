@@ -855,7 +855,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   prompt включает review-добавления `valueMetatable`/`topointer` и
   полный semantic switch gate перед публикацией n=0 producer.
 
-- [ ] **Internal stdlib `.Builtin` скрывает PUC light C function
+- [x] **Internal stdlib `.Builtin` скрывает PUC light C function
   identity (BLOCKER, pre-existing, ORDINARY-BACKLOG до owner decision).**
   PUC `loadlib.c:727` + `lauxlib.h:135–136` публикует
   `package.loadlib`/`package.searchpath` как VLCF; luazig
@@ -865,6 +865,28 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   Та же модель затрагивает другие standard-library nup=0 функции;
   полный scope и архитектура миграции требуют отдельного owner choice.
   Не смешивать с D1 для externally pushed C functions без решения.
+  A-FULL P2 EXECUTED (cuts `090d117` P2a + `9dcb884` P2b + `bd9521c`
+  P2c, 2026-10-05): все PUC 5.5 nup=0 stdlib entries опубликованы
+  каноническими LightCFunction со стабильным реальным C ABI pointer.
+  Инфраструктура: comptime pointer-only registry + @Vector(8,usize)
+  scan (скалярный scan отвергнут измерением +28-48%; sort/binary и
+  perfect-hash невозможны в Zig 0.16 — @intFromPtr не
+  comptime-evaluable); нормализация на входе всех 15 dispatch funnels
+  (обычный stdlib вызов НЕ через host C boundary); trampoline
+  использует переданный lua_State и P1 transport. Исключения: require/
+  searchers (CClosure — верный класс), math.random/randomseed (P3
+  CClosure(1) RanState — пункт открыт), gmatch/io.lines products (P4),
+  file mt f_close-sharing и F1 frozen C-lane staging (3
+  документированных наблюдения suite 46). Suites 45_utf8_light /
+  46_light_sweep / 47_light_yield постоянные. Гейты (координатор
+  лично): 41-47 IDENTICAL D+RF; 377/377 D+RF; smoke; matrix
+  zig_fail=0; memerr rc=0; api580 GREEN; fmt/diff-check. Perf
+  milestone (vs pre-P2 b39880f): дешёвые light-вызовы +5.5..+16.7%
+  (медиана ~+10%), yield +7.1%, Lua-call контроль 0.00% — измеренная
+  цена parity, раскрыта. ПУНКТ ЗАКРЫТ; A-full НЕ полон до P3/P4.
+  Findings: 4 tag-strict сравнения исправлены через lightBuiltinId
+  (семантический registry-резолв); 9 pre-existing мёртвых функций —
+  ORDINARY-BACKLOG; F1 ARCH-BACKLOG (frozen C-lane staging).
   RESEARCH VERDICT (scres, 2026-10-04, к `e759061`; отчёт
   /tmp/opencode/scres_report.md, артефакты /tmp/opencode/scres_*):
   полный inventory — ~141 опубликованная stdlib-функция как .Builtin;

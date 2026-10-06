@@ -45,15 +45,24 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
 
 ## Открытые пункты текущей фазы (владелец, 2026-09-15)
 
-- [ ] **P3(math.random) ready-to-implement: RanState CClosure-миграция
-  (research p3res принят; дизайн доказан прототипом).** Target: RanState
+- [ ] **P3(math.random) research correction: RanState CClosure-миграция
+  ещё не готова к implementation.** Target: RanState
   userdata upvalue CClosure(1) на каждое открытие; удалить Vm.rng_state
   и BuiltinId.math_random* arms; project() rejection-путь в acceptance.
-  ОБЯЗАТЕЛЬНЫЙ gate (координаторская верификация): починить
-  coroutine-body lane прототипа (coroutine.resume тела с math.random
-  падает "missing RanState upvalue"; скрыто PUC-UB ранним вылетом
-  p3res_dbg). Perf ~1.85-2.05x микропетли — цена C-call механизма,
-  раскрыта; отчёт /tmp/opencode/p3res_report.md.
+  REVIEW 2026-10-06: **CORRECT** для исследовательского handoff.
+  Throwaway prototype заменил `os.tmpname` RNG на `makeRandomSeed()`;
+  два последовательных вызова в одну секунду возвращают одинаковое имя
+  (PUC и baseline luazig дают разные). Это внесённая предлагаемым
+  дизайном наблюдаемая регрессия, затрагивающая сохранность данных при
+  использовании временных имён; нужен независимый stateful producer и
+  доказательство отсутствия влияния на math RanState. Чистая валидная
+  coroutine-body проба с seed(42,7) даёт `true 49 dead` и в PUC, и в
+  prototype; `p3res_dbg.lua` сначала заменяет RanState upvalue числом,
+  поэтому поздний сбой — PUC UB, а не доказанный дефект coroutine lane.
+  C-проба 18/18, OOM k=1..12 и fixed-seed trail остаются полезным
+  evidence только для проверенных осей; perf ~1.85–2.05x раскрыт.
+  Correction scope — `prompt.md`; не выдавать implementation handoff
+  до независимого tmpname owner и clean coroutine oracle.
 
 - [ ] **debug.setupvalue(f, n, g()) multret-tail: zig устанавливает
   args[2] вместо top-of-stack (BLOCKER-класс, pre-existing; найден
@@ -892,34 +901,6 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   использует переданный lua_State и P1 transport. Исключения: require/
   searchers (CClosure — верный класс), math.random/randomseed (P3
   CClosure(1) RanState — пункт открыт), gmatch/io.lines products (P4),
-  P3 RESEARCH VERDICT (p3res, 2026-10-05, к `bf4d24e`; отчёт
-  /tmp/opencode/p3res_report.md, прототип /tmp/opencode/p3res_proto):
-  дизайн подтверждён throwaway-прототипом — RanState как userdata
-  upvalue CClosure(1) на каждое открытие (PUC setrandfunc форма);
-  Vm.rng_state и BuiltinId.math_random* arms удаляются; openMath
-  Library() в стиле luaopen_package; os.tmpname -> makeRandomSeed;
-  debugUpvalueName "" фикс; 1-arg project() rejection-путь (pre-existing
-  semantic gap % span) исправлен в прототипе — включить в P3
-  acceptance. C-проба 18 проверок byte-identical PUC D+RF
-  (probe-proto/probe-puc — координатор сверил лично); OOM-проба
-  k=1..12 byte-identical; fixed-seed trails byte-identical. Perf
-  (раскрыто): ~1.85-2.05x на чистых math.random микропетлях —
-  атрибуция общему C-call механизму (dupe/free ~15%, root scope 6%,
-  pending-call ~10%, C-frame 4%); mathShimPush оптимизация 0.45->0.37c;
-  дальнейшие варианты в отчёте. КООРДИНАТОРСКОЕ УТОЧНЕНИЕ (верификация
-  p3res_dbg): прототип НЕ завершён — Lua-уровень coroutine-body lane
-  ПАДАЕТ (coroutine.resume(co), тело зовёт math.random -> "math.random:
-  missing RanState upvalue"; PUC на этой пробе умирает РАНЬШЕ от UB
-  setupvalue-формы rc=139, поэтому расхождение скрыто в отчёте).
-  ОБЯЗАТЕЛЬНЫЙ P3 gate: починить coroutine-body вызов CClosure-upvalue
-  шима. Подтверждённые findings: (1) BLOCKER-класс pre-existing:
-  debug.setupvalue(f,n,g()) multret-tail устанавливает args[2] вместо
-  top-of-stack PUC (ортогонально, отдельный пункт ниже); (2) %.17g
-  shortest-repr семейство (без изменений); (3) dead-upvalue: PUC UB
-  rc=139, прототип чистая ошибка — осознанное расхождение (не
-  реплицировать UB). Повторное luaopen_math создаёт новый table+state
-  (PUC-форма), старые closures продолжают работать со своим state —
-  counterexample к singleton-подходу не требуется.
   file mt f_close-sharing и F1 frozen C-lane staging (3
   документированных наблюдения suite 46). Suites 45_utf8_light /
   46_light_sweep / 47_light_yield постоянные. Гейты (координатор
@@ -931,6 +912,15 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   Findings: 4 tag-strict сравнения исправлены через lightBuiltinId
   (семантический registry-резолв); 9 pre-existing мёртвых функций —
   ORDINARY-BACKLOG; F1 ARCH-BACKLOG (frozen C-lane staging).
+  P3 RESEARCH RECORD (p3res, 2026-10-05, к `bf4d24e`; отчёт
+  /tmp/opencode/p3res_report.md, prototype /tmp/opencode/p3res_proto):
+  PUC-подобная RanState userdata/CClosure(1) форма подтверждена C-пробой
+  18/18, OOM k=1..12 и fixed-seed trails. Одноаргументный `project()`
+  rejection-путь остаётся обязательным P3 acceptance. Предложенная
+  замена `os.tmpname` на `makeRandomSeed()` и трактовка coroutine-body
+  пробы отклонены независимым review; детали и correction scope в
+  открытом P3 research-пункте выше. Perf prototype ~1.85–2.05x на
+  math.random микропетлях раскрыт, но это не финальное P3 измерение.
   REVIEW 2026-10-06: **CORRECT; P2 completion claim suspended.** The
   open review BLOCKER below must be resolved before P3/P4.
   RESEARCH VERDICT (scres, 2026-10-04, к `e759061`; отчёт

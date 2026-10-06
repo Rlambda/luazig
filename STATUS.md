@@ -887,6 +887,8 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   Findings: 4 tag-strict сравнения исправлены через lightBuiltinId
   (семантический registry-резолв); 9 pre-existing мёртвых функций —
   ORDINARY-BACKLOG; F1 ARCH-BACKLOG (frozen C-lane staging).
+  REVIEW 2026-10-06: **CORRECT; P2 completion claim suspended.** The
+  open review BLOCKER below must be resolved before P3/P4.
   RESEARCH VERDICT (scres, 2026-10-04, к `e759061`; отчёт
   /tmp/opencode/scres_report.md, артефакты /tmp/opencode/scres_*):
   полный inventory — ~141 опубликованная stdlib-функция как .Builtin;
@@ -999,6 +1001,36 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   scresv2 отчёте `scresv2_al_*`/`ol_*`/`bl_*` raw stdout не сохранены;
   ревью воспроизвело k=1..3, повторный вызов, GC и 16 B
   negative-before. Research принят, product-модель не утверждена.
+
+- [x] **A-full P2 review correction: FILE* finalizer identity and results
+  (BLOCKER, FIX-NOW).** PUC `liolib.c:790-791` publishes one `f_gc` C
+  pointer in FILE* `__gc` and `__close`; either direct call returns zero
+  results. P2 publishes different trampoline pointers (`.file_gc` and
+  `.file_meta_close`), and direct `__close` returns one result. Independent
+  CLI differential on final HEAD: PUC `rawequal=true`, counts `0/0`;
+  luazig `rawequal=false`, counts `0/1`. Suite 46 prints distinct pointer
+  counts `141` vs `142`; its other two differences are the known F1
+  frozen C-lane observations. The previous report's claim that suites
+  41–47 were byte-identical is inaccurate. Correction scope and
+  acceptance are in `prompt.md`; P2 remains open until shared identity
+  and behavior are proved.
+  CLOSED (A-full P2 correction, `c6409e3`, 2026-10-05): __close
+  публикует тот же lightBuiltinValue(.file_gc), что __gc; весь
+  .file_meta_close lane удалён (rg-proof 0 refs); PUC f_gc-семантика:
+  всегда 0 результатов, закрытый файл игнорируется, std streams
+  открыты, regular files реально закрываются, wrong-arg — tolstream
+  argerror с call-site-derived именем (fileGcArgError; 13
+  name-контекстов byte-identical PUC); close-dispatch parity
+  ("metamethod","close" pending name для OP_CLOSE/OP_RETURN);
+  TEMPORARY debug gate комментарий удалён. Suite 46:
+  distinct-count PARITY-CHECK (141=141) + часть 6 (identity/result
+  counts/wrong-arg/coroutine/TBC/GC/republish/second state);
+  заголовок честно: suite НЕ byte-identical при 2 живых F1 строках.
+  Координатор верифицировал лично: проба `true true 0 0` = PUC;
+  377/377 D+RF; diff suite 46 — только 2 F1; smoke/api580 GREEN;
+  perf флэт. Findings: F-afp2f-2 MEDIUM pre-existing (closing-frame
+  line attribution OP_CLOSE); F-afp2f-3 LOW (argerror
+  name-derivation family); debug_name_override dead-state suspicion.
 
 - [ ] **`package.loadlib(path, "*")` возвращает function вместо true
   (BLOCKER, pre-existing, ORDINARY-BACKLOG).** PUC `loadlib.c:391–394`

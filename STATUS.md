@@ -215,7 +215,7 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   запрещённого класса. Pre-existing `api.State.pcall/call` args-dupe
   gap выделен отдельным пунктом ниже, его не скрывать P5d.
 
-- [ ] **C API lua_pcall/lua_call args-dupe OOM теряет error object
+- [x] **C API lua_pcall/lua_call args-dupe OOM теряет error object
   (BLOCKER, pre-existing; найден p3c2).** При freeze на
   api.zig:1161/1600 возвращается LUA_ERRMEM с нетронутым стеком,
   без PUC-обязательного строкового error object. P5d наблюдал этот
@@ -223,6 +223,15 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   вручную восстанавливает top. Судьба ORDINARY-BACKLOG после
   исправления достоверности P5d; если строгий P3 OOM gate требует
   этот путь, включить исправление в тот же correction cut.
+  CLOSED (P3 correction `ae9edf1`, 2026-10-06): State.pcall
+  вооружает границу ДО args-dupe; маршаллинг-OOM (и
+  cWindowMoveResults OOM) публикуется через pcallPublishBoundaryError
+  в PUC luaD_pcall-форме (region close -> old_top -> seterrorobj ->
+  raw status), allocation-free; форма «ERRMEM без объекта на
+  нетронутом стеке» устранена (PUC её не может породить). State.call
+  — незащищённый lua_call контракт (kind до внешней границы),
+  правка не нужна. Raw per-edge: k=1 теперь PUC-форма;
+  координатор верифицировал 48 IDENTICAL D+RF.
 
 - [ ] **debug.setupvalue(f, n, g()) multret-tail: zig устанавливает
   args[2] вместо top-of-stack (BLOCKER-класс, pre-existing; найден

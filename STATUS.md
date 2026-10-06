@@ -156,8 +156,6 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   Дополнительный harness failure edge: `exhaust_fds()` может вернуть
   -1 до инициализации `rl_old`, а caller вызывает `restore_fds` с
   неинициализированным limit; исправить в том же bounded correction.
-- [ ] **debug.setupvalue(f, n, g()) multret-tail: zig устанавливает
-  args[2] вместо top-of-stack (BLOCKER-класс, pre-existing; найден
   CORRECTION CLOSED (`1ef6fc1`, 2026-10-06): mathTagError — текст
   тега теперь течёт в failArgerror как format-args (форма
   failTabArgerror), а общий второй предел failWithPosFrame [2048]u8
@@ -179,6 +177,55 @@ Geomean замедления vs PUC Lua: **1.44x** (цель: 1.0x; run-dependen
   (:787 lua_gettop mismatch, PUC проходит); 29 denied=3 vs 2 и
   46_light_sweep — стабильные, byte-identical с/без правки. P3
   verdict: READY FOR REVIEW.
+  REVIEW 2026-10-06: **CORRECT**. Длинный error object (3000 `A`)
+  независимо совпал с PUC; fd-gate теперь симметричен. Но новая
+  обязательная OOM-проба P5d (`tests/c_api/48_math_ranstate.c`) считает
+  ЛЮБУЮ непустую строку при `LUA_ERRRUN` успешным
+  `degraded-recovered`, хотя обязана различать OOM и RuntimeError.
+  При `LUA_ERRMEM` без строкового error object она вручную вызывает
+  `lua_settop(pre_top)` и также считает исход успешным. Эти ветви
+  маскируют неверный error kind/object и исправляют product stack
+  внутри harness; после такого verdict нельзя считать OOM gate
+  CORRECTION CLOSED (`ae9edf1`, 2026-10-06): мутации доказали
+  недостоверность старого P5d (обе — rc=0: произвольный непустой
+  ERRRUN и ERRMEM-без-объекта); новый gate отклоняет ОБЕ (rc=1,
+  VIOLATION(errrun-object)/VIOLATION(top)), фиксирует failure ДО
+  любого stack-cleanup, никогда не восстанавливает product стек до
+  verdict; degraded-recovered catch-all удалён (0 refs). Product-fix
+  (общий C API error/stack publication, закрывает args-dupe пункт
+  ниже): State.pcall вооружает границу ДО args-dupe; маршаллинг-OOM
+  (и cWindowMoveResults OOM) публикуется через
+  pcallPublishBoundaryError в PUC luaD_pcall-форме (region close ->
+  old_top -> seterrorobj -> raw status), без аллокаций — форма
+  «ERRMEM без объекта на нетронутом стеке», которую PUC не может
+  породить, устранена. State.call сохраняет незащищённый lua_call
+  контракт (kind до внешней границы; правка не нужна). Raw per-edge
+  таблица (полные трейсы, обе машины): zig k=1 args-dupe
+  (единственный маршаллинг-эдж), k=2..6 ERRMEM, k=7/8 full message;
+  PUC k=1..4 ERRMEM, k=5/6 точный staged-assembly артефакт
+  «math.random» (PUC-механизм задокументирован по исходнику:
+  addstr2buff err-flag -> rawrunprotected глотает ERRMEM -> concat
+  fast-path), k=7/8 full. Координатор верифицировал лично: 48
+  IDENTICAL vs PUC D+RF fails:0 (k=1..6 oom-recovered, k=7/8
+  clean-full обе машины); 377/377 D; smoke; matrix zig_fail=0; fmt;
+  29/46 byte-неизменны vs pristine. Perf: контроли в шуме
+  (lua_calls −0.3%, error-path-only). P3 verdict: READY FOR REVIEW.
+  достоверным. BLOCKER/FIX-NOW для P3 verification; нужен raw
+  per-edge статус/объект и mutation-sensitive test без нормализации
+  запрещённого класса. Pre-existing `api.State.pcall/call` args-dupe
+  gap выделен отдельным пунктом ниже, его не скрывать P5d.
+
+- [ ] **C API lua_pcall/lua_call args-dupe OOM теряет error object
+  (BLOCKER, pre-existing; найден p3c2).** При freeze на
+  api.zig:1161/1600 возвращается LUA_ERRMEM с нетронутым стеком,
+  без PUC-обязательного строкового error object. P5d наблюдал этот
+  край на k=1; текущий P3 gate ошибочно считает его допустимым и
+  вручную восстанавливает top. Судьба ORDINARY-BACKLOG после
+  исправления достоверности P5d; если строгий P3 OOM gate требует
+  этот путь, включить исправление в тот же correction cut.
+
+- [ ] **debug.setupvalue(f, n, g()) multret-tail: zig устанавливает
+  args[2] вместо top-of-stack (BLOCKER-класс, pre-existing; найден
   p3res 2026-10-05).** Ортогонален P3; нужен отдельный PUC-дифференциал
   и fix; p3res_dbg.lua воспроизводит (PUC на форме умирает rc=139 —
   UB, zig-прототип продолжает с args[2]).
